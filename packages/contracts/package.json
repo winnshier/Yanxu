@@ -1,0 +1,10 @@
+{
+  "name": "@yanxu/contracts",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": { "typecheck": "tsc --noEmit" },
+  "dependencies": { "@sinclair/typebox": "^0.34.41" },
+  "devDependencies": { "typescript": "^5.9.2" }
+}

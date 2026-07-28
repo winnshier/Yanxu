@@ -1,0 +1,41 @@
+#!/bin/sh
+set -eu
+
+ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+cd "$ROOT_DIR"
+
+NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || true)
+if [ "$NODE_MAJOR" != "24" ]; then
+  echo "Yanxu requires Node.js 24 LTS. Switch Node using nvm, fnm, mise, or your preferred version manager."
+  exit 1
+fi
+
+if ! command -v pnpm >/dev/null 2>&1; then
+  echo "pnpm 10 is required. Install it with your preferred Node version manager, then run ./yanxu again."
+  exit 1
+fi
+
+PNPM_MAJOR=$(pnpm --version | cut -d. -f1)
+if [ "$PNPM_MAJOR" != "10" ]; then
+  echo "Yanxu requires pnpm 10 (the project pins pnpm@10.17.0)."
+  exit 1
+fi
+
+if [ ! -d node_modules ]; then
+  pnpm install --frozen-lockfile
+fi
+
+case "${1:-start}" in
+  dev)
+    exec pnpm dev
+    ;;
+  start)
+    pnpm build
+    export YANXU_OPEN_BROWSER="${YANXU_OPEN_BROWSER:-1}"
+    exec pnpm start
+    ;;
+  *)
+    echo "Usage: ./yanxu [start|dev]"
+    exit 1
+    ;;
+esac
