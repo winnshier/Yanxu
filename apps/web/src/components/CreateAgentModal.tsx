@@ -17,6 +17,10 @@ export function CreateAgentModal({ open, roles, executors, agent, onClose }: Cre
   const settings = useQuery({ queryKey: ['settings'], queryFn: api.settings });
   const executor = Form.useWatch('executor', form);
   const installation = executors.find((item) => item.id === executor);
+  const closeModal = () => {
+    form.resetFields();
+    onClose();
+  };
   const probe = useMutation({
     mutationFn: api.probeExecutors,
     onSuccess: (data) => { queryClient.setQueryData(['executors'], data); },
@@ -27,8 +31,7 @@ export function CreateAgentModal({ open, roles, executors, agent, onClose }: Cre
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['agents'] });
       message.success(agent ? 'AI 人员已更新' : 'AI 人员已创建');
-      form.resetFields();
-      onClose();
+      closeModal();
     },
     onError: (error: Error) => message.error(error.message),
   });
@@ -37,13 +40,14 @@ export function CreateAgentModal({ open, roles, executors, agent, onClose }: Cre
     <Modal
       title={agent ? '编辑 AI 人员' : '创建 AI 人员'}
       open={open}
-      onCancel={onClose}
+      onCancel={closeModal}
       okText={agent ? '保存人员' : '创建人员'}
       confirmLoading={mutation.isPending}
       onOk={() => { void form.validateFields().then((values) => mutation.mutate(values)); }}
       destroyOnHidden
       afterOpenChange={(isOpen) => {
         if (isOpen) {
+          form.resetFields();
           form.setFieldsValue(agent ? {
             name: agent.name,
             roleId: agent.roleId,
@@ -57,6 +61,8 @@ export function CreateAgentModal({ open, roles, executors, agent, onClose }: Cre
             parameters: {},
           });
           probe.mutate();
+        } else {
+          form.resetFields();
         }
       }}
     >

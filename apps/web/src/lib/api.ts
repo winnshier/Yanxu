@@ -18,7 +18,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
     credentials: 'same-origin',
     headers: {
-      'content-type': 'application/json',
+      ...(init?.body !== undefined ? { 'content-type': 'application/json' } : {}),
       ...(mutation && csrfToken ? { 'x-yanxu-csrf': csrfToken } : {}),
       ...init?.headers,
     },

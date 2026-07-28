@@ -34,10 +34,12 @@
 ## 运行要求
 
 - macOS
-- Node.js 24
-- pnpm 10（项目锁定 `pnpm@10.17.0`）
+- Node.js 22.13.0 或更高版本
+- pnpm（项目不限制 pnpm 主版本；所用版本需要能够读取当前锁文件）
 - Git
 - OpenCode CLI（浏览和配置工作台不要求；创建 OpenCode 人员、分析或执行任务时才校验）
+
+在 Node.js 22 和 24 之间切换后，`./yanxu` 会自动检测并按当前 Node.js ABI 重编译 `better-sqlite3`。
 
 ## 一键启动
 
