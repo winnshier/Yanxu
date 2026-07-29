@@ -13,6 +13,7 @@ import type {
   StructuredExecutionInput,
   StructuredExecutionResult,
 } from './types.js';
+import { createStructuredOutputValidator, isStructuredOutputCompatibilityError } from './structured-output.js';
 
 interface ManagedRuntime extends RuntimeHandle {
   password: string;
@@ -21,8 +22,21 @@ interface ManagedRuntime extends RuntimeHandle {
 
 type SdkClient = ReturnType<typeof createOpencodeClient>;
 
+type StructuredOutputMode = 'opencode-schema' | 'prompt-json';
+
+interface PromptResult<T = unknown> {
+  info: {
+    structured?: T;
+    error?: { name?: string; data?: { message?: string } };
+  };
+  parts: Array<{ type: string; text?: string }>;
+}
+
+const structuredRepairAttempts = 2;
+
 export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly runtimes = new Map<string, ManagedRuntime>();
+  private readonly structuredOutputModes = new Map<string, StructuredOutputMode>();
 
   constructor(private readonly knownInstallation?: ExecutorInstallation) {}
 
@@ -87,22 +101,95 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     let promptSettled = false;
     const permissionWorker = this.processPermissions(client, runtime, session.id, input, () => promptSettled);
     try {
-      const response = await client.session.prompt({
-        sessionID: session.id,
-        directory: runtime.workspacePath,
-        model: { providerID, modelID },
-        parts: [{ type: 'text', text: input.prompt }],
-        format: { type: 'json_schema', schema: input.schema, retryCount: 2 },
-      });
-      const data = unwrap<{ info: { structured?: T; error?: { name?: string; data?: { message?: string } } } }>(response);
-      if (data.info.error) throw new Error(data.info.error.data?.message ?? data.info.error.name ?? 'OpenCode structured output failed.');
-      if (data.info.structured === undefined) throw new Error('OpenCode did not return structured output.');
-      return { sessionId: session.id, output: data.info.structured };
+      const preferredMode = this.structuredOutputModes.get(input.model) ?? 'opencode-schema';
+      let continuingAfterSchemaFailure = false;
+      if (preferredMode === 'opencode-schema') {
+        try {
+          const output = await this.promptWithOpenCodeSchema<T>(client, runtime, session.id, providerID, modelID, input);
+          this.structuredOutputModes.set(input.model, 'opencode-schema');
+          return { sessionId: session.id, output };
+        } catch (error) {
+          if (!isStructuredOutputCompatibilityError(error)) throw error;
+          // OpenCode currently implements JSON Schema as a forced tool call.
+          // Some thinking modes reject tool_choice=required, so remember the
+          // compatible path for all later requests using the same model.
+          this.structuredOutputModes.set(input.model, 'prompt-json');
+          continuingAfterSchemaFailure = true;
+        }
+      }
+      const output = await this.promptWithValidatedJson<T>(
+        client,
+        runtime,
+        session.id,
+        providerID,
+        modelID,
+        input,
+        continuingAfterSchemaFailure,
+      );
+      return { sessionId: session.id, output };
     } finally {
       promptSettled = true;
       await permissionWorker;
       input.abortSignal?.removeEventListener('abort', abort);
     }
+  }
+
+  private async promptWithOpenCodeSchema<T>(
+    client: SdkClient,
+    runtime: ManagedRuntime,
+    sessionId: string,
+    providerID: string,
+    modelID: string,
+    input: StructuredExecutionInput,
+  ): Promise<T> {
+    const response = await client.session.prompt({
+      sessionID: sessionId,
+      directory: runtime.workspacePath,
+      model: { providerID, modelID },
+      parts: [{ type: 'text', text: input.prompt }],
+      format: { type: 'json_schema', schema: input.schema, retryCount: structuredRepairAttempts },
+    });
+    const data = unwrap<PromptResult<T>>(response);
+    throwPromptError(data);
+    if (data.info.structured === undefined) throw new Error('OpenCode did not return structured output.');
+    return data.info.structured;
+  }
+
+  private async promptWithValidatedJson<T>(
+    client: SdkClient,
+    runtime: ManagedRuntime,
+    sessionId: string,
+    providerID: string,
+    modelID: string,
+    input: StructuredExecutionInput,
+    continuingAfterSchemaFailure: boolean,
+  ): Promise<T> {
+    const validator = createStructuredOutputValidator<T>(input.schema);
+    let prompt = continuingAfterSchemaFailure
+      ? jsonContinuationPrompt(input.schema)
+      : jsonProtocolPrompt(input.prompt, input.schema);
+    let lastErrors: string[] = [];
+    let lastResponse = '';
+    for (let attempt = 0; attempt <= structuredRepairAttempts; attempt += 1) {
+      const response = await client.session.prompt({
+        sessionID: sessionId,
+        directory: runtime.workspacePath,
+        model: { providerID, modelID },
+        parts: [{ type: 'text', text: prompt }],
+      });
+      const data = unwrap<PromptResult>(response);
+      throwPromptError(data);
+      lastResponse = data.parts
+        .filter((part) => part.type === 'text' && typeof part.text === 'string')
+        .map((part) => part.text as string)
+        .join('\n')
+        .trim();
+      const result = validator.parseAndValidate(lastResponse);
+      if (result.ok) return result.value;
+      lastErrors = result.errors;
+      if (attempt < structuredRepairAttempts) prompt = jsonRepairPrompt(lastResponse, lastErrors, input.schema);
+    }
+    throw new Error(`OpenCode JSON output failed local Schema validation after ${structuredRepairAttempts + 1} attempts: ${lastErrors.join('; ')}`);
   }
 
   async abortSession(runtime: RuntimeHandle, sessionId: string): Promise<void> {
@@ -206,6 +293,28 @@ export class OpenCodeAdapter implements ExecutorAdapter {
 function unwrap<T>(response: unknown): T {
   if (response && typeof response === 'object' && 'data' in response) return (response as { data: T }).data;
   return response as T;
+}
+
+function throwPromptError(result: PromptResult): void {
+  if (!result.info.error) return;
+  const name = result.info.error.name ?? 'OpenCodePromptError';
+  const message = result.info.error.data?.message ?? 'OpenCode prompt failed.';
+  const error = new Error(message);
+  error.name = name;
+  throw error;
+}
+
+function jsonProtocolPrompt(prompt: string, schema: Record<string, unknown>): string {
+  return `${prompt}\n\n【研序 JSON 输出协议】\n保留并完成上面的全部工作。最终响应只能包含一个符合下方 JSON Schema 的 JSON 对象，不要使用 Markdown 代码块，不要添加解释文字。\n${JSON.stringify(schema, null, 2)}`;
+}
+
+function jsonContinuationPrompt(schema: Record<string, unknown>): string {
+  return `OpenCode 的结构化输出通道未能提交结果。继续当前会话中的原任务，不要重复已经完成的工作；如仍有未完成部分则完成它。最终响应只能包含一个符合下方 JSON Schema 的 JSON 对象，不要使用 Markdown 代码块，不要添加解释文字。\n${JSON.stringify(schema, null, 2)}`;
+}
+
+function jsonRepairPrompt(previousResponse: string, errors: string[], schema: Record<string, unknown>): string {
+  const boundedResponse = previousResponse.slice(-20_000);
+  return `你上一次的最终响应没有通过研序的本地 JSON Schema 校验。不要重新执行任务，不要调用工具；只根据本会话已经完成的工作修正最终 JSON。响应只能包含 JSON 对象。\n\n校验错误：\n${errors.map((error) => `- ${error}`).join('\n')}\n\nJSON Schema：\n${JSON.stringify(schema, null, 2)}\n\n上一次响应：\n${boundedResponse}`;
 }
 
 function findFreePort(): Promise<number> {

@@ -118,6 +118,9 @@ describe('dynamic execution plans', () => {
       feedback: '保留两个步骤，但让测试步骤明确验证可追溯性。',
     });
     expect(task.status).toBe('REPLANNING');
+    const historicalStepId = task.steps[0]?.id ?? '';
+    const historicalSessionId = store.createAgentSession(task.id, task.steps[0]!, product);
+    store.recordSessionFailure(historicalSessionId, historicalStepId, '保留重新规划前的失败会话证据。');
     task = store.saveComposedPlan(task.id, {
       goal: '完成产品与测试协作',
       scope: ['功能点', '测试范围'],
@@ -134,7 +137,24 @@ describe('dynamic execution plans', () => {
     expect(task.status).toBe('WAITING_REAPPROVAL');
     expect(task.plan?.version).toBe(3);
     expect(task.steps[1]?.title).toBe('验证功能点可追溯性');
+    expect(database.prepare('SELECT status FROM task_steps WHERE id = ?').get(historicalStepId))
+      .toEqual({ status: 'skipped' });
+    expect(database.prepare('SELECT step_id, status FROM agent_sessions WHERE id = ?').get(historicalSessionId))
+      .toEqual({ step_id: historicalStepId, status: 'failed' });
     expect(store.listTaskPlans(task.id).map((plan) => plan.version)).toEqual([3, 2, 1]);
+    task = store.updatePlanAnswers(task.id, {
+      answers: {},
+      stepAssignments: task.plan?.steps.map((step) => ({ stepId: step.id, agentId: step.agentId })) ?? [],
+      branchRoutes: task.plan?.branchRoutes.map((route) => ({
+        directoryId: route.directoryId,
+        sourceBranch: route.sourceBranch,
+        targetBranch: route.targetBranch,
+      })) ?? [],
+    });
+    expect(database.prepare('SELECT status FROM task_steps WHERE id = ?').get(historicalStepId))
+      .toEqual({ status: 'skipped' });
+    expect(database.prepare('SELECT step_id, status FROM agent_sessions WHERE id = ?').get(historicalSessionId))
+      .toEqual({ step_id: historicalStepId, status: 'failed' });
     task = store.commandTask(task.id, 'stop', task.stateVersion);
     expect(task.status).toBe('STOPPED');
     task = store.commandTask(task.id, 'resume', task.stateVersion);
@@ -142,7 +162,7 @@ describe('dynamic execution plans', () => {
     task = store.commandTask(task.id, 'confirm', task.stateVersion);
 
     expect(task.status).toBe('PREPARING');
-    expect(task.snapshot?.planVersion).toBe(3);
+    expect(task.snapshot?.planVersion).toBe(4);
     const snapshot = store.getRunSnapshot(task.id);
     expect(snapshot?.agents.map((agent) => agent.id)).toEqual([product.id, tester.id]);
     store.updateTeam(team.id, { name: team.name, memberIds: [] });

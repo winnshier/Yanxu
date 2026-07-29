@@ -661,6 +661,7 @@ export interface SystemDiagnostics {
   projectSpaceFailedOperations: number;
   gitVersion: string | null;
   workbenchHome: string;
+  daemonLogPath: string;
 }
 
 export interface SystemSettings {

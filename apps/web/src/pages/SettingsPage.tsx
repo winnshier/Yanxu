@@ -107,6 +107,7 @@ export function SettingsPage() {
             { key: 'recovery', label: '恢复记录', children: diagnostics.data?.recoveryRecords ?? 0 },
             { key: 'space-failures', label: 'ProjectSpace 失败操作', children: diagnostics.data?.projectSpaceFailedOperations ?? 0 },
             { key: 'git', label: 'Git', children: diagnostics.data?.gitVersion ?? '未检测' },
+            { key: 'daemon-log', label: '服务日志', children: <Typography.Text className="mono-text" copyable>{diagnostics.data?.daemonLogPath ?? '加载中'}</Typography.Text> },
           ]} />
         </Card>
       </Spin>

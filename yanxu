@@ -14,12 +14,18 @@ if ! command -v pnpm >/dev/null 2>&1; then
   exit 1
 fi
 
+# pnpm 11 defaults verify-deps-before-run to "install", which can launch a
+# silent nested install before commands such as `pnpm exec` or `pnpm build`.
+# Dependency installation is already handled explicitly above, so disable that
+# implicit behavior for a predictable one-command startup on every pnpm version.
+export pnpm_config_verify_deps_before_run=false
+
 if [ ! -d node_modules ]; then
   pnpm install --frozen-lockfile
 fi
 
 check_sqlite_runtime() {
-  pnpm --filter @yanxu/core exec node -e 'const Database = require("better-sqlite3"); const database = new Database(":memory:"); database.close()'
+  node -e 'const Database = require("./packages/core/node_modules/better-sqlite3"); const database = new Database(":memory:"); database.close()'
 }
 
 if ! check_sqlite_runtime >/dev/null 2>&1; then
@@ -36,8 +42,10 @@ case "${1:-start}" in
     exec pnpm dev
     ;;
   start)
+    echo "[yanxu] Building the application..."
     pnpm build
     export YANXU_OPEN_BROWSER="${YANXU_OPEN_BROWSER:-1}"
+    echo "[yanxu] Starting at http://127.0.0.1:${YANXU_PORT:-43120} ..."
     exec pnpm start
     ;;
   *)

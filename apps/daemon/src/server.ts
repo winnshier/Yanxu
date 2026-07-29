@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, createWriteStream, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
@@ -28,7 +28,28 @@ export async function createServer(
   scheduler: Scheduler,
   options: ServerOptions = {},
 ): Promise<FastifyInstance> {
-  const server = Fastify({ logger: { level: process.env.YANXU_LOG_LEVEL ?? 'info' }, bodyLimit: 2 * 1024 * 1024 });
+  const daemonLogDirectory = join(store.workbenchHome, 'system', 'logs');
+  mkdirSync(daemonLogDirectory, { recursive: true });
+  const daemonLogPath = join(daemonLogDirectory, 'daemon.log');
+  const daemonLogStream = createWriteStream(daemonLogPath, { flags: 'a', mode: 0o600 });
+  daemonLogStream.on('error', (error) => {
+    process.stderr.write(`[yanxu] Failed to write daemon log: ${error.message}\n`);
+  });
+  const server = Fastify({
+    logger: {
+      level: process.env.YANXU_LOG_LEVEL ?? 'info',
+      stream: {
+        write(message: string) {
+          process.stdout.write(message);
+          daemonLogStream.write(message);
+        },
+      },
+    },
+    bodyLimit: 2 * 1024 * 1024,
+  });
+  server.addHook('onClose', (_instance, done) => {
+    daemonLogStream.end(() => done());
+  });
   const webOrigin = process.env.YANXU_WEB_ORIGIN;
   const folderSelections = new FolderSelectionRegistry();
   const fileSelections = new FileSelectionRegistry();
@@ -72,15 +93,21 @@ export async function createServer(
     done();
   });
 
-  server.setErrorHandler((error, _request, reply) => {
+  server.setErrorHandler((error, request, reply) => {
     if (error instanceof DomainError) {
       return reply.status(error.statusCode).send({ error: { code: error.code, message: error.message, details: error.details } });
     }
     if (error instanceof Error && 'validation' in error && error.validation) {
       return reply.status(400).send({ error: { code: 'VALIDATION_ERROR', message: '提交的数据格式不正确。', details: error.validation } });
     }
-    server.log.error(error);
-    return reply.status(500).send({ error: { code: 'INTERNAL_ERROR', message: '本地服务发生未预期错误。' } });
+    request.log.error({ err: error, requestId: request.id, method: request.method, url: request.url }, 'Unhandled request error');
+    return reply.status(500).send({
+      error: {
+        code: 'INTERNAL_ERROR',
+        message: '本地服务发生未预期错误。',
+        details: { requestId: request.id, logPath: daemonLogPath },
+      },
+    });
   });
 
   const systemHealth = () => {
@@ -345,10 +372,19 @@ export async function createServer(
 
   const webRoot = join(process.cwd(), 'apps', 'web', 'dist');
   if (existsSync(webRoot)) {
-    await server.register(fastifyStatic, { root: webRoot, wildcard: false });
+    await server.register(fastifyStatic, {
+      root: webRoot,
+      wildcard: false,
+      cacheControl: false,
+      setHeaders: (response, filePath) => {
+        if (filePath.endsWith('index.html')) response.setHeader('cache-control', 'no-store');
+        else if (filePath.includes(`${join('assets', '')}`)) response.setHeader('cache-control', 'public, max-age=31536000, immutable');
+      },
+    });
     server.setNotFoundHandler((request, reply) => {
       if (request.url.startsWith('/api/') || request.url.startsWith('/health')) return reply.status(404).send({ error: { code: 'NOT_FOUND', message: '接口不存在。' } });
-      return reply.sendFile('index.html');
+      if (request.url.split('?')[0]?.startsWith('/assets/')) return reply.status(404).type('text/plain').send('Static asset not found.');
+      return reply.header('cache-control', 'no-store').sendFile('index.html');
     });
   }
   return server;

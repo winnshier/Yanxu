@@ -8,6 +8,15 @@ import { App } from './app/App.js';
 import { queryClient } from './lib/query-client.js';
 import './styles/global.css';
 
+const preloadReloadKey = 'yanxu:preload-reload-entry';
+window.addEventListener('vite:preloadError', (event) => {
+  const entryScript = document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src ?? window.location.href;
+  if (window.sessionStorage.getItem(preloadReloadKey) === entryScript) return;
+  event.preventDefault();
+  window.sessionStorage.setItem(preloadReloadKey, entryScript);
+  window.location.reload();
+});
+
 const root = document.getElementById('root');
 if (!root) throw new Error('Root element is missing.');
 

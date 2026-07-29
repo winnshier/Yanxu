@@ -408,7 +408,9 @@ export class Scheduler {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const task = this.store.getTask(job.aggregateId);
-      if (['STOPPED', 'PAUSED', 'REPLANNING', 'WAITING_REAPPROVAL', 'BLOCKED'].includes(task.status)) {
+      const jobWasSuperseded = ['STOPPED', 'PAUSED', 'WAITING_REAPPROVAL', 'BLOCKED'].includes(task.status)
+        || (task.status === 'REPLANNING' && job.type !== 'COMPOSE_PLAN');
+      if (jobWasSuperseded) {
         this.store.succeedJob(job.id, this.instanceId);
       }
       else this.store.failJob(job, message.slice(0, 4000));
@@ -462,6 +464,7 @@ export class Scheduler {
     const skill = snapshot.skills.find((item) => item.id === step.skillId);
     if (!skill) throw new Error(`Skill ${step.skillId} is missing from the confirmed task run snapshot.`);
     if (agent.executor !== 'opencode') throw new Error(`Executor ${agent.executor} is not supported yet.`);
+    await this.executors.ensureAvailable(agent.executor);
     const permissionManifest = snapshot.permissionManifests?.find((item) => item.stepId === step.id);
     if (permissionManifest && permissionManifest.agentId !== agent.id) {
       throw new Error(`Permission manifest for step ${step.id} does not match its confirmed agent.`);
@@ -708,8 +711,7 @@ export class Scheduler {
     const settings = this.store.getSettings(this.executors.list());
     if (settings.coordinatorExecutor !== 'opencode') throw new Error('Only OpenCode coordinator is supported in the first release.');
     if (!settings.coordinatorModel) throw new Error('Coordinator model is not configured.');
-    const installation = this.executors.get('opencode');
-    if (!installation || installation.health !== 'available') throw new Error('OpenCode CLI is unavailable.');
+    await this.executors.ensureAvailable('opencode');
 
     const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'coordinator', task.id);
     const runtime = await this.adapter.startRuntime(project.projectSpacePath, runtimeDirectory);

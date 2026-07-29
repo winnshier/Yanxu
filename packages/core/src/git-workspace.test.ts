@@ -25,7 +25,7 @@ describe('GitWorkspaceManager', () => {
     const repository = join(root, 'repository');
     const workbench = join(root, 'workbench');
     mkdirSync(repository);
-    git(repository, 'init');
+    git(repository, 'init', '-b', 'master');
     git(repository, 'config', 'user.name', 'Test');
     git(repository, 'config', 'user.email', 'test@example.com');
     writeFileSync(join(repository, 'tracked.txt'), 'base\n');
@@ -294,7 +294,7 @@ describe('GitWorkspaceManager', () => {
 function createRepository(root: string): string {
   const repository = join(root, 'repository');
   mkdirSync(repository);
-  git(repository, 'init');
+  git(repository, 'init', '-b', 'master');
   git(repository, 'config', 'user.name', 'Test');
   git(repository, 'config', 'user.email', 'test@example.com');
   writeFileSync(join(repository, 'tracked.txt'), 'base\n');

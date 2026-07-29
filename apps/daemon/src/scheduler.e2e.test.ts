@@ -38,12 +38,14 @@ interface FakePlanConfiguration {
   blockFirstImplementation?: boolean;
   failFirstImplementation?: boolean;
   delayFirstImplementation?: boolean;
+  failReplan?: boolean;
 }
 
 class FakeOpenCodeAdapter implements ExecutorAdapter {
   private runtimeSequence = 0;
   private sessionSequence = 0;
   private implementationAttempts = 0;
+  private planningAttempts = 0;
   private readonly blocked = new Map<string, (error: Error) => void>();
 
   constructor(private readonly configuration: FakePlanConfiguration) {}
@@ -86,6 +88,10 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
       ));
     }
     if (input.title.startsWith('研序计划')) {
+      this.planningAttempts += 1;
+      if (this.configuration.failReplan && this.planningAttempts > 1) {
+        throw new Error('Injected automatic replan failure.');
+      }
       return this.result<T>(sessionId, this.plan());
     }
     if (input.title.includes('技术方案')) {
@@ -489,6 +495,67 @@ describe('scheduler end-to-end', () => {
       fixture.database.close();
     }
   }, 20_000);
+
+  it('records and retries a failed compose-plan job while the task is replanning', async () => {
+    const fixture = createFixture(false, false, false, false, false, true);
+    try {
+      fixture.scheduler.start();
+      let task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      task = fixture.store.requestAutomaticReplan(
+        task.id,
+        '重新规划失败回归测试。',
+        'scheduler_replan_failure_test',
+        true,
+      );
+      expect(task.status).toBe('REPLANNING');
+
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'BLOCKED',
+        15_000,
+      );
+      const latestJob = fixture.database.prepare(`
+        SELECT type, status, attempt, last_error FROM jobs
+        WHERE aggregate_id = ? ORDER BY created_at DESC LIMIT 1
+      `).get(task.id) as { type: string; status: string; attempt: number; last_error: string | null };
+      expect(latestJob).toMatchObject({
+        type: 'COMPOSE_PLAN',
+        status: 'FAILED',
+        attempt: 3,
+        last_error: 'Injected automatic replan failure.',
+      });
+      expect(fixture.store.listEvents(task.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'job.retry_scheduled' }),
+        expect.objectContaining({ type: 'task.blocked' }),
+      ]));
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 20_000);
+
+  it('re-probes an unchecked executor registry before composing a resumed task plan', async () => {
+    const fixture = createFixture(false, false, false, false, false, false, true);
+    try {
+      expect(fixture.registry.get('opencode')?.health).toBe('unchecked');
+      fixture.scheduler.start();
+      const task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      await waitFor(
+        () => fixture.store.getTask(task.id),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      expect(fixture.registry.get('opencode')).toMatchObject({ health: 'available', path: '/tmp/fake-opencode' });
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  });
 });
 
 function createFixture(
@@ -497,6 +564,8 @@ function createFixture(
   failFirstImplementation = false,
   delayFirstImplementation = false,
   emptyRepository = false,
+  failReplan = false,
+  uncheckedRegistry = false,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'yanxu-scheduler-e2e-'));
   temporaryDirectories.push(root);
@@ -558,8 +627,20 @@ function createFixture(
     blockFirstImplementation,
     failFirstImplementation,
     delayFirstImplementation,
+    failReplan,
   });
-  const registry = new ExecutorRegistry([availableOpenCode], () => Promise.resolve([availableOpenCode]));
+  const uncheckedOpenCode: ExecutorInstallation = {
+    ...availableOpenCode,
+    path: null,
+    version: null,
+    health: 'unchecked',
+    models: [],
+    lastCheckedAt: null,
+  };
+  const registry = new ExecutorRegistry(
+    [uncheckedRegistry ? uncheckedOpenCode : availableOpenCode],
+    () => Promise.resolve([availableOpenCode]),
+  );
   const scheduler = new Scheduler(store, registry, adapter, 10);
-  return { root, database, store, scheduler, adapter, taskId: task.id };
+  return { root, database, store, registry, scheduler, adapter, taskId: task.id };
 }

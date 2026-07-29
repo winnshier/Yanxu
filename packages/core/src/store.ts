@@ -450,6 +450,7 @@ export class YanxuStore {
       projectSpaceFailedOperations: count(`SELECT COUNT(*) AS count FROM project_space_operations WHERE status = 'failed'`),
       gitVersion: git(process.cwd(), ['--version']) || null,
       workbenchHome: this.workbenchHome,
+      daemonLogPath: join(this.workbenchHome, 'system', 'logs', 'daemon.log'),
     };
   }
 
@@ -4053,7 +4054,10 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     if (task.steps.some((step) => step.status !== 'pending')) {
       throw new DomainError('PLAN_STEPS_ALREADY_STARTED', '执行已经开始，不能直接修改当前 SkillStep；请请求重新规划。', 409);
     }
-    this.database.prepare('DELETE FROM task_steps WHERE task_id = ?').run(task.id);
+    this.database.prepare(`
+      DELETE FROM task_steps
+      WHERE task_id = ? AND NOT (status = 'skipped' AND position >= 1000)
+    `).run(task.id);
     const insert = this.database.prepare(`
       INSERT INTO task_steps(
         id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json, status
@@ -4113,7 +4117,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json, status
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     `);
-    if (task.steps.every((step) => step.status === 'pending')) {
+    if (!preserveCompleted && task.steps.every((step) => step.status === 'pending')) {
       this.database.prepare('DELETE FROM task_steps WHERE task_id = ?').run(task.id);
       for (const step of this.buildSteps(task, plan)) {
         insertStep.run(step.id, step.taskId, step.position, step.skillId,

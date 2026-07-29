@@ -172,6 +172,9 @@ importers:
       '@yanxu/contracts':
         specifier: workspace:*
         version: link:../contracts
+      ajv:
+        specifier: ^8.20.0
+        version: 8.20.0
     devDependencies:
       '@types/node':
         specifier: ^24.3.0

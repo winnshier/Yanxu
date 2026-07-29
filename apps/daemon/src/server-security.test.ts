@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -35,6 +35,9 @@ describe('local daemon HTTP boundary', () => {
     const registry = new ExecutorRegistry([availableOpenCode], () => Promise.resolve([availableOpenCode]));
     const scheduler = new Scheduler(store, registry);
     const server = await createServer(store, registry, scheduler);
+    server.get('/api/test-internal-error', () => {
+      throw new Error('Injected persistent daemon log failure.');
+    });
     try {
       const rejected = await server.inject({
         method: 'PATCH',
@@ -87,11 +90,26 @@ describe('local daemon HTTP boundary', () => {
         scheduler: { running: true },
       });
       expect((await server.inject('/health/ready')).statusCode).toBe(200);
+
+      const internalFailure = await server.inject({
+        method: 'GET',
+        url: '/api/test-internal-error',
+        headers: { cookie: session.cookie },
+      });
+      expect(internalFailure.statusCode).toBe(500);
+      const internalFailureBody = internalFailure.json<{
+        error: { code: string; details: { requestId: string; logPath: string } };
+      }>();
+      expect(internalFailureBody.error.code).toBe('INTERNAL_ERROR');
+      expect(internalFailureBody.error.details.requestId).toMatch(/^req-/);
+      expect(internalFailureBody.error.details.logPath).toBe(join(root, 'system', 'logs', 'daemon.log'));
     } finally {
       scheduler.stop();
       await server.close();
       database.close();
     }
+    expect(readFileSync(join(root, 'system', 'logs', 'daemon.log'), 'utf8'))
+      .toContain('Injected persistent daemon log failure.');
   });
 
   it('accepts only short-lived folder selection tokens and consumes them after project creation', async () => {

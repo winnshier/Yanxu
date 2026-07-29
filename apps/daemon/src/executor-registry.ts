@@ -5,6 +5,7 @@ import { OpenCodeAdapter, probeExecutors } from '@yanxu/executors';
 
 export class ExecutorRegistry {
   private installations: ExecutorInstallation[];
+  private probePromise: Promise<ExecutorInstallation[]> | null = null;
 
   constructor(
     initialInstallations: ExecutorInstallation[] = [
@@ -26,8 +27,30 @@ export class ExecutorRegistry {
   }
 
   async probe(): Promise<ExecutorInstallation[]> {
-    this.installations = await this.probeExecutorsFn();
-    return this.installations;
+    if (this.probePromise) return this.probePromise;
+    this.probePromise = this.probeExecutorsFn()
+      .then((installations) => {
+        this.installations = installations;
+        return this.installations;
+      })
+      .finally(() => {
+        this.probePromise = null;
+      });
+    return this.probePromise;
+  }
+
+  async ensureAvailable(executor: ExecutorType): Promise<ExecutorInstallation> {
+    let installation = this.get(executor);
+    const checkedAt = installation?.lastCheckedAt ? Date.parse(installation.lastCheckedAt) : Number.NaN;
+    const checkedRecently = Number.isFinite(checkedAt) && Date.now() - checkedAt < 15_000;
+    if (!installation || installation.health === 'unchecked' || (installation.health !== 'available' && !checkedRecently)) {
+      await this.probe();
+      installation = this.get(executor);
+    }
+    if (!installation || installation.health !== 'available' || !installation.path) {
+      throw new Error(installation?.error ?? `${installation?.name ?? executor} CLI is unavailable.`);
+    }
+    return installation;
   }
 
   async validateRuntime(executor: ExecutorType, workbenchHome: string): Promise<ExecutorRuntimeValidation> {
