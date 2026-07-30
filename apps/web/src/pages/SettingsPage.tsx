@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { AutoComplete, Badge, Button, Card, Col, Descriptions, Form, InputNumber, Row, Select, Space, Spin, Switch, Tag, Typography, message } from 'antd';
+import { AutoComplete, Badge, Button, Card, Col, Descriptions, Form, InputNumber, Row, Select, Spin, Switch, Tag, Typography, message } from 'antd';
 import { ReloadOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { SystemSettings } from '@yanxu/contracts';
@@ -36,15 +36,15 @@ export function SettingsPage() {
   const openCode = executors.data?.find((item) => item.id === 'opencode');
 
   return (
-    <div className="page-container">
+    <div className="page-container settings-page">
       <PageHeader eyebrow="本地运行环境" title="设置" description="环境不阻塞浏览和草稿；创建人员、提交分析和启动任务时才进行强校验。" actions={<Button icon={<ReloadOutlined />} loading={probe.isPending} onClick={() => probe.mutate()}>重新检测 CLI</Button>} />
       <Spin spinning={executors.isLoading || settings.isLoading}>
-        <Row gutter={[16, 16]}>
+        <Row gutter={[16, 16]} className="executor-grid">
           {(executors.data ?? []).map((executor) => (
-            <Col key={executor.id} xs={24} lg={8}>
-              <Card title={executor.name} extra={<Badge status={executor.health === 'available' ? 'success' : 'default'} text={executor.health === 'available' ? '可用' : executor.health === 'unchecked' ? '待检测' : '不可用'} />}>
+            <Col key={executor.id} xs={24} lg={12} xxl={8}>
+              <Card className="executor-card" title={executor.name} extra={<Badge status={executor.health === 'available' ? 'success' : 'default'} text={executor.health === 'available' ? '可用' : executor.health === 'unchecked' ? '待检测' : '不可用'} />}>
                 <Descriptions size="small" column={1} items={[
-                  { key: 'path', label: '路径', children: <Typography.Text ellipsis={{ tooltip: executor.path }} className="mono-text">{executor.path ?? '未找到'}</Typography.Text> },
+                  { key: 'path', label: '路径', children: <Typography.Text ellipsis={{ tooltip: executor.path }} className="mono-text description-path">{executor.path ?? '未找到'}</Typography.Text> },
                   { key: 'version', label: '版本', children: executor.version ?? '—' },
                   { key: 'models', label: '模型', children: `${executor.models.length} 个` },
                 ]} />
@@ -72,7 +72,7 @@ export function SettingsPage() {
             </Col>
           ))}
         </Row>
-        <Card title="协调与执行" className="settings-card">
+        <Card title="协调与执行" className="settings-card settings-panel">
           <Form form={form} layout="vertical" onFinish={(values) => save.mutate(values)}>
             <Row gutter={20}>
               <Col xs={24} md={12}><Form.Item name="coordinatorExecutor" label="全局协调 CLI"><Select options={[{ label: 'OpenCode', value: 'opencode' }]} /></Form.Item></Col>
@@ -91,15 +91,15 @@ export function SettingsPage() {
                 { label: '始终拒绝', value: 'deny' },
               ]} /></Form.Item></Col>
             </Row>
-            <Space><Button type="primary" htmlType="submit" loading={save.isPending}>保存设置</Button><Typography.Text type="secondary">Workbench：{settings.data?.workbenchHome}</Typography.Text></Space>
+            <div className="settings-form-footer"><Button type="primary" htmlType="submit" loading={save.isPending}>保存设置</Button><Typography.Text type="secondary" className="mono-text">Workbench：{settings.data?.workbenchHome}</Typography.Text></div>
           </Form>
         </Card>
-        <Card title="系统与存储" className="settings-card">
+        <Card title="系统与存储" className="settings-card settings-panel">
           <Descriptions column={{ xs: 1, md: 2 }} items={[
             { key: 'daemon', label: '本地服务', children: <Badge status={health.data?.status === 'ready' ? 'success' : 'warning'} text={health.data?.status ?? '连接中'} /> },
             { key: 'database', label: 'SQLite', children: <Badge status={health.data?.database === 'ready' ? 'success' : 'warning'} text={health.data?.database ?? '检查中'} /> },
             { key: 'scheduler', label: 'Scheduler', children: health.data?.scheduler.running ? `运行中 · ${health.data.scheduler.activeJobs} 个任务` : '尚未启动' },
-            { key: 'workbench', label: 'Workbench', children: <Typography.Text className="mono-text" copyable>{settings.data?.workbenchHome ?? '—'}</Typography.Text> },
+            { key: 'workbench', label: 'Workbench', children: <Typography.Text className="mono-text description-path" copyable>{settings.data?.workbenchHome ?? '—'}</Typography.Text> },
             { key: 'db-check', label: 'SQLite quick_check', children: diagnostics.data?.databaseCheck ?? '检查中' },
             { key: 'fts-files', label: '项目文件索引', children: `${diagnostics.data?.indexedProjectFiles ?? 0} 个文件` },
             { key: 'fts-knowledge', label: '知识检索索引', children: `${diagnostics.data?.indexedKnowledgeEntries ?? 0} 条` },
@@ -107,7 +107,7 @@ export function SettingsPage() {
             { key: 'recovery', label: '恢复记录', children: diagnostics.data?.recoveryRecords ?? 0 },
             { key: 'space-failures', label: 'ProjectSpace 失败操作', children: diagnostics.data?.projectSpaceFailedOperations ?? 0 },
             { key: 'git', label: 'Git', children: diagnostics.data?.gitVersion ?? '未检测' },
-            { key: 'daemon-log', label: '服务日志', children: <Typography.Text className="mono-text" copyable>{diagnostics.data?.daemonLogPath ?? '加载中'}</Typography.Text> },
+            { key: 'daemon-log', label: '服务日志', children: <Typography.Text className="mono-text description-path" copyable>{diagnostics.data?.daemonLogPath ?? '加载中'}</Typography.Text> },
           ]} />
         </Card>
       </Spin>

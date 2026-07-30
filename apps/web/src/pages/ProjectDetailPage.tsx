@@ -117,7 +117,7 @@ export function ProjectDetailPage() {
   const data = project.data;
   const items = data ? [
     {
-      key: 'overview', label: '概览', children: <div className="detail-grid">
+      key: 'overview', label: '概览', children: <div className="detail-grid project-overview-grid">
         <Card title="项目状态"><Descriptions column={1} items={[
           { key: 'directories', label: '项目目录', children: `${data.directories.length} 个` },
           { key: 'active', label: '正在推进', children: `${data.taskSummary.active} 个任务` },
@@ -132,7 +132,7 @@ export function ProjectDetailPage() {
         {data.directories.map((directory) => {
           const candidate = directoryProfiles.data?.find((profile) =>
             profile.directoryId === directory.id && profile.status === 'candidate');
-          return <Card key={directory.id} title={<Space>{directory.displayName}<Badge status={directory.gitInitialized ? 'success' : 'warning'} text={directory.gitInitialized ? 'Git 已初始化' : '未初始化 Git'} /></Space>} extra={<Space>
+          return <Card key={directory.id} className="directory-card" title={<Space wrap>{directory.displayName}<Badge status={directory.gitInitialized ? 'success' : 'warning'} text={directory.gitInitialized ? 'Git 已初始化' : '未初始化 Git'} /></Space>} extra={<Space className="detail-card-actions">
             <Button icon={<HistoryOutlined />} onClick={() => setProfileDirectoryId(directory.id)}>认知历史</Button>
             <Button icon={<ReloadOutlined />} loading={rescan.isPending} onClick={() => rescan.mutate(directory.id)}>重新扫描</Button>
             <Popconfirm
@@ -228,7 +228,7 @@ export function ProjectDetailPage() {
   ] : [];
 
   return (
-    <div className="page-container">
+    <div className="page-container project-detail-page">
       <QueryState loading={project.isLoading} error={project.error} onRetry={() => { void project.refetch(); }}>
         {data && <><PageHeader eyebrow="项目" title={data.name} description={data.description || '暂无项目简介'} actions={<Space><Button icon={<SettingOutlined />} onClick={() => setSettingsDraft({
           description: data.description,

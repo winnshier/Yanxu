@@ -187,7 +187,7 @@ export function TaskDetailPage() {
   const planEditable = data ? ['WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL'].includes(data.status) : false;
   const executionStarted = Boolean(data?.snapshot);
   const planDirectlyEditable = planEditable && !executionStarted;
-  const actions = data ? <Space wrap>
+  const actions = data ? <Space wrap className="task-detail-actions">
     {['DRAFT', 'REOPENED'].includes(data.status) && <Button type="primary" icon={<PlayCircleOutlined />} loading={command.isPending} onClick={() => command.mutate(commandFor(data, 'submit'))}>提交分析</Button>}
     {planEditable && <Button icon={<ReloadOutlined />} loading={updatePlan.isPending || requestRevision.isPending} onClick={() => setRevisionOpen(true)}>请求修改</Button>}
     {planEditable && <Button
@@ -222,7 +222,7 @@ export function TaskDetailPage() {
 
   const items = data ? [
     {
-      key: 'overview', label: '概览', children: <div className="detail-grid">
+      key: 'overview', label: '概览', children: <div className="detail-grid task-overview-grid">
         <Card title="当前进度"><Progress percent={data.progress} status={data.status === 'BLOCKED' ? 'exception' : 'active'} /><Descriptions column={1} items={[
           { key: 'status', label: '状态', children: <TaskStatusTag status={data.status} /> },
           { key: 'project', label: '项目', children: data.projectName },
@@ -330,7 +330,7 @@ export function TaskDetailPage() {
           })}</div>
         </Card>}
         <Card title="动态执行步骤" className="settings-card">
-          <List rowKey={(step) => step.id} dataSource={data.plan.steps} renderItem={(step) => {
+          <List className="plan-step-list" rowKey={(step) => step.id} dataSource={data.plan.steps} renderItem={(step) => {
             const team = teams.data?.find((item) => item.id === data.teamId);
             const compatibleAgents = (agents.data ?? []).filter((agent) => {
               if (!team?.memberIds.includes(agent.id)) return false;
@@ -355,7 +355,7 @@ export function TaskDetailPage() {
             </List.Item>;
           }} />
         </Card>
-        <Card title="目录与分支" className="settings-card">
+        <Card title="目录与分支" className="settings-card branch-route-list">
           {project.data?.directories.some((directory) => !data.plan?.branchRoutes.some((route) => route.directoryId === directory.id)) && <Alert
             type="info"
             showIcon
@@ -461,7 +461,7 @@ export function TaskDetailPage() {
   ] : [];
 
   return (
-    <div className="page-container">
+    <div className="page-container task-detail-page">
       <QueryState loading={task.isLoading} error={task.error} onRetry={() => { void task.refetch(); }}>
         {data && <>
           <PageHeader eyebrow={`${data.projectName} · ${data.teamName}`} title={data.title} description="计划、执行、门禁和交付记录都绑定在这个任务版本链上。" actions={actions} />

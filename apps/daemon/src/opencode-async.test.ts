@@ -51,4 +51,31 @@ describe('OpenCode asynchronous prompt completion', () => {
 
     expect(result).toBeUndefined();
   });
+
+  it('selects the latest completed message regardless of API array order', () => {
+    const newestFirst = selectNewCompletedPromptResult([
+      {
+        info: { id: 'final', role: 'assistant', time: { created: 30, completed: 40 } },
+        parts: [{ type: 'text', text: '{"status":"succeeded"}' }],
+      },
+      {
+        info: { id: 'tool-loop', role: 'assistant', time: { created: 10, completed: 20 } },
+        parts: [{ type: 'text', text: '' }],
+      },
+    ], new Set(), 'idle');
+
+    const oldestFirst = selectNewCompletedPromptResult([
+      {
+        info: { id: 'tool-loop', role: 'assistant', time: { created: 10, completed: 20 } },
+        parts: [{ type: 'text', text: '' }],
+      },
+      {
+        info: { id: 'final', role: 'assistant', time: { created: 30, completed: 40 } },
+        parts: [{ type: 'text', text: '{"status":"succeeded"}' }],
+      },
+    ], new Set(), 'idle');
+
+    expect(newestFirst?.info.id).toBe('final');
+    expect(oldestFirst?.info.id).toBe('final');
+  });
 });

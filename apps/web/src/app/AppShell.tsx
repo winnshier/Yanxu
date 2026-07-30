@@ -79,7 +79,7 @@ export function AppShell() {
           </button>
         </div>
       </Sider>
-      <Layout>
+      <Layout className="app-main-layout">
         <Content className="app-content"><Outlet /></Content>
       </Layout>
     </Layout>

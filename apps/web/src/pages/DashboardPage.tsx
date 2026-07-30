@@ -28,7 +28,7 @@ export function DashboardPage() {
   });
 
   return (
-    <div className="page-container">
+    <div className="page-container dashboard-page">
       <PageHeader
         eyebrow="全局调度"
         title="今天要推进什么？"

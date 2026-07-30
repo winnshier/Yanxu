@@ -26,6 +26,7 @@ export function CreateTeamModal({ open, agents, team, onClose }: CreateTeamModal
   return (
     <Modal
       title={team ? '编辑团队' : '创建团队'}
+      width={560}
       open={open}
       onCancel={onClose}
       okText={team ? '保存修改' : '创建团队'}

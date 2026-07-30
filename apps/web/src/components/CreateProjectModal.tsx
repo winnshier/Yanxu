@@ -44,6 +44,7 @@ export function CreateProjectModal({ open, onClose, onCreated }: CreateProjectMo
   return (
     <Modal
       title="创建项目"
+      width={560}
       open={open}
       onCancel={onClose}
       okText="创建项目"

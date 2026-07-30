@@ -48,10 +48,12 @@ export function TeamPage() {
   const items = [
     {
       key: 'agents', label: 'AI 人员', children: <QueryState loading={agents.isLoading} error={agents.error} empty={(agents.data?.length ?? 0) === 0} emptyText="还没有 AI 人员；人员负责把 Role、CLI 和模型绑定在一起。">
-        <Row gutter={[16, 16]}>{(agents.data ?? []).map((agent) => {
+        <Row gutter={[16, 16]} className="team-grid">{(agents.data ?? []).map((agent) => {
           const executor = executorForAgent(agent.executor);
-          return <Col key={agent.id} xs={24} md={12} xl={8}><Card
-            extra={<Space size="small">
+          return <Col key={agent.id} xs={24} lg={12} xxl={8}><Card
+            className="agent-card"
+            title={<Space><Avatar size={32} icon={<RobotOutlined />} /><Typography.Text strong>{agent.name}</Typography.Text></Space>}
+            extra={<Space size="small" className="agent-card-actions">
               <Button type="text" icon={<EditOutlined />} onClick={() => { setEditingAgent(agent); setAgentModal(true); }}>编辑</Button>
               <Button type="link" onClick={() => setAgentStatus.mutate({ id: agent.id, status: agent.status === 'active' ? 'inactive' : 'active' })}>
                 {agent.status === 'active' ? '停用' : '启用'}
@@ -60,15 +62,15 @@ export function TeamPage() {
                 <Button type="text" danger icon={<DeleteOutlined />} aria-label={`删除 ${agent.name}`} />
               </Popconfirm>
             </Space>}
-          ><Space align="start"><Avatar size={44} icon={<RobotOutlined />} /><div><Typography.Title level={5}>{agent.name}</Typography.Title><Space wrap><Tag color="blue">{roleName(agent.roleId)}</Tag><Tag>{agent.executor}</Tag><Tag color={agent.permissionMode === 'managed' ? 'purple' : 'default'}>{agent.permissionMode}</Tag><Tag color={agent.status === 'active' ? 'green' : 'default'}>{agent.status === 'active' ? '启用' : '停用'}</Tag></Space><Typography.Paragraph className="card-caption" type="secondary">{agent.model}</Typography.Paragraph><Typography.Paragraph className="card-caption" type="secondary">所属团队：{teamsForAgent(agent.id).map((team) => team.name).join('、') || '未加入团队'}</Typography.Paragraph><Typography.Text type="secondary">CLI：{executor?.health ?? 'unchecked'} · {executor?.lastCheckedAt ? new Date(executor.lastCheckedAt).toLocaleString() : '尚未检测'}</Typography.Text></div></Space></Card></Col>;
+          ><div className="agent-card-content"><Space wrap><Tag color="blue">{roleName(agent.roleId)}</Tag><Tag>{agent.executor}</Tag><Tag color={agent.permissionMode === 'managed' ? 'purple' : 'default'}>{agent.permissionMode}</Tag><Tag color={agent.status === 'active' ? 'green' : 'default'}>{agent.status === 'active' ? '启用' : '停用'}</Tag></Space><Typography.Paragraph className="card-caption agent-model" type="secondary">{agent.model}</Typography.Paragraph><Typography.Paragraph className="card-caption" type="secondary">所属团队：{teamsForAgent(agent.id).map((team) => team.name).join('、') || '未加入团队'}</Typography.Paragraph><Typography.Text type="secondary">CLI：{executor?.health ?? 'unchecked'} · {executor?.lastCheckedAt ? new Date(executor.lastCheckedAt).toLocaleString() : '尚未检测'}</Typography.Text></div></Card></Col>;
         })}</Row>
       </QueryState>,
     },
     {
       key: 'teams', label: '团队', children: <QueryState loading={teams.isLoading} error={teams.error} empty={(teams.data?.length ?? 0) === 0}>
-        <Row gutter={[16, 16]}>{(teams.data ?? []).map((team) => {
+        <Row gutter={[16, 16]} className="team-grid">{(teams.data ?? []).map((team) => {
           const coverage = coverageForTeam(team);
-          return <Col key={team.id} xs={24} md={12}><Card
+          return <Col key={team.id} xs={24} lg={12}><Card className="team-card"
             title={<Space><TeamOutlined />{team.name}{team.isDefault && <Tag color="blue">默认</Tag>}</Space>}
             extra={<Button type="text" icon={<EditOutlined />} onClick={() => { setEditingTeam(team); setTeamModal(true); }}>编辑</Button>}
           ><Typography.Paragraph type="secondary">{team.description || '暂无说明'}</Typography.Paragraph><Typography.Paragraph>{team.memberIds.length} 名 AI 人员</Typography.Paragraph><Typography.Text strong>已覆盖 Skills</Typography.Text><div className="tag-row">{coverage.covered.length ? coverage.covered.map((skill) => <Tag color="green" key={skill.id}>{skill.name}</Tag>) : <Tag>无</Tag>}</div><Typography.Text strong>未覆盖（任务选择后才构成缺口）</Typography.Text><div className="tag-row">{coverage.uncovered.length ? coverage.uncovered.map((skill) => <Tag key={skill.id}>{skill.name}</Tag>) : <Tag color="green">全部覆盖</Tag>}</div></Card></Col>;
@@ -76,15 +78,15 @@ export function TeamPage() {
       </QueryState>,
     },
     {
-      key: 'roles', label: 'Role 库', children: <Row gutter={[16, 16]}>{(builtins.data?.roles ?? []).map((role) => <Col key={role.id} xs={24} md={12}><Card title={role.name}><Typography.Paragraph type="secondary">{role.description}</Typography.Paragraph><Descriptions column={1} size="small" items={[{ key: 'skills', label: 'Skills', children: role.skillIds.map((skill) => <Tag key={skill}>{skill}</Tag>) }, { key: 'version', label: '版本', children: role.version }]} /></Card></Col>)}</Row>,
+      key: 'roles', label: 'Role 库', children: <Row gutter={[16, 16]} className="library-grid">{(builtins.data?.roles ?? []).map((role) => <Col key={role.id} xs={24} lg={12}><Card className="library-card" title={role.name}><Typography.Paragraph type="secondary">{role.description}</Typography.Paragraph><Descriptions column={1} size="small" items={[{ key: 'skills', label: 'Skills', children: role.skillIds.map((skill) => <Tag key={skill}>{skill}</Tag>) }, { key: 'version', label: '版本', children: role.version }]} /></Card></Col>)}</Row>,
     },
     {
-      key: 'skills', label: 'Skill 库', children: <Row gutter={[16, 16]}>{(builtins.data?.skills ?? []).map((skill) => <Col key={skill.id} xs={24} lg={12}><Card title={skill.name} extra={<Space><Tag>{roleName(skill.roleId)}</Tag>{skill.canBlockDelivery && <Tag color="red">可阻断交付</Tag>}</Space>}><Typography.Paragraph type="secondary">{skill.description}</Typography.Paragraph><Typography.Text strong>必需 Artifact</Typography.Text><div className="tag-row">{skill.artifactTypes.map((artifactType) => <Tag color="geekblue" key={artifactType}>{artifactType}</Tag>)}</div><Typography.Text strong>机器校验条件</Typography.Text><div className="tag-row">{skill.completionChecks.map((check) => <Tag color="cyan" key={check}>{check}</Tag>)}</div></Card></Col>)}</Row>,
+      key: 'skills', label: 'Skill 库', children: <Row gutter={[16, 16]} className="library-grid">{(builtins.data?.skills ?? []).map((skill) => <Col key={skill.id} xs={24} lg={12}><Card className="library-card" title={skill.name} extra={<Space wrap><Tag>{roleName(skill.roleId)}</Tag>{skill.canBlockDelivery && <Tag color="red">可阻断交付</Tag>}</Space>}><Typography.Paragraph type="secondary">{skill.description}</Typography.Paragraph><Typography.Text strong>必需 Artifact</Typography.Text><div className="tag-row">{skill.artifactTypes.map((artifactType) => <Tag color="geekblue" key={artifactType}>{artifactType}</Tag>)}</div><Typography.Text strong>机器校验条件</Typography.Text><div className="tag-row">{skill.completionChecks.map((check) => <Tag color="cyan" key={check}>{check}</Tag>)}</div></Card></Col>)}</Row>,
     },
   ];
 
   return (
-    <div className="page-container">
+    <div className="page-container team-page">
       <PageHeader eyebrow="模型人员编排" title="AI 团队" description="人员绑定 Role、CLI 与模型；团队只是可复用的人员组合，不是写死的工作流。" actions={<Space><Button icon={<PlusOutlined />} onClick={() => { setEditingTeam(null); setTeamModal(true); }}>创建团队</Button><Button type="primary" icon={<PlusOutlined />} onClick={() => setAgentModal(true)}>创建人员</Button></Space>} />
       <Tabs items={items} />
       <CreateAgentModal open={agentModal} roles={builtins.data?.roles ?? []} executors={executors.data ?? []} agent={editingAgent} onClose={() => { setAgentModal(false); setEditingAgent(null); }} />

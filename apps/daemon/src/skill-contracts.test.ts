@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SkillDefinition } from '@yanxu/contracts';
 import { permissionRules } from '@yanxu/executors';
-import { skillResultSchema, validateSkillResult, type SkillResult } from './scheduler.js';
+import { normalizeSkillResultOutcome, skillResultSchema, validateSkillResult, type SkillResult } from './scheduler.js';
 
 const reviewSkill: SkillDefinition = {
   id: 'delivery-review',
@@ -67,6 +67,21 @@ describe('skill output contracts', () => {
         { check: '偏差和限制未被隐藏', status: 'failed', evidence: 'AC-2 缺口。' },
       ],
     }))).not.toThrow();
+  });
+
+  it('forces a delivery review with reported issues into the correction flow', () => {
+    const reviewed = result({
+      status: 'succeeded',
+      summary: '评审声称通过。',
+      issues: ['代码示例缺少必要导入，无法直接运行。'],
+    });
+
+    expect(() => validateSkillResult(reviewSkill, reviewed)).toThrow('仍报告待处理问题时不能返回成功');
+    expect(normalizeSkillResultOutcome(reviewSkill, reviewed)).toMatchObject({
+      status: 'changes_required',
+      issues: ['代码示例缺少必要导入，无法直接运行。'],
+    });
+    expect(() => validateSkillResult(reviewSkill, normalizeSkillResultOutcome(reviewSkill, reviewed))).not.toThrow();
   });
 
   it('compiles confirmed workspace and command boundaries into runtime allows', () => {

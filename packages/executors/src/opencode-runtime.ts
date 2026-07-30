@@ -28,7 +28,7 @@ interface PromptResult<T = unknown> {
   info: {
     id?: string;
     role?: string;
-    time?: { completed?: number };
+    time?: { created?: number; completed?: number };
     structured?: T;
     error?: { name?: string; data?: { message?: string } };
   };
@@ -392,11 +392,17 @@ export function selectNewCompletedPromptResult<T>(
   // the final response; treating an intermediate tool-loop message as final
   // would send a JSON repair prompt before the agent has finished its work.
   if (sessionStatus !== 'idle') return undefined;
-  return [...messages].reverse().find((message) =>
+  const candidates = messages.filter((message) =>
     message.info.role === 'assistant'
     && Boolean(message.info.id)
     && !existingMessageIds.has(message.info.id as string)
     && (message.info.time?.completed !== undefined || message.info.error !== undefined));
+  return candidates.reduce<PromptResult<T> | undefined>((latest, message) => {
+    if (!latest) return message;
+    const latestTime = latest.info.time?.completed ?? latest.info.time?.created ?? Number.NEGATIVE_INFINITY;
+    const messageTime = message.info.time?.completed ?? message.info.time?.created ?? Number.NEGATIVE_INFINITY;
+    return messageTime > latestTime ? message : latest;
+  }, undefined);
 }
 
 function abortedSessionError(): Error {

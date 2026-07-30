@@ -42,11 +42,11 @@ export function ProjectsPage() {
   });
   const filtered = (projects.data ?? []).filter((project) => `${project.name} ${project.description}`.toLowerCase().includes(query.toLowerCase()));
   return (
-    <div className="page-container">
+    <div className="page-container projects-page">
       <PageHeader eyebrow="项目资产" title="项目" description="项目是任务、目录、计划和经验沉淀的共同边界。" actions={<Space><Button icon={<FolderOpenOutlined />} loading={chooseRestoreSource.isPending} onClick={() => chooseRestoreSource.mutate()}>从 ProjectSpace 恢复</Button><Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建项目</Button></Space>} />
       <div className="toolbar"><Input allowClear prefix={<SearchOutlined />} placeholder="搜索项目" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
       <QueryState loading={projects.isLoading} error={projects.error} empty={filtered.length === 0} emptyText="还没有项目，先选择一个本地目录创建项目。" onRetry={() => { void projects.refetch(); }}>
-        <Row gutter={[16, 16]}>
+        <Row gutter={[16, 16]} className="project-grid">
           {filtered.map((project) => (
             <Col key={project.id} xs={24} md={12} xl={8}>
               <Card hoverable className="project-card" onClick={() => { void navigate(`/projects/${project.id}`); }}>

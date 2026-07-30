@@ -39,6 +39,7 @@ export function CreateAgentModal({ open, roles, executors, agent, onClose }: Cre
   return (
     <Modal
       title={agent ? '编辑 AI 人员' : '创建 AI 人员'}
+      width={560}
       open={open}
       onCancel={closeModal}
       okText={agent ? '保存人员' : '创建人员'}
