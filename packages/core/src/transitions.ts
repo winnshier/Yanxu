@@ -1,7 +1,7 @@
 import type { TaskStatus } from '@yanxu/contracts';
 import { DomainError } from './errors.js';
 
-export type TaskCommand = 'submit' | 'confirm' | 'pause' | 'resume' | 'stop' | 'self_merge' | 'merge' | 'reopen';
+export type TaskCommand = 'submit' | 'confirm' | 'pause' | 'resume' | 'stop' | 'cancel' | 'self_merge' | 'merge' | 'reopen';
 
 const transitions: Record<TaskCommand, Partial<Record<TaskStatus, TaskStatus>>> = {
   submit: { DRAFT: 'COMPOSING_PLAN', REOPENED: 'COMPOSING_PLAN' },
@@ -21,9 +21,18 @@ const transitions: Record<TaskCommand, Partial<Record<TaskStatus, TaskStatus>>> 
     WAITING_REAPPROVAL: 'STOPPED',
     PAUSED: 'STOPPED',
   },
+  cancel: {
+    DRAFT: 'CANCELLED',
+    WAITING_PLAN_APPROVAL: 'CANCELLED',
+    WAITING_REAPPROVAL: 'CANCELLED',
+    BLOCKED: 'CANCELLED',
+    STOPPED: 'CANCELLED',
+    DELIVERED: 'CANCELLED',
+    REOPENED: 'CANCELLED',
+  },
   self_merge: { DELIVERED: 'ARCHIVED' },
   merge: { DELIVERED: 'ARCHIVED' },
-  reopen: { DELIVERED: 'REOPENED', ARCHIVED: 'REOPENED' },
+  reopen: { DELIVERED: 'REOPENED', ARCHIVED: 'REOPENED', CANCELLED: 'REOPENED' },
 };
 
 export function transitionTask(current: TaskStatus, command: TaskCommand): TaskStatus {

@@ -1,11 +1,17 @@
 import { useEffect, useState } from 'react';
-import { Alert, Button, Card, Checkbox, Descriptions, Divider, Form, Input, List, Modal, Popconfirm, Progress, Select, Space, Tabs, Tag, Timeline, Typography, message } from 'antd';
-import { CheckOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Checkbox, Descriptions, Divider, Form, Input, List, Modal, Popconfirm, Progress, Radio, Select, Space, Tabs, Tag, Timeline, Typography, message } from 'antd';
+import { CheckOutlined, DeleteOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'react-router-dom';
 import type { AnswerPlanInput, RequestPlanRevisionInput, Task, TaskCommandInput, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
 import { api, ApiError } from '../lib/api.js';
+import {
+  buildPlanQuestionFormAnswers,
+  serializePlanQuestionAnswers,
+  type PlanQuestionFormAnswer,
+} from '../lib/plan-questions.js';
 import { PageHeader } from '../components/PageHeader.js';
+import { MarkdownContent } from '../components/MarkdownContent.js';
 import { QueryState } from '../components/QueryState.js';
 import { TaskStatusTag } from '../components/TaskStatusTag.js';
 
@@ -15,7 +21,7 @@ interface PlanFormValues {
   nonScopeText: string;
   successText: string;
   permissionsText: string;
-  answers: Record<string, string>;
+  answers: Record<string, PlanQuestionFormAnswer>;
   stepAgents: Record<string, string | null>;
   branchRoutes: Record<string, { sourceBranch: string; targetBranch: string }>;
   waivedGateIds: string[];
@@ -93,7 +99,7 @@ export function TaskDetailPage() {
         nonScopeText: data.plan.nonScope.join('\n'),
         successText: data.plan.successCriteria.join('\n'),
         permissionsText: data.plan.permissions.join('\n'),
-        answers: Object.fromEntries(data.plan.questions.map((item) => [item.id, item.answer ?? ''])),
+        answers: buildPlanQuestionFormAnswers(data.plan.questions),
         stepAgents: Object.fromEntries(data.plan.steps.map((step) => [step.id, step.agentId])),
         branchRoutes: Object.fromEntries(data.plan.branchRoutes.map((route) => [route.directoryId, {
           sourceBranch: route.sourceBranch,
@@ -137,7 +143,7 @@ export function TaskDetailPage() {
     mutationFn: ({ values }: UpdatePlanVariables) => {
       if (!data?.plan) throw new Error('当前任务没有可修订计划。');
       const input: AnswerPlanInput = {
-        answers: values.answers ?? {},
+        answers: serializePlanQuestionAnswers(data.plan.questions, values.answers),
         goal: values.goal,
         scope: values.scopeText.split('\n').map((item) => item.trim()).filter(Boolean),
         nonScope: values.nonScopeText.split('\n').map((item) => item.trim()).filter(Boolean),
@@ -179,6 +185,8 @@ export function TaskDetailPage() {
   });
 
   const planEditable = data ? ['WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL'].includes(data.status) : false;
+  const executionStarted = Boolean(data?.snapshot);
+  const planDirectlyEditable = planEditable && !executionStarted;
   const actions = data ? <Space wrap>
     {['DRAFT', 'REOPENED'].includes(data.status) && <Button type="primary" icon={<PlayCircleOutlined />} loading={command.isPending} onClick={() => command.mutate(commandFor(data, 'submit'))}>提交分析</Button>}
     {planEditable && <Button icon={<ReloadOutlined />} loading={updatePlan.isPending || requestRevision.isPending} onClick={() => setRevisionOpen(true)}>请求修改</Button>}
@@ -187,13 +195,28 @@ export function TaskDetailPage() {
       icon={<CheckOutlined />}
       loading={command.isPending || updatePlan.isPending}
       onClick={() => {
+        if (executionStarted && !(data.plan?.questions.length && !data.plan.answersReviewedAt)) {
+          command.mutate(commandFor(data, 'confirm'));
+          return;
+        }
         void planForm.validateFields()
           .then((values) => updatePlan.mutate({ values, action: 'confirm' }))
           .catch(() => undefined);
       }}
-    >{data.plan?.questions.length && !data.plan.answersReviewedAt ? '提交回答并完善计划' : '保存计划并启动'}</Button>}
+    >{data.plan?.questions.length && !data.plan.answersReviewedAt
+        ? '提交回答并完善计划'
+        : executionStarted ? '确认修订计划并继续' : '保存计划并启动'}</Button>}
     {['PREPARING', 'QUEUED', 'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING'].includes(data.status) && <Button icon={<PauseOutlined />} onClick={() => command.mutate(commandFor(data, 'pause'))}>暂停</Button>}
     {['PAUSED', 'STOPPED', 'BLOCKED'].includes(data.status) && <Button type="primary" icon={<PlayCircleOutlined />} onClick={() => command.mutate(commandFor(data, 'resume'))}>恢复</Button>}
+    {['DRAFT', 'WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL', 'BLOCKED', 'STOPPED', 'DELIVERED', 'REOPENED'].includes(data.status) && <Popconfirm
+      title="确认废弃这个任务？"
+      description="任务会退出默认看板且不能继续恢复执行；需求、计划、日志、分支与产物仍会保留。"
+      okText="确认废弃"
+      cancelText="返回"
+      okButtonProps={{ danger: true }}
+      onConfirm={() => command.mutate(commandFor(data, 'cancel'))}
+    ><Button danger icon={<DeleteOutlined />}>废弃任务</Button></Popconfirm>}
+    {data.status === 'CANCELLED' && <Button icon={<ReloadOutlined />} onClick={() => setCorrectionOpen(true)}>重新打开</Button>}
     {['COMPOSING_PLAN', 'WAITING_PLAN_APPROVAL', 'PREPARING', 'QUEUED', 'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING', 'WAITING_APPROVAL', 'WAITING_REAPPROVAL', 'PAUSED'].includes(data.status) && <Popconfirm title="立即停止并保留现场？" description="当前 Session 会终止，日志、分支和 worktree 会保留。" onConfirm={() => command.mutate(commandFor(data, 'stop'))}><Button danger icon={<StopOutlined />}>立即停止</Button></Popconfirm>}
   </Space> : null;
 
@@ -234,7 +257,14 @@ export function TaskDetailPage() {
       </div>,
     },
     {
-      key: 'plan', label: `任务与计划${data.plan ? ` v${data.plan.version}` : ''}`, children: data.plan ? <Form form={planForm} layout="vertical" disabled={!planEditable} onFinish={(values) => updatePlan.mutate({ values, action: 'save' })}>
+      key: 'plan', label: `任务与计划${data.plan ? ` v${data.plan.version}` : ''}`, children: data.plan ? <Form form={planForm} layout="vertical" disabled={!planDirectlyEditable} onFinish={(values) => updatePlan.mutate({ values, action: 'save' })}>
+        {planEditable && executionStarted && <Alert
+          type="warning"
+          showIcon
+          message="这是执行过程中生成的修订计划"
+          description="确认后会从整改步骤继续执行；如需修改目标、范围、步骤或权限，请使用“请求修改”，系统会重新规划并保留既有执行证据。"
+          className="settings-card"
+        />}
         <PreApprovalArtifacts
           artifacts={(evidence.data?.preApprovalArtifacts ?? []).filter((artifact) => artifact.planId === data.plan?.id)}
         />
@@ -244,9 +274,60 @@ export function TaskDetailPage() {
           <Form.Item name="nonScopeText" label="非范围（每行一项）"><Input.TextArea autoSize={{ minRows: 2 }} /></Form.Item>
           <Form.Item name="successText" label="成功标准（每行一项）" rules={[{ required: true, message: '请至少保留一项成功标准' }]}><Input.TextArea autoSize={{ minRows: 3 }} /></Form.Item>
         </Card>
-        {data.plan.questions.length > 0 && <Card title="需要你回答" className="settings-card">
-          {!data.plan.answersReviewedAt && <Alert type="info" showIcon message="回答后会先由协调器完善计划" description="系统会把答案落实到目标、范围、成功标准、步骤、权限和门禁，生成新版本后再让你最终确认。" />}
-          <div className="settings-card">{data.plan.questions.map((question) => <Form.Item key={question.id} name={['answers', question.id]} label={question.question} rules={[{ required: true, message: '请回答该问题' }]}><Input.TextArea autoSize={{ minRows: 2 }} /></Form.Item>)}</div>
+        {data.plan.questions.length > 0 && <Card title="需要你确认的方案" className="settings-card">
+          {!data.plan.answersReviewedAt && <Alert
+            type="info"
+            showIcon
+            message="协调器已经先给出推荐和备选方案"
+            description="你可以直接选择，也可以填写自定义方案。提交后，协调器会把决定落实到目标、范围、成功标准、步骤、权限和门禁，再生成新版本供你最终确认。"
+          />}
+          {data.plan.questions.some((question) => !(question.options ?? []).length) && <Alert
+            className="settings-card"
+            type="warning"
+            showIcon
+            message="这个旧版计划还没有候选方案"
+            description="你可以填写自定义方案，或使用页面上方“请求修改”让协调器按新规则重新生成推荐与备选方案。"
+          />}
+          <div className="settings-card">{data.plan.questions.map((question) => {
+            const options = question.options ?? [];
+            return <Card key={question.id} size="small" className="plan-question-card" title={question.question}>
+              <Form.Item
+                name={['answers', question.id, 'optionId']}
+                rules={[{ required: true, message: '请选择一个方案或选择自定义方案' }]}
+              >
+                <Radio.Group className="full-width">
+                  <Space direction="vertical" size={10} className="full-width">
+                    {options.map((option) => <Radio key={option.id} value={option.id} className="plan-question-option">
+                      <Space size={8}>
+                        <Typography.Text strong>{option.label}</Typography.Text>
+                        {option.recommended && <Tag color="blue">推荐</Tag>}
+                      </Space>
+                      <Typography.Paragraph type="secondary" className="plan-question-description">
+                        {option.description}
+                      </Typography.Paragraph>
+                    </Radio>)}
+                    <Radio value="custom" className="plan-question-option">
+                      <Typography.Text strong>自定义方案</Typography.Text>
+                      <Typography.Paragraph type="secondary" className="plan-question-description">
+                        以上方案不合适时，输入你希望采用的处理方式。
+                      </Typography.Paragraph>
+                    </Radio>
+                  </Space>
+                </Radio.Group>
+              </Form.Item>
+              <Form.Item noStyle shouldUpdate>
+                {({ getFieldValue }) => getFieldValue(['answers', question.id, 'optionId']) === 'custom'
+                  ? <Form.Item
+                    name={['answers', question.id, 'custom']}
+                    label="你的方案"
+                    rules={[{ required: true, whitespace: true, message: '请输入自定义方案' }]}
+                  >
+                    <Input.TextArea autoSize={{ minRows: 2 }} placeholder="说明你希望采用的方案、范围或验收方式" />
+                  </Form.Item>
+                  : null}
+              </Form.Item>
+            </Card>;
+          })}</div>
         </Card>}
         <Card title="动态执行步骤" className="settings-card">
           <List rowKey={(step) => step.id} dataSource={data.plan.steps} renderItem={(step) => {
@@ -334,7 +415,7 @@ export function TaskDetailPage() {
             }}
           />
         </Card>
-        {planEditable && <Button htmlType="submit" icon={<ReloadOutlined />} loading={updatePlan.isPending}>保存当前修订</Button>}
+        {planDirectlyEditable && <Button htmlType="submit" icon={<ReloadOutlined />} loading={updatePlan.isPending}>保存当前修订</Button>}
       </Form> : <Card><Typography.Text type="secondary">任务提交分析后会在这里生成可确认的计划。</Typography.Text></Card>,
     },
     {
@@ -486,7 +567,7 @@ export function PreApprovalArtifacts({ artifacts }: {
             </Tag>
           </Space>}
           description={<>
-            <Typography.Paragraph className="artifact-content">{artifact.content}</Typography.Paragraph>
+            <MarkdownContent content={artifact.content} className="artifact-content" />
             <Typography.Text className="mono-text" type="secondary">
               {artifact.sourceExecutor}/{artifact.sourceModel} · {artifact.contentHash.slice(0, 12)}
             </Typography.Text>

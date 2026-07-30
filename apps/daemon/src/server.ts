@@ -20,6 +20,7 @@ import type { Scheduler } from './scheduler.js';
 interface ServerOptions {
   chooseFolder?: () => Promise<string>;
   chooseFile?: () => Promise<string>;
+  webRoot?: string;
 }
 
 export async function createServer(
@@ -370,11 +371,14 @@ export async function createServer(
     request.raw.once('close', () => clearInterval(interval));
   });
 
-  const webRoot = join(process.cwd(), 'apps', 'web', 'dist');
+  const webRoot = options.webRoot ?? join(process.cwd(), 'apps', 'web', 'dist');
   if (existsSync(webRoot)) {
     await server.register(fastifyStatic, {
       root: webRoot,
-      wildcard: false,
+      // Vite replaces the dist/assets directory atomically on every build.
+      // A wildcard route resolves files at request time; registering one route
+      // per file would leave a running daemon unable to serve newly hashed assets.
+      wildcard: true,
       cacheControl: false,
       setHeaders: (response, filePath) => {
         if (filePath.endsWith('index.html')) response.setHeader('cache-control', 'no-store');

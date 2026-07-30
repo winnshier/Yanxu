@@ -18,11 +18,13 @@ export interface StructuredExecutionInput {
   permissionMode?: 'standard' | 'managed';
   readOnly?: boolean;
   policy?: RuntimePermissionPolicy;
+  onSessionStarted?: (sessionId: string) => void | Promise<void>;
   onPermission?: (request: ExecutorPermissionRequest) => Promise<'once' | 'always' | 'reject'>;
 }
 
 export interface RuntimePermissionPolicy {
   allowedReadPatterns: string[];
+  allowedExternalDirectoryPatterns?: string[];
   allowedEditPatterns: string[];
   allowedBashPatterns: string[];
   taskGrants: Array<{ permission: string; patterns: string[] }>;

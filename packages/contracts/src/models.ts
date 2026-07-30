@@ -1,7 +1,7 @@
 export const taskStatuses = [
   'DRAFT', 'COMPOSING_PLAN', 'WAITING_PLAN_APPROVAL', 'PREPARING', 'QUEUED',
   'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING', 'WAITING_APPROVAL',
-  'WAITING_REAPPROVAL', 'PAUSED', 'BLOCKED', 'STOPPED', 'DELIVERED', 'ARCHIVED', 'REOPENED',
+  'WAITING_REAPPROVAL', 'PAUSED', 'BLOCKED', 'STOPPED', 'DELIVERED', 'ARCHIVED', 'CANCELLED', 'REOPENED',
 ] as const;
 
 export type TaskStatus = (typeof taskStatuses)[number];
@@ -253,6 +253,21 @@ export interface TaskVersionSummary {
   createdAt: string;
 }
 
+export interface PlanQuestionOption {
+  id: string;
+  label: string;
+  description: string;
+  value: string;
+  recommended: boolean;
+}
+
+export interface PlanQuestion {
+  id: string;
+  question: string;
+  options: PlanQuestionOption[];
+  answer: string | null;
+}
+
 export interface TaskPlan {
   id: string;
   taskId: string;
@@ -266,7 +281,7 @@ export interface TaskPlan {
   successCriteria: string[];
   assumptions: string[];
   risks: string[];
-  questions: Array<{ id: string; question: string; answer: string | null }>;
+  questions: PlanQuestion[];
   steps: ExecutionPlanStep[];
   permissions: string[];
   branchRoutes: BranchRoute[];

@@ -39,6 +39,7 @@ interface FakePlanConfiguration {
   failFirstImplementation?: boolean;
   delayFirstImplementation?: boolean;
   failReplan?: boolean;
+  skipImplementationWrite?: boolean;
 }
 
 class FakeOpenCodeAdapter implements ExecutorAdapter {
@@ -47,6 +48,8 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   private implementationAttempts = 0;
   private planningAttempts = 0;
   private readonly blocked = new Map<string, (error: Error) => void>();
+  readonly prompts: Array<{ title: string; prompt: string }> = [];
+  readonly executions: StructuredExecutionInput[] = [];
 
   constructor(private readonly configuration: FakePlanConfiguration) {}
 
@@ -71,8 +74,11 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
 
   async executeStructured<T>(input: StructuredExecutionInput): Promise<StructuredExecutionResult<T>> {
     this.sessionSequence += 1;
+    this.prompts.push({ title: input.title, prompt: input.prompt });
+    this.executions.push(input);
     const sessionId = `fake-session-${this.sessionSequence}`;
     input.runtime.sessionIds.push(sessionId);
+    await input.onSessionStarted?.(sessionId);
 
     if (input.title.startsWith('确认前技能选择')) {
       return this.result<T>(sessionId, {
@@ -114,10 +120,12 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
           this.blocked.set(input.runtime.id, reject);
         });
       }
-      writeFileSync(
-        join(input.runtime.workspacePath, this.configuration.directoryId, 'feature.txt'),
-        `implementation attempt ${this.implementationAttempts}\n`,
-      );
+      if (!this.configuration.skipImplementationWrite) {
+        writeFileSync(
+          join(input.runtime.workspacePath, this.configuration.directoryId, 'feature.txt'),
+          `implementation attempt ${this.implementationAttempts}\n`,
+        );
+      }
       return this.result<T>(sessionId, skillResult(
         'implementation-report',
         '# Implementation\n\n已新增 feature.txt。',
@@ -300,6 +308,12 @@ describe('scheduler end-to-end', () => {
         ],
       });
       expect(deliveredEvidence.deliveryReport?.markdown).toContain('## 实际变更');
+      const implementationArtifact = deliveredEvidence.artifacts.find((artifact) => artifact.artifactType === 'implementation-report');
+      const reviewExecution = fixture.adapter.executions.find((execution) => execution.title.includes('交付评审'));
+      expect(implementationArtifact).toBeDefined();
+      expect(reviewExecution?.policy?.allowedReadPatterns).toContain(implementationArtifact?.artifactPath);
+      expect(reviewExecution?.policy?.allowedExternalDirectoryPatterns).toContain(implementationArtifact?.artifactPath);
+      expect(reviewExecution?.policy?.allowedExternalDirectoryPatterns).not.toContain('*');
       const changedFeature = deliveredEvidence.changeManifests
         .flatMap((manifest) => manifest.files.map((file) => ({ manifest, file })))
         .find(({ file }) => file.path === 'feature.txt');
@@ -406,6 +420,12 @@ describe('scheduler end-to-end', () => {
         () => fixture.store.getTask(fixture.taskId),
         (current) => current.status === 'RUNNING' && current.steps.some((step) => step.status === 'running'),
       );
+      await waitFor(
+        () => fixture.store.getTaskEvidence(task.id).sessions.at(-1)?.externalSessionId,
+        (externalSessionId) => Boolean(externalSessionId),
+      );
+      expect(fixture.store.getTaskEvidence(task.id).sessions.at(-1)?.externalSessionId)
+        .toMatch(/^fake-session-/);
 
       task = fixture.store.commandTask(task.id, 'stop', task.stateVersion);
       await fixture.scheduler.abortTask(task.id);
@@ -467,6 +487,37 @@ describe('scheduler end-to-end', () => {
       fixture.database.close();
     }
   }, 20_000);
+
+  it('rejects a successful implementation response when Git reports zero changed files', async () => {
+    const fixture = createFixture(false, false, false, false, false, false, false, true);
+    try {
+      fixture.scheduler.start();
+      let task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      fixture.store.commandTask(task.id, 'confirm', task.stateVersion);
+      const failedSession = await waitFor(
+        () => fixture.store.getTaskEvidence(task.id).sessions.find((session) =>
+          session.status === 'failed' && session.error?.includes('隔离工作区没有任何可由 Git 重建的文件变更')),
+        (session) => Boolean(session),
+      );
+      expect(failedSession).toMatchObject({
+        status: 'failed',
+      });
+      expect(failedSession?.externalSessionId).toMatch(/^fake-session-/);
+      const implementationPrompt = fixture.adapter.prompts.find((item) => item.title.includes('内容实施'))?.prompt;
+      expect(implementationPrompt).toContain('Write 会递归创建缺失的父目录');
+      expect(implementationPrompt).toContain('不要先调用 mkdir');
+      expect(fixture.store.getTask(task.id).status).not.toBe('DELIVERED');
+      expect(fixture.store.getTaskEvidence(task.id).changeManifests).toEqual([]);
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 12_000);
 
   it('discards a failed runtime and retries the step in a newly started runtime', async () => {
     const fixture = createFixture(false, false, true);
@@ -566,6 +617,7 @@ function createFixture(
   emptyRepository = false,
   failReplan = false,
   uncheckedRegistry = false,
+  skipImplementationWrite = false,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'yanxu-scheduler-e2e-'));
   temporaryDirectories.push(root);
@@ -628,6 +680,7 @@ function createFixture(
     failFirstImplementation,
     delayFirstImplementation,
     failReplan,
+    skipImplementationWrite,
   });
   const uncheckedOpenCode: ExecutorInstallation = {
     ...availableOpenCode,

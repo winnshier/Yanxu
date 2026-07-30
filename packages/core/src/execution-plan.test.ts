@@ -135,13 +135,13 @@ describe('dynamic execution plans', () => {
         : step),
     });
     expect(task.status).toBe('WAITING_REAPPROVAL');
-    expect(task.plan?.version).toBe(3);
+    expect(task.plan?.version).toBe(2);
     expect(task.steps[1]?.title).toBe('验证功能点可追溯性');
     expect(database.prepare('SELECT status FROM task_steps WHERE id = ?').get(historicalStepId))
       .toEqual({ status: 'skipped' });
     expect(database.prepare('SELECT step_id, status FROM agent_sessions WHERE id = ?').get(historicalSessionId))
       .toEqual({ step_id: historicalStepId, status: 'failed' });
-    expect(store.listTaskPlans(task.id).map((plan) => plan.version)).toEqual([3, 2, 1]);
+    expect(store.listTaskPlans(task.id).map((plan) => plan.version)).toEqual([2, 1]);
     task = store.updatePlanAnswers(task.id, {
       answers: {},
       stepAssignments: task.plan?.steps.map((step) => ({ stepId: step.id, agentId: step.agentId })) ?? [],
@@ -151,6 +151,8 @@ describe('dynamic execution plans', () => {
         targetBranch: route.targetBranch,
       })) ?? [],
     });
+    expect(task.plan?.version).toBe(2);
+    expect(store.listTaskPlans(task.id).map((plan) => plan.version)).toEqual([2, 1]);
     expect(database.prepare('SELECT status FROM task_steps WHERE id = ?').get(historicalStepId))
       .toEqual({ status: 'skipped' });
     expect(database.prepare('SELECT step_id, status FROM agent_sessions WHERE id = ?').get(historicalSessionId))
@@ -162,7 +164,7 @@ describe('dynamic execution plans', () => {
     task = store.commandTask(task.id, 'confirm', task.stateVersion);
 
     expect(task.status).toBe('PREPARING');
-    expect(task.snapshot?.planVersion).toBe(4);
+    expect(task.snapshot?.planVersion).toBe(2);
     const snapshot = store.getRunSnapshot(task.id);
     expect(snapshot?.agents.map((agent) => agent.id)).toEqual([product.id, tester.id]);
     store.updateTeam(team.id, { name: team.name, memberIds: [] });
@@ -173,6 +175,33 @@ describe('dynamic execution plans', () => {
     const initializedProject = store.ensureTaskDirectoriesGit(task.id);
     expect(initializedProject.directories[0]?.gitInitialized).toBe(true);
     expect(initializedProject.directories[0]?.currentBranch).toBe('main');
+    const preparedDirectory = initializedProject.directories[0];
+    if (!preparedDirectory) throw new Error('project directory missing');
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO jobs(
+        id, type, aggregate_id, payload_json, status, priority, available_at, attempt, max_attempts,
+        dedupe_key, last_error, created_at, updated_at
+      ) VALUES (?, 'RUN_SKILL_STEP', ?, '{}', 'FAILED', 70, ?, 3, 3, ?, 'historical failure', ?, ?)
+    `).run('legacy-run-skill-job', task.id, timestamp, `task:${task.id}:step:next:0`, timestamp, timestamp);
+    task = store.savePreparedWorkspaces(task.id, [{
+      taskId: task.id,
+      directoryId: preparedDirectory.id,
+      workspacePath: join(root, 'prepared-workspace'),
+      scopePath: join(root, 'prepared-workspace'),
+      baselineCommit: 'test-baseline',
+      taskBranch: 'yanxu/test-task',
+      targetBranch: 'main',
+    }]);
+    expect(task.status).toBe('RUNNING');
+    expect(database.prepare(`
+      SELECT status, dedupe_key FROM jobs
+      WHERE aggregate_id = ? AND type = 'RUN_SKILL_STEP' AND status = 'READY'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(task.id)).toEqual({
+      status: 'READY',
+      dedupe_key: `task:${task.id}:plan:2:step:${task.steps[0]?.id}:attempt:1`,
+    });
     database.close();
   });
 
@@ -208,7 +237,27 @@ describe('dynamic execution plans', () => {
       successCriteria: ['生成用户选择的格式'],
       assumptions: [],
       risks: [],
-      questions: [{ id: 'format-question', question: '导出格式是什么？', answer: null }],
+      questions: [{
+        id: 'format-question',
+        question: '导出格式是什么？',
+        options: [
+          {
+            id: 'format-csv',
+            label: 'CSV',
+            description: '适合表格软件和批量处理。',
+            value: '导出为 CSV 格式。',
+            recommended: true,
+          },
+          {
+            id: 'format-json',
+            label: 'JSON',
+            description: '适合程序继续处理。',
+            value: '导出为 JSON 格式。',
+            recommended: false,
+          },
+        ],
+        answer: null,
+      }],
       permissions: ['读取项目目录'],
       steps: [{
         id: 'requirement-step',

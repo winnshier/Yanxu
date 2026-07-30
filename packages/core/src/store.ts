@@ -26,6 +26,7 @@ import type {
   KnowledgeItem,
   PermissionManifest,
   PermissionRequest,
+  PlanQuestionOption,
   PreApprovalArtifactVersion,
   Project,
   ProjectDirectory,
@@ -34,7 +35,6 @@ import type {
   ProjectSpaceIntegrityReport,
   ProjectSpaceRestorePreview,
   QualityGate,
-  RecoveryRecord,
   RequestPlanRevisionInput,
   SkillArtifactOutput,
   SystemSettings,
@@ -312,6 +312,24 @@ function id(prefix: string): string {
   return `${prefix}_${randomUUID().replaceAll('-', '')}`;
 }
 
+function createPlanQuestionOptions(
+  options: Array<Omit<PlanQuestionOption, 'id' | 'recommended'> & { recommended?: boolean }>,
+): PlanQuestionOption[] {
+  const recommendedIndex = options.findIndex((option) => option.recommended);
+  const firstIndex = recommendedIndex >= 0 ? recommendedIndex : 0;
+  const ordered = [
+    options[firstIndex]!,
+    ...options.filter((_, index) => index !== firstIndex),
+  ];
+  return ordered.map((option, index) => ({
+    id: id('option'),
+    label: option.label,
+    description: option.description,
+    value: option.value,
+    recommended: index === 0,
+  }));
+}
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -366,7 +384,7 @@ export class YanxuStore {
     const rows = this.database.prepare('SELECT key, value_json FROM settings').all() as Array<{ key: string; value_json: string }>;
     const values = Object.fromEntries(rows.map((row) => [row.key, parseJson<unknown>(row.value_json, null)]));
     const coordinatorExecutor = (values.coordinatorExecutor ?? 'opencode') as SystemSettings['coordinatorExecutor'];
-    const coordinatorModel = String(values.coordinatorModel ?? '');
+    const coordinatorModel = typeof values.coordinatorModel === 'string' ? values.coordinatorModel : '';
     const installation = executors.find((executor) => executor.id === coordinatorExecutor);
     return {
       maxParallelTasks: Number(values.maxParallelTasks ?? 2),
@@ -744,7 +762,7 @@ export class YanxuStore {
       FROM tasks t
       JOIN task_steps s ON s.task_id = t.id
       JOIN json_each(s.directory_ids_json) d ON d.value = ?
-      WHERE t.project_id = ? AND t.status != 'ARCHIVED'
+      WHERE t.project_id = ? AND t.status NOT IN ('ARCHIVED', 'CANCELLED')
       ORDER BY t.updated_at DESC
     `).all(directoryId, row.project_id) as Array<{ id: string; title: string; status: TaskStatus }>;
     if (referencingTasks.length > 0) {
@@ -1055,7 +1073,7 @@ export class YanxuStore {
     const where: string[] = [];
     const parameters: string[] = [];
     if (options?.projectId) { where.push('t.project_id = ?'); parameters.push(options.projectId); }
-    if (!options?.includeArchived) where.push(`t.status != 'ARCHIVED'`);
+    if (!options?.includeArchived) where.push(`t.status NOT IN ('ARCHIVED', 'CANCELLED')`);
     const clause = where.length > 0 ? `WHERE ${where.join(' AND ')}` : '';
     const rows = this.database.prepare(`
       SELECT t.*, p.name AS project_name, tm.name AS team_name
@@ -1085,7 +1103,12 @@ export class YanxuStore {
     const next = transitionTask(task.status, 'submit');
     this.database.transaction(() => {
       this.updateTaskState(taskId, task.stateVersion, next, 'task.analysis_requested', '任务已提交分析，等待协调执行器生成计划。');
-      this.enqueueJob('COMPOSE_PLAN', taskId, `task:${taskId}:compose-plan:${task.stateVersion + 1}`, 100);
+      this.enqueueJobOrAssertRunnable(
+        'COMPOSE_PLAN',
+        taskId,
+        `task:${taskId}:compose-plan:${task.stateVersion + 1}`,
+        100,
+      );
     })();
     return this.getTask(taskId);
   }
@@ -1597,7 +1620,7 @@ export class YanxuStore {
         feedback,
         artifactPath: artifact.path,
       });
-      this.enqueueJob(
+      this.enqueueJobOrAssertRunnable(
         'COMPOSE_PLAN',
         taskId,
         `task:${taskId}:replan:${task.stateVersion + 1}`,
@@ -1625,6 +1648,10 @@ export class YanxuStore {
       ? this.resolveBranchRoutes(task, project, nextSteps, input.branchRoutes)
       : task.plan.branchRoutes;
     const waivedGateIds = new Set(input.waivedGateIds ?? task.plan.qualityGates.filter((gate) => gate.status === 'waived').map((gate) => gate.id));
+    const nextQualityGates = task.plan.qualityGates.map((gate) => ({
+      ...gate,
+      status: waivedGateIds.has(gate.id) ? 'waived' as const : 'pending' as const,
+    }));
     const answersChanged = task.plan.questions.some((question) => {
       const nextAnswer = input.answers[question.id];
       return nextAnswer !== undefined && nextAnswer.trim() !== (question.answer ?? '').trim();
@@ -1635,6 +1662,12 @@ export class YanxuStore {
       || (input.nonScope !== undefined && JSON.stringify(input.nonScope) !== JSON.stringify(task.plan.nonScope))
       || (input.successCriteria !== undefined
         && JSON.stringify(input.successCriteria) !== JSON.stringify(task.plan.successCriteria));
+    const planContentChanged = requirementFieldsChanged
+      || JSON.stringify(nextSteps) !== JSON.stringify(task.plan.steps)
+      || JSON.stringify(nextRoutes) !== JSON.stringify(task.plan.branchRoutes)
+      || JSON.stringify(input.permissions ?? task.plan.permissions) !== JSON.stringify(task.plan.permissions)
+      || JSON.stringify(nextQualityGates) !== JSON.stringify(task.plan.qualityGates);
+    if (!planContentChanged) return task;
     let nextPlan: TaskPlan = {
       ...task.plan,
       version: task.plan.version + 1,
@@ -1647,10 +1680,7 @@ export class YanxuStore {
       steps: nextSteps,
       branchRoutes: nextRoutes,
       permissions: input.permissions ?? task.plan.permissions,
-      qualityGates: task.plan.qualityGates.map((gate) => ({
-        ...gate,
-        status: waivedGateIds.has(gate.id) ? 'waived' : 'pending',
-      })),
+      qualityGates: nextQualityGates,
       answersReviewedAt: answersChanged ? null : task.plan.answersReviewedAt,
       createdAt: now(),
       confirmedAt: null,
@@ -1804,6 +1834,16 @@ export class YanxuStore {
           WHERE task_id = ? AND status = 'pending'
         `).run(now(), taskId);
       }
+      if (command === 'cancel') {
+        this.database.prepare(`
+          UPDATE permission_requests SET status = 'resolved', decision = 'reject', message = '任务已废弃。', resolved_at = ?
+          WHERE task_id = ? AND status = 'pending'
+        `).run(now(), taskId);
+        this.database.prepare(`
+          UPDATE jobs SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
+          WHERE aggregate_id = ? AND status = 'READY'
+        `).run(now(), taskId);
+      }
       if (command === 'self_merge') {
         this.database.prepare(`
           UPDATE delivery_conflicts
@@ -1821,7 +1861,14 @@ export class YanxuStore {
           })),
         }), now());
       }
-      if (command === 'confirm') this.enqueueJob('PREPARE_WORKSPACE', taskId, `task:${taskId}:prepare:${task.stateVersion + 1}`, 80);
+      if (command === 'confirm') {
+        this.enqueueJobOrAssertRunnable(
+          'PREPARE_WORKSPACE',
+          taskId,
+          `task:${taskId}:prepare:${task.stateVersion + 1}`,
+          80,
+        );
+      }
     })();
     if (snapshot) {
       const project = this.getProject(task.projectId);
@@ -1830,6 +1877,10 @@ export class YanxuStore {
     if (requirementRevision) {
       this.recordProjectSpaceCommit(this.getProject(task.projectId).projectSpacePath,
         `docs: revise requirement v${requirementRevision.version} for ${taskId}`, taskId);
+    }
+    if (command === 'cancel') {
+      this.recordProjectSpaceCommit(this.getProject(task.projectId).projectSpacePath,
+        `docs: cancel task ${taskId}`, taskId);
     }
     if (command === 'self_merge') this.createDeliveryReport(taskId);
     return this.getTask(taskId);
@@ -1899,9 +1950,22 @@ export class YanxuStore {
     }
 
     this.database.transaction(() => {
+      const cleanupTimestamp = now();
+      this.database.prepare(`
+        UPDATE task_steps
+        SET status = 'skipped', completed_at = COALESCE(completed_at, ?)
+        WHERE task_id = ? AND position >= 1000 AND status != 'succeeded'
+      `).run(cleanupTimestamp, task.id);
+      this.database.prepare(`
+        UPDATE tasks SET active_step_id = NULL
+        WHERE id = ? AND active_step_id IN (
+          SELECT id FROM task_steps WHERE task_id = ? AND position >= 1000
+        )
+      `).run(task.id, task.id);
       if (resetRunningStep) {
         this.database.prepare(`
-          UPDATE task_steps SET status = 'pending', completed_at = NULL WHERE task_id = ? AND status = 'running'
+          UPDATE task_steps SET status = 'pending', completed_at = NULL
+          WHERE task_id = ? AND status = 'running' AND position < 1000
         `).run(task.id);
         this.database.prepare('UPDATE tasks SET active_step_id = NULL WHERE id = ?').run(task.id);
       }
@@ -1910,7 +1974,7 @@ export class YanxuStore {
         resumedTo: nextStatus,
       });
       if (nextJob) {
-        this.enqueueJob(
+        this.enqueueJobOrAssertRunnable(
           nextJob.type,
           task.id,
           `task:${task.id}:resume:${task.stateVersion + 1}:${nextJob.type}`,
@@ -2267,6 +2331,12 @@ export class YanxuStore {
     if (task.status !== 'PREPARING' && task.status !== 'QUEUED') {
       throw new DomainError('WORKSPACE_STATE_INVALID', '任务当前不能准备工作区。', 409);
     }
+    const nextPending = task.steps.find((step) => step.status === 'pending');
+    if (!nextPending) {
+      throw new DomainError('NEXT_SKILL_STEP_NOT_FOUND', '工作区已准备，但任务没有可执行的 SkillStep。', 409);
+    }
+    const planVersion = task.snapshot?.planVersion ?? task.plan?.version ?? 0;
+    const runJobDedupeKey = `task:${taskId}:plan:${planVersion}:step:${nextPending.id}:attempt:${nextPending.attempt + 1}`;
     const statement = this.database.prepare(`
       INSERT INTO task_workspaces(task_id, directory_id, workspace_path, baseline_commit, task_branch, target_branch, status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, 'ready', ?, ?)
@@ -2283,7 +2353,7 @@ export class YanxuStore {
       this.updateTaskState(taskId, task.stateVersion, 'RUNNING', 'workspace.prepared', '隔离任务工作区已准备完成。', {
         directories: workspaces.map((workspace) => workspace.directoryId),
       });
-      this.enqueueJob('RUN_SKILL_STEP', taskId, `task:${taskId}:step:next:0`, 70);
+      this.enqueueJobOrAssertRunnable('RUN_SKILL_STEP', taskId, runJobDedupeKey, 70);
     })();
     return this.getTask(taskId);
   }
@@ -2346,6 +2416,23 @@ export class YanxuStore {
       VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
     `).run(sessionId, taskId, step.id, agent.id, agent.executor, agent.model, now());
     return sessionId;
+  }
+
+  recordExternalSessionId(sessionRecordId: string, externalSessionId: string): void {
+    const session = this.database.prepare(`
+      SELECT task_id, step_id FROM agent_sessions WHERE id = ?
+    `).get(sessionRecordId) as { task_id: string; step_id: string } | undefined;
+    if (!session) throw new DomainError('AGENT_SESSION_NOT_FOUND', '执行会话不存在。', 404);
+    const result = this.database.prepare(`
+      UPDATE agent_sessions SET external_session_id = ?
+      WHERE id = ? AND status = 'running'
+    `).run(externalSessionId, sessionRecordId);
+    if (result.changes !== 1) return;
+    this.appendEvent('task', session.task_id, 'agent_session.connected', 'executor', '本地执行器会话已建立。', {
+      sessionRecordId,
+      externalSessionId,
+      stepId: session.step_id,
+    });
   }
 
   completeStep(
@@ -2510,10 +2597,20 @@ export class YanxuStore {
         && (!nextPending || nextPending.skillId === 'delivery-review');
       if (gatesRequiredBeforeNextStep) {
         this.updateTaskState(taskId, task.stateVersion, 'VALIDATING', 'quality_gate.started', '开始运行独立质量门禁。');
-        this.enqueueJob('RUN_QUALITY_GATE', taskId, `task:${taskId}:gates:${step.attempt + 1}`, 75);
+        this.enqueueJobOrAssertRunnable(
+          'RUN_QUALITY_GATE',
+          taskId,
+          `task:${taskId}:gates:${step.attempt + 1}`,
+          75,
+        );
       } else if (nextPending) {
         this.updateTaskState(taskId, task.stateVersion, 'RUNNING', 'task.step_advanced', `准备执行下一步：${nextPending.title}。`);
-        this.enqueueJob('RUN_SKILL_STEP', taskId, `task:${taskId}:step:${nextPending.id}:attempt:${nextPending.attempt + 1}`, 70);
+        this.enqueueJobOrAssertRunnable(
+          'RUN_SKILL_STEP',
+          taskId,
+          `task:${taskId}:step:${nextPending.id}:attempt:${nextPending.attempt + 1}`,
+          70,
+        );
       } else {
         this.updateTaskState(taskId, task.stateVersion, 'DELIVERED', 'task.delivered', '全部 SkillStep 与质量门禁已完成，等待交付确认。');
       }
@@ -2547,10 +2644,24 @@ export class YanxuStore {
       `tasks/${taskId}/steps/${step.position + 1}-${step.skillId}/attempt-${step.attempt}-${result.status}.json`,
       `${JSON.stringify({ result, artifactVersions }, null, 2)}\n`,
     );
-    const implementationStep = task.steps.find((item) => item.skillId === 'implementation');
-    const canRetryImplementation = result.status === 'changes_required'
-      && implementationStep
-      && implementationStep.attempt <= retryLimit;
+    const implementationStep = task.steps.find((item) => item.skillId === 'implementation' && item.position < step.position);
+    const precedingProducerStep = task.steps
+      .filter((item) => item.position < step.position && item.position < 1000 && item.skillId !== 'delivery-review')
+      .sort((left, right) => right.position - left.position)[0];
+    const correctionStep = implementationStep ?? precedingProducerStep;
+    const reviewRetryCount = (this.database.prepare(`
+      SELECT COUNT(*) AS count FROM workflow_events
+      WHERE aggregate_type = 'task' AND aggregate_id = ? AND event_type = 'task.review_retrying'
+        AND seq > COALESCE((
+          SELECT MAX(seq) FROM workflow_events
+          WHERE aggregate_type = 'task' AND aggregate_id = ?
+            AND event_type IN ('task.confirm', 'plan.auto_reapproved')
+        ), 0)
+    `).get(taskId, taskId) as { count: number }).count;
+    const canRetryCorrection = result.status === 'changes_required'
+      && Boolean(correctionStep)
+      && reviewRetryCount < retryLimit;
+    const planVersion = task.snapshot?.planVersion ?? task.plan?.version ?? 0;
 
     this.database.transaction(() => {
       const insertArtifact = this.database.prepare(`
@@ -2615,28 +2726,29 @@ export class YanxuStore {
       if (result.status === 'blocked') {
         this.updateTaskState(taskId, task.stateVersion, 'BLOCKED', 'task.blocked',
           `${step.title} 返回阻塞结论，需要人工处理。`, { stepId, issues: result.issues ?? [] });
-      } else if (canRetryImplementation && implementationStep) {
+      } else if (canRetryCorrection && correctionStep) {
         this.database.prepare(`
           UPDATE task_steps SET status = 'pending', completed_at = NULL, summary = NULL
-          WHERE task_id = ? AND position >= ?
-        `).run(taskId, implementationStep.position);
+          WHERE task_id = ? AND position >= ? AND position < 1000
+        `).run(taskId, correctionStep.position);
         this.updateTaskState(taskId, task.stateVersion, 'RETRYING', 'task.review_retrying',
-          `${step.title} 要求整改，带着评审证据重新执行 ${implementationStep.title}。`, {
+          `${step.title} 要求整改，带着评审证据重新执行 ${correctionStep.title}。`, {
             stepId,
-            implementationStepId: implementationStep.id,
+            correctionStepId: correctionStep.id,
+            implementationStepId: correctionStep.skillId === 'implementation' ? correctionStep.id : undefined,
             issues: result.issues ?? [],
           });
-        this.enqueueJob(
+        this.enqueueJobOrAssertRunnable(
           'RUN_SKILL_STEP',
           taskId,
-          `task:${taskId}:review-fix:${implementationStep.id}:attempt:${implementationStep.attempt + 1}`,
+          `task:${taskId}:plan:${planVersion}:review-fix:${correctionStep.id}:cycle:${reviewRetryCount + 1}`,
           90,
         );
       }
     })();
 
     this.recordProjectSpaceCommit(project.projectSpacePath, `docs: record ${step.skillId} ${result.status} for ${taskId}`, taskId);
-    if (result.status === 'changes_required' && !canRetryImplementation) {
+    if (result.status === 'changes_required' && !canRetryCorrection) {
       return this.requestAutomaticReplan(
         taskId,
         `${step.title} 要求整改：${result.summary}\n${(result.issues ?? []).join('\n')}`,
@@ -2714,7 +2826,12 @@ export class YanxuStore {
     } else {
       this.database.transaction(() => {
         this.updateTaskState(taskId, task.stateVersion, 'RUNNING', 'task.validation_passed', `质量门禁通过，继续执行 ${next.title}。`);
-        this.enqueueJob('RUN_SKILL_STEP', taskId, `task:${taskId}:step:${next.id}:attempt:${next.attempt + 1}`, 70);
+        this.enqueueJobOrAssertRunnable(
+          'RUN_SKILL_STEP',
+          taskId,
+          `task:${taskId}:step:${next.id}:attempt:${next.attempt + 1}`,
+          70,
+        );
       })();
     }
     return this.getTask(taskId);
@@ -2742,10 +2859,15 @@ export class YanxuStore {
     this.database.transaction(() => {
       this.database.prepare(`
         UPDATE task_steps SET status = 'pending', completed_at = NULL, summary = NULL
-        WHERE task_id = ? AND position >= ?
+        WHERE task_id = ? AND position >= ? AND position < 1000
       `).run(taskId, implementationStep.position);
       this.updateTaskState(taskId, task.stateVersion, 'RETRYING', 'task.retrying', `质量门禁失败，带着失败证据重新执行 ${implementationStep.title}。`);
-      this.enqueueJob('RUN_SKILL_STEP', taskId, `task:${taskId}:step:${implementationStep.id}:attempt:${implementationStep.attempt + 1}`, 85);
+      this.enqueueJobOrAssertRunnable(
+        'RUN_SKILL_STEP',
+        taskId,
+        `task:${taskId}:step:${implementationStep.id}:attempt:${implementationStep.attempt + 1}`,
+        85,
+      );
     })();
     return this.getTask(taskId);
   }
@@ -2765,14 +2887,14 @@ export class YanxuStore {
     this.database.transaction(() => {
       this.database.prepare(`
         UPDATE task_steps SET status = 'pending', completed_at = NULL
-        WHERE task_id = ? AND position >= ? AND status != 'succeeded'
+        WHERE task_id = ? AND position >= ? AND position < 1000 AND status != 'succeeded'
       `).run(taskId, activePosition);
       this.database.prepare(`
         UPDATE tasks SET active_step_id = NULL, auto_replan_count = auto_replan_count + 1 WHERE id = ?
       `).run(taskId);
       this.updateTaskState(taskId, task.stateVersion, 'REPLANNING', 'task.replan_requested',
         '自动修复已耗尽，协调器正在生成一次修订计划。', { trigger, feedback, autoResume });
-      this.enqueueJob('COMPOSE_PLAN', taskId, `task:${taskId}:automatic-replan:${task.stateVersion + 1}`, 100, {
+      this.enqueueJobOrAssertRunnable('COMPOSE_PLAN', taskId, `task:${taskId}:automatic-replan:${task.stateVersion + 1}`, 100, {
         feedback,
         autoResume,
         trigger,
@@ -3095,7 +3217,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         WHERE id = ? AND lease_owner = ?
       `).run(nextAttempt, error, now(), job.id, job.leaseOwner);
       const task = this.getTask(job.aggregateId);
-      if (!['ARCHIVED', 'DELIVERED', 'STOPPED'].includes(task.status)) {
+      if (!['ARCHIVED', 'CANCELLED', 'DELIVERED', 'STOPPED'].includes(task.status)) {
         shouldReplan = ['RUN_SKILL_STEP', 'RUN_QUALITY_GATE'].includes(job.type);
         if (!shouldReplan) {
           this.updateTaskState(task.id, task.stateVersion, 'BLOCKED', 'task.blocked', '自动重试已耗尽，需要人工处理。', { jobType: job.type, error });
@@ -3175,6 +3297,124 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       }
     })();
     return expired.length;
+  }
+
+  reconcileOrphanedActiveTasks(): number {
+    const candidates = this.database.prepare(`
+      SELECT id FROM tasks
+      WHERE status IN ('COMPOSING_PLAN', 'PREPARING', 'QUEUED', 'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING')
+        AND NOT EXISTS (
+          SELECT 1 FROM jobs
+          WHERE jobs.aggregate_id = tasks.id AND jobs.status IN ('READY', 'LEASED')
+        )
+      ORDER BY updated_at
+    `).all() as Array<{ id: string }>;
+    let recovered = 0;
+    for (const candidate of candidates) {
+      const task = this.getTask(candidate.id);
+      let jobType: string | null = null;
+      let priority = 70;
+      let payload: Record<string, unknown> = {};
+      const runningStep = task.steps.find((step) => step.status === 'running');
+      const pendingStep = task.steps.find((step) => step.status === 'pending');
+      let resetRunningStep = false;
+
+      if (task.status === 'COMPOSING_PLAN' || task.status === 'REPLANNING') {
+        jobType = 'COMPOSE_PLAN';
+        priority = 100;
+        const previous = this.database.prepare(`
+          SELECT payload_json FROM jobs
+          WHERE aggregate_id = ? AND type = 'COMPOSE_PLAN'
+          ORDER BY created_at DESC LIMIT 1
+        `).get(task.id) as { payload_json: string } | undefined;
+        payload = parseJson(previous?.payload_json ?? '{}', {});
+      } else if (task.status === 'PREPARING' || task.status === 'QUEUED') {
+        jobType = 'PREPARE_WORKSPACE';
+        priority = 80;
+      } else if (task.status === 'VALIDATING') {
+        jobType = 'RUN_QUALITY_GATE';
+        priority = 75;
+      } else if (runningStep) {
+        jobType = 'RUN_SKILL_STEP';
+        priority = 85;
+        resetRunningStep = true;
+      } else if (!this.requiredGatesSatisfied(task) && (!pendingStep || pendingStep.skillId === 'delivery-review')) {
+        jobType = 'RUN_QUALITY_GATE';
+        priority = 75;
+      } else if (pendingStep) {
+        jobType = 'RUN_SKILL_STEP';
+        priority = task.status === 'RETRYING' ? 85 : 70;
+      }
+
+      if (!jobType) {
+        this.updateTaskState(
+          task.id,
+          task.stateVersion,
+          'BLOCKED',
+          'recovery.orphaned_task_blocked',
+          '任务处于活跃状态，但没有可恢复的执行步骤或质量门禁。',
+          { previousStatus: task.status },
+        );
+        recovered += 1;
+        continue;
+      }
+
+      const recoveredJobType = jobType;
+      const dedupeKey = `task:${task.id}:orphan-recovery:${task.stateVersion}:${recoveredJobType}`;
+      const didRecover = this.database.transaction(() => {
+        const current = this.database.prepare(`
+          SELECT status, state_version FROM tasks WHERE id = ?
+        `).get(task.id) as { status: TaskStatus; state_version: number } | undefined;
+        if (!current || current.state_version !== task.stateVersion || current.status !== task.status) return false;
+        const runnableJob = this.database.prepare(`
+          SELECT 1 FROM jobs
+          WHERE aggregate_id = ? AND status IN ('READY', 'LEASED')
+          LIMIT 1
+        `).get(task.id);
+        if (runnableJob) return false;
+        if (resetRunningStep && runningStep) {
+          const timestamp = now();
+          this.database.prepare(`
+            UPDATE task_steps SET status = 'pending', completed_at = NULL
+            WHERE id = ? AND status = 'running'
+          `).run(runningStep.id);
+          this.database.prepare(`
+            UPDATE agent_sessions
+            SET status = 'interrupted', completed_at = ?,
+              error = COALESCE(error, 'Recovered an active task that no longer had a runnable job.')
+            WHERE task_id = ? AND step_id = ? AND status = 'running'
+          `).run(timestamp, task.id, runningStep.id);
+          this.database.prepare(`
+            UPDATE tasks SET active_step_id = NULL, updated_at = ? WHERE id = ?
+          `).run(timestamp, task.id);
+        }
+        this.enqueueJobOrAssertRunnable(recoveredJobType, task.id, dedupeKey, priority, payload);
+        const job = this.database.prepare(`
+          SELECT id FROM jobs WHERE dedupe_key = ?
+        `).get(dedupeKey) as { id: string };
+        this.database.prepare(`
+          INSERT INTO recovery_records(
+            id, task_id, job_id, reason, previous_owner, recovered_by, action, created_at
+          ) VALUES (?, ?, ?, 'active_task_without_job', NULL, NULL, ?, ?)
+        `).run(id('recovery'), task.id, job.id, `${recoveredJobType.toLowerCase()}_enqueued`, now());
+        this.appendEvent(
+          'task',
+          task.id,
+          'recovery.orphaned_task',
+          'scheduler',
+          '检测到活跃任务缺少后台作业，已自动恢复执行队列。',
+          {
+            previousStatus: task.status,
+            jobId: job.id,
+            jobType: recoveredJobType,
+            resetStepId: resetRunningStep ? runningStep?.id : null,
+          },
+        );
+        return true;
+      })();
+      if (didRecover) recovered += 1;
+    }
+    return recovered;
   }
 
   getBuiltins(): { roles: typeof builtinRoles; skills: typeof builtinSkills } {
@@ -3316,7 +3556,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const currentTaskVersion = this.getCurrentTaskVersion(row.id);
     const steps = (this.database.prepare(`
       SELECT * FROM task_steps
-      WHERE task_id = ? AND NOT (status = 'skipped' AND position >= 1000)
+      WHERE task_id = ? AND position < 1000
       ORDER BY position
     `).all(row.id) as StepRow[]).map((step) => ({
       id: step.id, taskId: step.task_id, position: step.position, skillId: step.skill_id, agentId: step.agent_id, title: step.title,
@@ -3333,6 +3573,10 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         preApprovalSkillIds: storedPlan.preApprovalSkillIds ?? [],
         preApprovalArtifacts: storedPlan.preApprovalArtifacts ?? [],
         answersReviewedAt: storedPlan.answersReviewedAt ?? null,
+        questions: (storedPlan.questions ?? []).map((question) => ({
+          ...question,
+          options: question.options ?? [],
+        })),
         confirmedAt: planRow?.confirmed_at ?? storedPlan.confirmedAt,
         steps: storedPlan.steps ?? steps.map((step) => ({
           id: step.id,
@@ -3435,12 +3679,39 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     dedupeKey: string,
     priority: number,
     payload: Record<string, unknown> = {},
-  ): void {
+  ): boolean {
     const timestamp = now();
-    this.database.prepare(`
+    const result = this.database.prepare(`
       INSERT OR IGNORE INTO jobs(id, type, aggregate_id, payload_json, status, priority, available_at, dedupe_key, created_at, updated_at)
       VALUES (?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?)
     `).run(id('job'), type, aggregateId, JSON.stringify(payload), priority, timestamp, dedupeKey, timestamp, timestamp);
+    return result.changes === 1;
+  }
+
+  private enqueueJobOrAssertRunnable(
+    type: string,
+    aggregateId: string,
+    dedupeKey: string,
+    priority: number,
+    payload: Record<string, unknown> = {},
+  ): void {
+    if (this.enqueueJob(type, aggregateId, dedupeKey, priority, payload)) return;
+    const existing = this.database.prepare(`
+      SELECT id, status FROM jobs WHERE dedupe_key = ? LIMIT 1
+    `).get(dedupeKey) as { id: string; status: string } | undefined;
+    if (existing && ['READY', 'LEASED'].includes(existing.status)) return;
+    throw new DomainError(
+      'JOB_NOT_QUEUED',
+      '任务状态已经推进，但后续后台作业未能入队。',
+      500,
+      {
+        aggregateId,
+        jobType: type,
+        dedupeKey,
+        conflictingJobId: existing?.id ?? null,
+        conflictingJobStatus: existing?.status ?? null,
+      },
+    );
   }
 
   private writeTaskVersion(projectSpace: string, taskId: string, version: number, input: CreateTaskInput): { path: string; hash: string } {
@@ -3498,7 +3769,11 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const createdAt = now();
     const list = (items: string[]) => items.length > 0 ? items.map((item) => `- ${item}`).join('\n') : '- 无';
     const questions = plan.questions.length > 0
-      ? plan.questions.map((item) => `- ${item.question}\n  - 回答：${item.answer?.trim() || '待回答'}`).join('\n')
+      ? plan.questions.map((item) => {
+        const options = item.options.map((option) =>
+          `  - ${option.recommended ? '推荐' : '备选'}：${option.label} — ${option.description}`).join('\n');
+        return `- ${item.question}\n${options || '  - 旧版计划未生成候选方案，可填写自定义方案'}\n  - 回答：${item.answer?.trim() || '待回答'}`;
+      }).join('\n')
       : '- 无';
     const preApprovalArtifacts = plan.preApprovalArtifacts.length > 0
       ? plan.preApprovalArtifacts.map((item) =>
@@ -3881,9 +4156,51 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       ...proposedQualityGates,
     ];
     const missingSkills = executionSteps.filter((step) => !step.agentId).map((step) => step.skillId);
-    const questions = [...(draft?.questions ?? [])];
-    if (!task.expectedOutput.trim()) questions.push({ id: id('q'), question: '这次任务最终必须交付哪些可验收结果？', answer: null });
-    if (missingSkills.length > 0) questions.push({ id: id('q'), question: `当前团队缺少这些 Skill 的执行人员：${missingSkills.join('、')}。请完善团队后再确认。`, answer: null });
+    const questions = (draft?.questions ?? []).map((question) => ({
+      ...question,
+      options: question.options ?? [],
+    }));
+    if (!task.expectedOutput.trim()) {
+      questions.push({
+        id: id('q'),
+        question: '这次任务最终必须交付哪些可验收结果？',
+        options: createPlanQuestionOptions([
+          {
+            label: '按计划标准交付',
+            description: '以计划中的成功标准、步骤产物和最终交付报告作为验收依据，适合目标已经基本明确的任务。',
+            value: '以当前计划的成功标准、各步骤结构化产物和最终交付报告作为本次可验收结果。',
+            recommended: true,
+          },
+          {
+            label: '先明确交付清单',
+            description: '要求协调器先列出具体文件、文档或可运行结果及验收方式，再进入执行。',
+            value: '请先在计划中补充明确的交付物清单、格式和验收方式，再启动任务。',
+          },
+        ]),
+        answer: null,
+      });
+    }
+    if (missingSkills.length > 0) {
+      const skillList = missingSkills.join('、');
+      questions.push({
+        id: id('q'),
+        question: `当前团队缺少这些 Skill 的执行人员：${skillList}。应该如何调整？`,
+        options: createPlanQuestionOptions([
+          {
+            label: '先完善团队',
+            description: '补充具备缺失 Skill 的人员后重新规划，保留当前任务目标和质量要求。',
+            value: `先为当前团队补充具备 ${skillList} 的可用人员，然后重新生成计划。`,
+            recommended: true,
+          },
+          {
+            label: '缩减任务范围',
+            description: '移除无法覆盖的步骤，并同步收窄目标、范围与成功标准。',
+            value: `调整计划，移除对 ${skillList} 的依赖，并同步缩减任务范围和成功标准。`,
+          },
+        ]),
+        answer: null,
+      });
+    }
 
     return {
       id: id('plan'), taskId: task.id, version,
@@ -3933,7 +4250,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const preApprovalArtifacts = plan.preApprovalArtifacts.map((artifact) =>
       `- ${artifact.title}（${artifact.artifactType} v${artifact.version}，${artifact.status}）\n  - 路径：${artifact.artifactPath}\n  - 哈希：${artifact.contentHash}`,
     ).join('\n');
-    return `# ${task.title} · 执行计划 v${plan.version}\n\n- 需求版本：v${plan.taskVersion}（${plan.taskVersionId}）\n- 确认前 Skills：${plan.preApprovalSkillIds.join('、') || '无'}\n\n## 目标\n\n${plan.goal}\n\n${section('范围', plan.scope)}\n${section('非范围', plan.nonScope)}\n${section('成功标准', plan.successCriteria)}\n${section('假设', plan.assumptions)}\n${section('风险', plan.risks)}\n## 确认前产物\n\n${preApprovalArtifacts || '- 无'}\n\n## 歧义问题\n\n${plan.questions.length ? plan.questions.map((item) => `- ${item.question}\n  - 回答：${item.answer ?? '待回答'}`).join('\n') : '- 无'}\n\n## 执行步骤\n\n${steps}\n\n## 分支路由\n\n${plan.branchRoutes.map((route) => `- ${route.directoryId}: ${route.sourceBranch}@${route.sourceCommit} → ${route.taskBranch} → ${route.targetBranch}`).join('\n')}\n\n${section('权限', plan.permissions)}\n## 质量门禁\n\n${plan.qualityGates.length ? plan.qualityGates.map((gate) => `- ${gate.name}: \`${gate.command}\`${gate.status === 'waived' ? '（已豁免）' : ''}`).join('\n') : '- 暂未识别已有自动化门禁，测试设计阶段必须补充。'}\n`;
+    const questions = plan.questions.map((item) => {
+      const options = item.options.map((option) =>
+        `  - ${option.recommended ? '推荐' : '备选'}：${option.label} — ${option.description}`).join('\n');
+      return `- ${item.question}\n${options || '  - 旧版计划未生成候选方案，可填写自定义方案'}\n  - 回答：${item.answer ?? '待回答'}`;
+    }).join('\n');
+    return `# ${task.title} · 执行计划 v${plan.version}\n\n- 需求版本：v${plan.taskVersion}（${plan.taskVersionId}）\n- 确认前 Skills：${plan.preApprovalSkillIds.join('、') || '无'}\n\n## 目标\n\n${plan.goal}\n\n${section('范围', plan.scope)}\n${section('非范围', plan.nonScope)}\n${section('成功标准', plan.successCriteria)}\n${section('假设', plan.assumptions)}\n${section('风险', plan.risks)}\n## 确认前产物\n\n${preApprovalArtifacts || '- 无'}\n\n## 歧义问题\n\n${questions || '- 无'}\n\n## 执行步骤\n\n${steps}\n\n## 分支路由\n\n${plan.branchRoutes.map((route) => `- ${route.directoryId}: ${route.sourceBranch}@${route.sourceCommit} → ${route.taskBranch} → ${route.targetBranch}`).join('\n')}\n\n${section('权限', plan.permissions)}\n## 质量门禁\n\n${plan.qualityGates.length ? plan.qualityGates.map((gate) => `- ${gate.name}: \`${gate.command}\`${gate.status === 'waived' ? '（已豁免）' : ''}`).join('\n') : '- 暂未识别已有自动化门禁，测试设计阶段必须补充。'}\n`;
   }
 
   private normalizePlanSteps(
@@ -4201,7 +4523,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           planVersion: plan.version,
           snapshotId: snapshot.id,
         });
-      this.enqueueJob('RUN_SKILL_STEP', taskId, `task:${taskId}:replan-resume:${task.plan?.version}`, 85);
+      this.enqueueJobOrAssertRunnable(
+        'RUN_SKILL_STEP',
+        taskId,
+        `task:${taskId}:replan-resume:${task.plan?.version}`,
+        85,
+      );
     })();
     this.recordProjectSpaceCommit(this.getProject(task.projectId).projectSpacePath, `docs: auto resume plan v${plan.version} for ${taskId}`, taskId);
     return this.getTask(taskId);
@@ -4270,7 +4597,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         });
       }
       const canRunProjectCommands = ['implementation', 'test-execution'].includes(step.skillId);
-      const commands = new Set(['git status*', 'git diff*']);
+      const commands = new Set(['pwd', 'ls', 'ls -la', 'git status*', 'git diff*']);
       if (canRunProjectCommands) {
         for (const gate of plan.qualityGates) {
           if (!step.directoryIds.includes(gate.directoryId) || gate.status === 'waived') continue;
@@ -4360,6 +4687,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
   private commandMessage(command: TaskCommand): string {
     const messages: Record<TaskCommand, string> = {
       submit: '提交任务分析。', confirm: '确认计划并启动任务。', pause: '请求暂停任务。', resume: '恢复任务。', stop: '立即停止任务并保留现场。',
+      cancel: '任务已废弃；执行现场与证据已保留。',
       self_merge: '保留本地任务分支，由用户自行合并；任务已归档。', merge: '任务分支已合并到目标分支；任务已归档。', reopen: '反馈问题并重新打开任务。',
     };
     return messages[command];

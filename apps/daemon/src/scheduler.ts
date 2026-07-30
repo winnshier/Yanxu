@@ -1,13 +1,51 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { SkillArtifactOutput, SkillDefinition, TaskContextPack, TaskFileDiff, TaskPlan } from '@yanxu/contracts';
+import type {
+  PlanQuestionOption,
+  SkillArtifactOutput,
+  SkillDefinition,
+  TaskContextPack,
+  TaskFileDiff,
+  TaskPlan,
+} from '@yanxu/contracts';
 import { DomainError, GitWorkspaceManager } from '@yanxu/core';
 import type { ClaimedJob, YanxuStore } from '@yanxu/core';
 import { OpenCodeAdapter } from '@yanxu/executors';
 import type { ExecutorAdapter, RuntimeHandle } from '@yanxu/executors';
 import type { ExecutorRegistry } from './executor-registry.js';
 import { runQualityGates } from './quality-gates.js';
+
+export function workspacePermissionPathPatterns(relativeRoot: string, absoluteRoot: string): string[] {
+  // OpenCode normalizes absolute file arguments before permission matching and
+  // currently reports them without the leading slash on macOS. Keep both forms
+  // so the approved workspace path still matches after that normalization.
+  const normalizedAbsoluteRoot = absoluteRoot.replace(/^\/+/, '');
+  return [...new Set([
+    relativeRoot,
+    `${relativeRoot}/**`,
+    absoluteRoot,
+    `${absoluteRoot}/**`,
+    normalizedAbsoluteRoot,
+    `${normalizedAbsoluteRoot}/**`,
+  ])];
+}
+
+export function contextPackReadPathPatterns(contextPack: TaskContextPack): string[] {
+  const explicitPaths = [
+    contextPack.manifestPath,
+    ...contextPack.upstreamArtifacts.map((artifact) => artifact.artifactPath),
+    ...contextPack.gateEvidence.map((gate) => gate.logPath),
+  ].filter((path): path is string => Boolean(path));
+  return [...new Set(explicitPaths.flatMap((path) => [path, path.replace(/^\/+/, '')]))];
+}
+
+interface ComposedPlanQuestionOption {
+  label: string;
+  description: string;
+  value: string;
+  recommended: boolean;
+}
 
 interface ComposedPlanOutput {
   goal: string;
@@ -16,7 +54,10 @@ interface ComposedPlanOutput {
   successCriteria: string[];
   assumptions: string[];
   risks: string[];
-  questions: Array<{ question: string }>;
+  questions: Array<{
+    question: string;
+    options: ComposedPlanQuestionOption[];
+  }>;
   steps: Array<{
     skillId: string;
     agentId: string | null;
@@ -67,7 +108,33 @@ const composedPlanSchema: Record<string, unknown> = {
     successCriteria: { type: 'array', items: { type: 'string' } },
     assumptions: { type: 'array', items: { type: 'string' } },
     risks: { type: 'array', items: { type: 'string' } },
-    questions: { type: 'array', items: { type: 'object', additionalProperties: false, properties: { question: { type: 'string' } }, required: ['question'] } },
+    questions: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          question: { type: 'string' },
+          options: {
+            type: 'array',
+            minItems: 2,
+            maxItems: 3,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                label: { type: 'string' },
+                description: { type: 'string' },
+                value: { type: 'string' },
+                recommended: { type: 'boolean' },
+              },
+              required: ['label', 'description', 'value', 'recommended'],
+            },
+          },
+        },
+        required: ['question', 'options'],
+      },
+    },
     steps: {
       type: 'array',
       minItems: 1,
@@ -109,6 +176,34 @@ const composedPlanSchema: Record<string, unknown> = {
   },
   required: ['goal', 'scope', 'nonScope', 'successCriteria', 'assumptions', 'risks', 'questions', 'steps', 'permissions', 'qualityGates'],
 };
+
+function normalizePlanQuestionOptions(options: ComposedPlanQuestionOption[]): PlanQuestionOption[] {
+  const normalized = options
+    .map((option) => ({
+      label: option.label.trim(),
+      description: option.description.trim(),
+      value: option.value.trim(),
+      recommended: option.recommended,
+    }))
+    .filter((option) => option.label && option.description && option.value)
+    .slice(0, 3);
+  if (normalized.length < 2) {
+    throw new Error('每个歧义问题必须提供至少两个有效方案。');
+  }
+  const recommendedIndex = normalized.findIndex((option) => option.recommended);
+  const firstIndex = recommendedIndex >= 0 ? recommendedIndex : 0;
+  const ordered = [
+    normalized[firstIndex]!,
+    ...normalized.filter((_, index) => index !== firstIndex),
+  ];
+  return ordered.map((option, index) => ({
+    id: `option_${randomUUID().replaceAll('-', '')}`,
+    label: option.label,
+    description: option.description,
+    value: option.value,
+    recommended: index === 0,
+  }));
+}
 
 export interface SkillResult {
   status: 'succeeded' | 'changes_required' | 'blocked';
@@ -259,6 +354,7 @@ export class Scheduler {
 
   start(): void {
     this.store.reconcileExpiredLeases(this.instanceId);
+    this.store.reconcileOrphanedActiveTasks();
     this.timer = setInterval(() => { void this.tick(); }, this.pollIntervalMs);
     void this.tick();
   }
@@ -392,6 +488,7 @@ export class Scheduler {
 
   private tick(): void {
     this.store.reconcileTimedOutLeases();
+    this.store.reconcileOrphanedActiveTasks();
     const capacity = this.store.getSettings(this.executors.list()).maxParallelTasks;
     if (this.activeJobs.size >= capacity) return;
     const job = this.store.claimReadyJob(this.instanceId);
@@ -408,7 +505,7 @@ export class Scheduler {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const task = this.store.getTask(job.aggregateId);
-      const jobWasSuperseded = ['STOPPED', 'PAUSED', 'WAITING_REAPPROVAL', 'BLOCKED'].includes(task.status)
+      const jobWasSuperseded = ['STOPPED', 'CANCELLED', 'PAUSED', 'WAITING_REAPPROVAL', 'BLOCKED'].includes(task.status)
         || (task.status === 'REPLANNING' && job.type !== 'COMPOSE_PLAN');
       if (jobWasSuperseded) {
         this.store.succeedJob(job.id, this.instanceId);
@@ -473,12 +570,18 @@ export class Scheduler {
     const workspaces = this.store.getPreparedWorkspaces(taskId);
     const baseCommits = new Map(workspaces.map((workspace) => [workspace.directoryId, this.git.head(workspace)]));
     const contextPack = this.store.buildContextPack(taskId, step.id);
+    const contextReadPatterns = contextPackReadPathPatterns(contextPack);
     const sessionRecordId = this.store.createAgentSession(taskId, step, agent);
     const readOnly = permissionManifest?.readOnly ?? step.skillId !== 'implementation';
-    const commandPatterns = permissionManifest?.allowedCommandPatterns
-      ?? (step.skillId === 'implementation' || step.skillId === 'test-execution'
-        ? this.allowedStepCommands(permissionDirectoryIds, snapshot)
-        : ['git status*', 'git diff*']);
+    const commandPatterns = [...new Set([
+      'pwd',
+      'ls',
+      'ls -la',
+      ...(permissionManifest?.allowedCommandPatterns
+        ?? (step.skillId === 'implementation' || step.skillId === 'test-execution'
+          ? this.allowedStepCommands(permissionDirectoryIds, snapshot)
+          : ['git status*', 'git diff*'])),
+    ])];
     const executionSettings = this.store.getSettings(this.executors.list());
     const abortController = this.registerTaskAbortController(taskId);
     const sessionTimeout = setTimeout(() => abortController.abort(), executionSettings.sessionTimeoutMs);
@@ -498,13 +601,20 @@ export class Scheduler {
         permissionMode: permissionManifest?.permissionMode ?? agent.permissionMode,
         readOnly,
         policy: {
-          allowedReadPatterns: this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
+          allowedReadPatterns: [
+            ...this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
+            ...contextReadPatterns,
+          ],
+          allowedExternalDirectoryPatterns: contextReadPatterns,
           allowedEditPatterns: this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
           allowedBashPatterns: commandPatterns,
           taskGrants: this.store.listTaskPermissionGrants(taskId),
           forbiddenReadPatterns: this.forbiddenReadPatterns(permissionDirectoryIds, snapshot),
           networkPolicy: executionSettings.networkPolicy,
           dependencyInstallPolicy: executionSettings.dependencyInstallPolicy,
+        },
+        onSessionStarted: (externalSessionId) => {
+          this.store.recordExternalSessionId(sessionRecordId, externalSessionId);
         },
         onPermission: async (request) => {
           const permission = this.store.createPermissionRequest(taskId, request.sessionId, request);
@@ -619,11 +729,28 @@ export class Scheduler {
           { ...result.output, status },
           this.store.getSettings(this.executors.list()).retryLimit,
         );
-        if (['BLOCKED', 'STOPPED', 'ARCHIVED'].includes(outcomeTask.status)) {
+        if (['BLOCKED', 'STOPPED', 'CANCELLED', 'ARCHIVED'].includes(outcomeTask.status)) {
           await this.adapter.stopRuntime(runtime);
           this.runtimes.delete(taskId);
         }
         return;
+      }
+      if (step.skillId === 'implementation') {
+        const changedFiles = inspections.flatMap((inspection) =>
+          inspection.files.map((file) => `${inspection.directoryId}:${file.path}`));
+        if (changedFiles.length === 0) {
+          throw new DomainError(
+            'IMPLEMENTATION_CHANGE_REQUIRED',
+            '内容实施返回成功，但隔离工作区没有任何可由 Git 重建的文件变更。Artifact 内容不能代替实际文件落盘。',
+            422,
+            {
+              taskId,
+              stepId: step.id,
+              attempt: step.attempt,
+              workspaceIds: workspaces.map((workspace) => workspace.directoryId),
+            },
+          );
+        }
       }
       const checkpoints = workspaces.map((workspace) => {
         const inspection = inspections.find((item) => item.directoryId === workspace.directoryId);
@@ -638,7 +765,7 @@ export class Scheduler {
       });
       this.store.completeStep(taskId, step.id, sessionRecordId, result.sessionId, result.output, checkpoints);
       const current = this.store.getTask(taskId);
-      if (['DELIVERED', 'BLOCKED', 'STOPPED', 'ARCHIVED'].includes(current.status)) {
+      if (['DELIVERED', 'BLOCKED', 'STOPPED', 'CANCELLED', 'ARCHIVED'].includes(current.status)) {
         await this.adapter.stopRuntime(runtime);
         this.runtimes.delete(taskId);
       }
@@ -699,10 +826,31 @@ export class Scheduler {
     const agent = step.agentId ? snapshot.agents.find((item) => item.id === step.agentId) : null;
     const role = snapshot.roles.find((item) => item.id === agent?.roleId);
     const workspaces = this.store.getPreparedWorkspaces(task.id).filter((workspace) => step.directoryIds.includes(workspace.directoryId));
+    const executionContextPack = {
+      ...contextPack,
+      directories: contextPack.directories.map((directory) => ({
+        id: directory.id,
+        displayName: directory.displayName,
+        gitInitialized: directory.gitInitialized,
+        currentBranch: directory.currentBranch,
+        isDirty: directory.isDirty,
+        contentTypes: directory.contentTypes,
+        stack: directory.stack,
+        commands: directory.commands,
+        localBranches: directory.localBranches,
+        scannedAt: directory.scannedAt,
+      })),
+    };
     const testDesignRule = step.skillId === 'test-design'
       ? '\n测试设计的 test-plan artifact.metadata.qualityGates 必须列出专项可执行门禁；每条 commandArgv 只能在冻结计划已有同目录命令后追加更窄的测试范围或参数，不能更换可执行程序或子命令。没有安全专项门禁时返回空数组并在正文说明原因。'
       : '';
-    return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据）：\n${JSON.stringify(contextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：严格遵守已批准范围；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required，无法安全继续时返回 blocked；其余 Skill 不得用这两个状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
+    const workspaceRule = step.skillId === 'implementation'
+      ? '当前步骤必须使用 OpenCode 的 Write/Edit 文件工具把批准的代码或文档真实写入授权隔离工作区。创建新文件时直接把授权工作区内的绝对文件路径交给 Write；Write 会递归创建缺失的父目录，不要先调用 mkdir，也不要用 echo、cat 或重定向代替文件工具。Artifact 只是实现报告，不能代替工作区文件；返回 succeeded 前必须通过 Git status/diff 确认至少一个批准范围内的文件发生变更，否则研序会拒绝本次结果。'
+      : '当前步骤工作区只读；不要在代码仓库或临时目录创建产物，完整内容必须通过 artifacts 返回，研序会将其版本化写入 ProjectSpace。';
+    const reviewRule = step.skillId === 'delivery-review'
+      ? ' 评审必须先核对 ChangeManifest 和 Git 实际文件：实施步骤 files=0、checkpoint 等于 baseline，或计划要求的目标文件不存在时，必须判定 changes_required。上下文中的 Artifact 摘要被截断时，应从授权只读工作区读取 ChangeManifest 对应文件，不得把截断误判为文件缺失。'
+      : '';
+    return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required，无法安全继续时返回 blocked；其余 Skill 不得用这两个状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
   }
 
   private async composePlan(taskId: string, revisionFeedback?: string, autoResume = false): Promise<void> {
@@ -795,10 +943,29 @@ export class Scheduler {
           ? new Date().toISOString()
           : null,
         questions: [
-          ...result.output.questions.map((item) => ({ id: `q_${randomUUID().replaceAll('-', '')}`, question: item.question, answer: null })),
+          ...result.output.questions.map((item) => ({
+            id: `q_${randomUUID().replaceAll('-', '')}`,
+            question: item.question,
+            options: normalizePlanQuestionOptions(item.options),
+            answer: null,
+          })),
           ...missingPreApprovalSkillIds.map((skillId) => ({
             id: `q_${randomUUID().replaceAll('-', '')}`,
             question: `协调器判定确认前需要 ${skillId}，但当前团队没有具备该 Skill 的可用人员。请先编辑团队，再请求重新生成计划。`,
+            options: normalizePlanQuestionOptions([
+              {
+                label: '先完善团队',
+                description: '为当前团队补充具备该 Skill 的可用人员，再重新生成完整计划。',
+                value: `先为当前团队补充具备 ${skillId} 的可用人员，然后重新生成计划。`,
+                recommended: true,
+              },
+              {
+                label: '缩减任务范围',
+                description: '移除依赖该 Skill 的工作，并同步收窄目标、范围和成功标准。',
+                value: `调整计划，移除对 ${skillId} 的依赖，并同步缩减任务范围和成功标准。`,
+                recommended: false,
+              },
+            ]),
             answer: null,
           })),
         ],
@@ -848,6 +1015,9 @@ export class Scheduler {
     snapshot: NonNullable<ReturnType<YanxuStore['getRunSnapshot']>>,
   ): string[] {
     const allowed = new Set<string>([
+      'pwd',
+      'ls',
+      'ls -la',
       'git status*',
       'git diff*',
     ]);
@@ -893,7 +1063,7 @@ export class Scheduler {
       const prefix = this.directoryScopePrefix(directory);
       const relativeRoot = prefix ? `${directoryId}/${prefix}` : directoryId;
       const absoluteRoot = prefix ? join(workspace.workspacePath, prefix) : workspace.workspacePath;
-      return [relativeRoot, `${relativeRoot}/**`, absoluteRoot, `${absoluteRoot}/**`];
+      return workspacePermissionPathPatterns(relativeRoot, absoluteRoot);
     });
   }
 
@@ -1047,7 +1217,7 @@ ${JSON.stringify({
       : '本任务未选择确认前 RequirementSpec；直接依据用户需求和项目事实规划。如果缺少产品人员导致无法可靠澄清范围，必须提出明确的歧义问题或能力缺口，不能自行补全。';
     return `你是研序的全局计划协调器。${requirementInstruction}你负责组合可确认的执行计划，不修改任何文件，不执行项目命令，也不要把 requirement-specification 再列入执行步骤。
 
-基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题；权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}
+基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题。提出问题前必须先分析并给出 2–3 个互斥、可直接执行的方案：推荐方案放在第一项且只能有一个 recommended=true；label 要简短；description 说明选择后的影响或取舍；value 是可直接吸收到计划里的完整答案。不要把“自行填写”作为方案，界面会统一提供自定义方案。权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}
 
 ${JSON.stringify(input, null, 2)}`;
   }

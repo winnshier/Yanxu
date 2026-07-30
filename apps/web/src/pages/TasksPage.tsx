@@ -32,7 +32,7 @@ export function TasksPage() {
   return (
     <div className="page-container">
       <PageHeader eyebrow="执行看板" title="任务" description="每条任务按实际 SkillStep 展开，当前、已完成和后续工作一眼可见。" actions={<Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建任务</Button>} />
-      <div className="toolbar toolbar-split"><Segmented value={group} onChange={(value) => setGroup(value as TaskGroup)} options={['全部', '需要处理', '运行中', '暂停 / 等待', '已交付']} /><Checkbox checked={archived} onChange={(event) => setArchived(event.target.checked)}>包含已归档</Checkbox></div>
+      <div className="toolbar toolbar-split"><Segmented value={group} onChange={(value) => setGroup(value as TaskGroup)} options={['全部', '需要处理', '运行中', '暂停 / 等待', '已交付']} /><Checkbox checked={archived} onChange={(event) => setArchived(event.target.checked)}>包含已归档 / 已废弃</Checkbox></div>
       <QueryState loading={tasks.isLoading} error={tasks.error} empty={filtered.length === 0} emptyText="当前筛选下没有任务。" onRetry={() => { void tasks.refetch(); }}>
         <Space direction="vertical" size={14} className="full-width">{filtered.map((task) => <TaskTrack key={task.id} task={task} />)}</Space>
       </QueryState>

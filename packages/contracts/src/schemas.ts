@@ -92,7 +92,7 @@ export type RequestPlanRevisionInput = Static<typeof requestPlanRevisionSchema>;
 export const taskCommandSchema = Type.Object({
   command: Type.Union([
     Type.Literal('submit'), Type.Literal('confirm'), Type.Literal('pause'), Type.Literal('resume'),
-    Type.Literal('stop'), Type.Literal('self_merge'), Type.Literal('merge'), Type.Literal('reopen'),
+    Type.Literal('stop'), Type.Literal('cancel'), Type.Literal('self_merge'), Type.Literal('merge'), Type.Literal('reopen'),
   ]),
   stateVersion: Type.Number({ minimum: 0 }),
   reason: Type.Optional(Type.String()),

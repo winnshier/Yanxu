@@ -20,4 +20,10 @@ describe('task transitions', () => {
     expect(transitionTask('WAITING_PLAN_APPROVAL', 'stop')).toBe('STOPPED');
     expect(transitionTask('WAITING_REAPPROVAL', 'stop')).toBe('STOPPED');
   });
+
+  it('turns a stopped task into a terminal cancelled task that cannot resume', () => {
+    expect(transitionTask('STOPPED', 'cancel')).toBe('CANCELLED');
+    expect(() => transitionTask('CANCELLED', 'resume')).toThrow(DomainError);
+    expect(transitionTask('CANCELLED', 'reopen')).toBe('REOPENED');
+  });
 });

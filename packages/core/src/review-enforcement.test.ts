@@ -131,6 +131,20 @@ describe('review enforcement', () => {
 
     const review = store.startOrResumeStep(task.id);
     const reviewSession = store.createAgentSession(task.id, review, reviewer);
+    const timestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO jobs(
+        id, type, aggregate_id, payload_json, status, priority, available_at,
+        attempt, max_attempts, dedupe_key, created_at, updated_at
+      ) VALUES (?, 'RUN_SKILL_STEP', ?, '{}', 'FAILED', 90, ?, 3, 3, ?, ?, ?)
+    `).run(
+      'legacy-review-fix-job',
+      task.id,
+      timestamp,
+      `task:${task.id}:review-fix:${implementation.id}:cycle:1`,
+      timestamp,
+      timestamp,
+    );
     task = store.handleNonPassingStep(task.id, review.id, reviewSession, 'review-external', {
       status: 'changes_required',
       summary: '缺少异常路径处理。',
@@ -149,6 +163,117 @@ describe('review enforcement', () => {
       expect.objectContaining({ artifactType: 'delivery-review' }),
     ]);
     expect(store.listEvents(task.id).some((event) => event.type === 'skill_step.changes_required')).toBe(true);
+    const correctionJob = database.prepare(`
+      SELECT status, dedupe_key FROM jobs
+      WHERE aggregate_id = ? AND dedupe_key LIKE ?
+      ORDER BY created_at DESC LIMIT 1
+    `).get(
+      task.id,
+      `task:${task.id}:plan:%:review-fix:${implementation.id}:cycle:1`,
+    ) as { status: string; dedupe_key: string } | undefined;
+    expect(correctionJob).toMatchObject({ status: 'READY' });
+    expect(correctionJob?.dedupe_key).toContain(`plan:${task.snapshot?.planVersion}`);
+    database.close();
+  });
+
+  it('routes documentation review changes back to the preceding producer step', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-document-review-test-'));
+    temporaryDirectories.push(root);
+    const repository = join(root, 'repository');
+    const workbench = join(root, 'workbench');
+    mkdirSync(repository);
+    git(repository, 'init', '-b', 'main');
+    git(repository, 'config', 'user.name', 'Test');
+    git(repository, 'config', 'user.email', 'test@example.com');
+    writeFileSync(join(repository, 'README.md'), '# Test\n');
+    git(repository, 'add', 'README.md');
+    git(repository, 'commit', '-m', 'initial');
+
+    const database = openDatabase(join(workbench, 'system', 'app.db'));
+    const store = new YanxuStore(database, workbench);
+    const designer = store.createAgent({
+      name: '架构师',
+      roleId: 'development',
+      executor: 'opencode',
+      model: 'test-model',
+    }, availableOpenCode);
+    const reviewer = store.createAgent({
+      name: '评审',
+      roleId: 'review',
+      executor: 'opencode',
+      model: 'test-model',
+    }, availableOpenCode);
+    const team = store.createTeam({ name: '架构评审团队', memberIds: [designer.id, reviewer.id] });
+    const project = store.createProject({ name: '文档项目', directoryPath: repository });
+    const directoryId = project.directories[0]?.id ?? '';
+    let task = store.createTask({
+      projectId: project.id,
+      teamId: team.id,
+      title: '设计并评审架构',
+      description: '形成架构文档后进行独立评审。',
+      expectedOutput: '通过评审的架构文档',
+    });
+    task = store.submitTask(task.id, task.stateVersion);
+    task = store.saveComposedPlan(task.id, {
+      goal: '形成可落地的架构文档',
+      scope: ['架构设计'],
+      nonScope: ['代码实施'],
+      successCriteria: ['文档通过评审'],
+      assumptions: [],
+      risks: [],
+      questions: [],
+      permissions: ['读取任务工作区'],
+      steps: [
+        {
+          id: 'technical-design-step',
+          position: 0,
+          skillId: 'technical-design',
+          agentId: designer.id,
+          title: '技术方案设计',
+          description: '输出技术方案。',
+          inputs: ['计划'],
+          expectedOutput: 'TechnicalPlan',
+          directoryIds: [directoryId],
+        },
+        {
+          id: 'document-review-step',
+          position: 1,
+          skillId: 'delivery-review',
+          agentId: reviewer.id,
+          title: '文档交付评审',
+          description: '独立检查技术方案。',
+          inputs: ['TechnicalPlan'],
+          expectedOutput: 'DeliveryReview',
+          directoryIds: [directoryId],
+        },
+      ],
+      qualityGates: [],
+    });
+    task = store.commandTask(task.id, 'confirm', task.stateVersion);
+    const manager = new GitWorkspaceManager(workbench);
+    const workspaces = manager.prepare(task, store.ensureTaskDirectoriesGit(task.id));
+    task = store.savePreparedWorkspaces(task.id, workspaces);
+
+    const design = store.startOrResumeStep(task.id);
+    const designSession = store.createAgentSession(task.id, design, designer);
+    task = store.completeStep(task.id, design.id, designSession, 'design-external', {
+      summary: '完成第一版技术方案。',
+      artifacts: [{ type: 'technical-plan', content: '# Technical plan\n' }],
+    }, []);
+    const review = store.startOrResumeStep(task.id);
+    const reviewSession = store.createAgentSession(task.id, review, reviewer);
+    task = store.handleNonPassingStep(task.id, review.id, reviewSession, 'review-external', {
+      status: 'changes_required',
+      summary: '缺少适配层示例。',
+      issues: ['补充适配层示例'],
+      artifacts: [{ type: 'delivery-review', content: '# Review\n\n需要整改。\n' }],
+    }, 2);
+
+    expect(task.status).toBe('RETRYING');
+    expect(task.steps.slice(0, 2).map((step) => step.status)).toEqual(['pending', 'pending']);
+    const retryEvent = store.listEvents(task.id).find((event) => event.type === 'task.review_retrying');
+    expect(retryEvent?.payload).toEqual(expect.objectContaining({ correctionStepId: design.id }));
+    expect(store.listEvents(task.id).some((event) => event.type === 'task.replan_requested')).toBe(false);
     database.close();
   });
 });

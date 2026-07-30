@@ -27,6 +27,32 @@ afterEach(() => {
 });
 
 describe('local daemon HTTP boundary', () => {
+  it('serves hashed assets created by a build after the daemon has started', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-static-assets-'));
+    roots.push(root);
+    const webRoot = join(root, 'web');
+    const assetsRoot = join(webRoot, 'assets');
+    mkdirSync(assetsRoot, { recursive: true });
+    writeFileSync(join(webRoot, 'index.html'), '<div id="root"></div>');
+    const database = openDatabase(join(root, 'system', 'app.db'));
+    const store = new YanxuStore(database, root);
+    const registry = new ExecutorRegistry([availableOpenCode], () => Promise.resolve([availableOpenCode]));
+    const scheduler = new Scheduler(store, registry);
+    const server = await createServer(store, registry, scheduler, { webRoot });
+    try {
+      await server.ready();
+      writeFileSync(join(assetsRoot, 'index-new-build.js'), 'globalThis.__yanxu = true;');
+
+      const response = await server.inject('/assets/index-new-build.js');
+      expect(response.statusCode).toBe(200);
+      expect(response.headers['content-type']).toContain('application/javascript');
+      expect(response.body).toBe('globalThis.__yanxu = true;');
+    } finally {
+      await server.close();
+      database.close();
+    }
+  });
+
   it('requires a local cookie and CSRF token, rejects cross-site mutations and exposes readiness', async () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-server-security-'));
     roots.push(root);

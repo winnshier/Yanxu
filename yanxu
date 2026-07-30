@@ -14,6 +14,27 @@ if ! command -v pnpm >/dev/null 2>&1; then
   exit 1
 fi
 
+YANXU_URL="http://127.0.0.1:${YANXU_PORT:-43120}"
+
+yanxu_is_running() {
+  node -e '
+    const endpoint = new URL("/health/live", process.argv[1]);
+    const timeout = AbortSignal.timeout(1500);
+    fetch(endpoint, { signal: timeout })
+      .then(async (response) => {
+        const body = await response.json().catch(() => null);
+        process.exit(response.ok && body?.service === "yanxu-daemon" ? 0 : 1);
+      })
+      .catch(() => process.exit(1));
+  ' "$YANXU_URL"
+}
+
+open_yanxu() {
+  if [ "${YANXU_OPEN_BROWSER:-1}" = "1" ] && [ "$(uname -s)" = "Darwin" ]; then
+    /usr/bin/open "$YANXU_URL"
+  fi
+}
+
 # pnpm 11 defaults verify-deps-before-run to "install", which can launch a
 # silent nested install before commands such as `pnpm exec` or `pnpm build`.
 # Dependency installation is already handled explicitly above, so disable that
@@ -42,10 +63,15 @@ case "${1:-start}" in
     exec pnpm dev
     ;;
   start)
+    if yanxu_is_running; then
+      echo "[yanxu] Yanxu is already running at $YANXU_URL. Reusing the existing daemon."
+      open_yanxu
+      exit 0
+    fi
     echo "[yanxu] Building the application..."
     pnpm build
     export YANXU_OPEN_BROWSER="${YANXU_OPEN_BROWSER:-1}"
-    echo "[yanxu] Starting at http://127.0.0.1:${YANXU_PORT:-43120} ..."
+    echo "[yanxu] Starting at $YANXU_URL ..."
     exec pnpm start
     ;;
   *)

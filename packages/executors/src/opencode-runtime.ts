@@ -26,6 +26,9 @@ type StructuredOutputMode = 'opencode-schema' | 'prompt-json';
 
 interface PromptResult<T = unknown> {
   info: {
+    id?: string;
+    role?: string;
+    time?: { completed?: number };
     structured?: T;
     error?: { name?: string; data?: { message?: string } };
   };
@@ -93,15 +96,26 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     });
     const session = unwrap<{ id: string }>(sessionResponse);
     runtime.sessionIds.push(session.id);
+    await input.onSessionStarted?.(session.id);
     const [providerID, ...modelParts] = input.model.split('/');
     const modelID = modelParts.join('/');
     if (!providerID || !modelID) throw new Error('OpenCode model must use provider/model format.');
-    const abort = () => { void client.session.abort({ sessionID: session.id, directory: runtime.workspacePath }); };
+    const abort = () => {
+      // Abort is best-effort. The runtime may close the HTTP connection while
+      // handling the request, which must not become an unhandled rejection and
+      // terminate the daemon.
+      void client.session.abort({ sessionID: session.id, directory: runtime.workspacePath }).catch(() => undefined);
+    };
     input.abortSignal?.addEventListener('abort', abort, { once: true });
     let promptSettled = false;
     const permissionWorker = this.processPermissions(client, runtime, session.id, input, () => promptSettled);
     try {
-      const preferredMode = this.structuredOutputModes.get(input.model) ?? 'opencode-schema';
+      // OpenCode 1.17.x cannot reliably list messages created by
+      // prompt_async when the request uses json_schema: the stored format is
+      // rejected while deserializing the message list. Long-running work must
+      // use prompt_async, so default to the model-agnostic JSON protocol and
+      // validate the response locally instead.
+      const preferredMode = this.structuredOutputModes.get(input.model) ?? 'prompt-json';
       let continuingAfterSchemaFailure = false;
       if (preferredMode === 'opencode-schema') {
         try {
@@ -142,14 +156,16 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     modelID: string,
     input: StructuredExecutionInput,
   ): Promise<T> {
-    const response = await client.session.prompt({
-      sessionID: sessionId,
-      directory: runtime.workspacePath,
-      model: { providerID, modelID },
-      parts: [{ type: 'text', text: input.prompt }],
-      format: { type: 'json_schema', schema: input.schema, retryCount: structuredRepairAttempts },
-    });
-    const data = unwrap<PromptResult<T>>(response);
+    const data = await this.promptAsyncAndWait<T>(
+      client,
+      runtime,
+      sessionId,
+      providerID,
+      modelID,
+      input.prompt,
+      input.abortSignal,
+      { type: 'json_schema', schema: input.schema, retryCount: structuredRepairAttempts },
+    );
     throwPromptError(data);
     if (data.info.structured === undefined) throw new Error('OpenCode did not return structured output.');
     return data.info.structured;
@@ -171,13 +187,15 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     let lastErrors: string[] = [];
     let lastResponse = '';
     for (let attempt = 0; attempt <= structuredRepairAttempts; attempt += 1) {
-      const response = await client.session.prompt({
-        sessionID: sessionId,
-        directory: runtime.workspacePath,
-        model: { providerID, modelID },
-        parts: [{ type: 'text', text: prompt }],
-      });
-      const data = unwrap<PromptResult>(response);
+      const data = await this.promptAsyncAndWait(
+        client,
+        runtime,
+        sessionId,
+        providerID,
+        modelID,
+        prompt,
+        input.abortSignal,
+      );
       throwPromptError(data);
       lastResponse = data.parts
         .filter((part) => part.type === 'text' && typeof part.text === 'string')
@@ -190,6 +208,66 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       if (attempt < structuredRepairAttempts) prompt = jsonRepairPrompt(lastResponse, lastErrors, input.schema);
     }
     throw new Error(`OpenCode JSON output failed local Schema validation after ${structuredRepairAttempts + 1} attempts: ${lastErrors.join('; ')}`);
+  }
+
+  private async promptAsyncAndWait<T>(
+    client: SdkClient,
+    runtime: ManagedRuntime,
+    sessionId: string,
+    providerID: string,
+    modelID: string,
+    prompt: string,
+    abortSignal?: AbortSignal,
+    format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount: number },
+  ): Promise<PromptResult<T>> {
+    const existingResponse = await client.session.messages({
+      sessionID: sessionId,
+      directory: runtime.workspacePath,
+    });
+    const existingMessageIds = new Set(
+      unwrap<Array<PromptResult>>(existingResponse).map((message) => message.info.id).filter((value): value is string => Boolean(value)),
+    );
+    await client.session.promptAsync({
+      sessionID: sessionId,
+      directory: runtime.workspacePath,
+      model: { providerID, modelID },
+      parts: [{ type: 'text', text: prompt }],
+      ...(format ? { format } : {}),
+    });
+
+    let consecutivePollingErrors = 0;
+    while (true) {
+      if (abortSignal?.aborted) throw abortedSessionError();
+      if (runtime.process.exitCode !== null) {
+        throw new Error(`OpenCode server exited with code ${runtime.process.exitCode}.`);
+      }
+      try {
+        const response = await client.session.messages({
+          sessionID: sessionId,
+          directory: runtime.workspacePath,
+        });
+        const statusResponse = await client.session.status({ directory: runtime.workspacePath });
+        const sessionStatuses = unwrap<Record<string, { type: string }>>(statusResponse);
+        const completed = selectNewCompletedPromptResult<T>(
+          unwrap<Array<PromptResult<T>>>(response),
+          existingMessageIds,
+          sessionStatuses[sessionId]?.type ?? 'idle',
+        );
+        consecutivePollingErrors = 0;
+        if (completed) return completed;
+      } catch (error) {
+        if (abortSignal?.aborted) throw abortedSessionError();
+        if (runtime.process.exitCode !== null) {
+          throw new Error(`OpenCode server exited with code ${runtime.process.exitCode}.`);
+        }
+        // A short polling request can race with an OpenCode server refresh,
+        // but persistent errors indicate a protocol incompatibility and must
+        // become observable instead of spinning until the session timeout.
+        consecutivePollingErrors += 1;
+        if (consecutivePollingErrors >= 10) throw error;
+      }
+      await waitForPoll(abortSignal);
+    }
   }
 
   async abortSession(runtime: RuntimeHandle, sessionId: string): Promise<void> {
@@ -304,6 +382,45 @@ function throwPromptError(result: PromptResult): void {
   throw error;
 }
 
+export function selectNewCompletedPromptResult<T>(
+  messages: Array<PromptResult<T>>,
+  existingMessageIds: ReadonlySet<string>,
+  sessionStatus = 'idle',
+): PromptResult<T> | undefined {
+  // A single OpenCode prompt may produce several completed assistant messages
+  // while it runs tools. Only the last one after the session becomes idle is
+  // the final response; treating an intermediate tool-loop message as final
+  // would send a JSON repair prompt before the agent has finished its work.
+  if (sessionStatus !== 'idle') return undefined;
+  return [...messages].reverse().find((message) =>
+    message.info.role === 'assistant'
+    && Boolean(message.info.id)
+    && !existingMessageIds.has(message.info.id as string)
+    && (message.info.time?.completed !== undefined || message.info.error !== undefined));
+}
+
+function abortedSessionError(): Error {
+  const error = new Error('OpenCode session was aborted.');
+  error.name = 'AbortError';
+  return error;
+}
+
+function waitForPoll(signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(abortedSessionError());
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, 500);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      reject(abortedSessionError());
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function jsonProtocolPrompt(prompt: string, schema: Record<string, unknown>): string {
   return `${prompt}\n\n【研序 JSON 输出协议】\n保留并完成上面的全部工作。最终响应只能包含一个符合下方 JSON Schema 的 JSON 对象，不要使用 Markdown 代码块，不要添加解释文字。\n${JSON.stringify(schema, null, 2)}`;
 }
@@ -341,12 +458,22 @@ export function permissionRules(
   const rules: PermissionRuleset = [
     { permission: '*', pattern: '*', action: mode === 'managed' ? 'deny' : 'ask' },
   ];
-  for (const pattern of policy?.allowedReadPatterns ?? []) {
+  const allowedReadPatterns = policy?.allowedReadPatterns ?? [];
+  for (const pattern of allowedReadPatterns) {
+    rules.push({ permission: 'read', pattern, action: 'allow' });
+  }
+  for (const pattern of policy?.allowedExternalDirectoryPatterns ?? []) {
+    rules.push({ permission: 'external_directory', pattern, action: 'allow' });
+  }
+  if (allowedReadPatterns.length > 0) {
+    // OpenCode evaluates glob/grep by the search expression (for example `*`),
+    // not by the resolved file path. External paths still require the separate
+    // external_directory permission, while actual file reads remain restricted
+    // by the path-scoped read rules above.
     rules.push(
-      { permission: 'read', pattern, action: 'allow' },
-      { permission: 'glob', pattern, action: 'allow' },
-      { permission: 'grep', pattern, action: 'allow' },
-      { permission: 'list', pattern, action: 'allow' },
+      { permission: 'glob', pattern: '*', action: 'allow' },
+      { permission: 'grep', pattern: '*', action: 'allow' },
+      { permission: 'list', pattern: '*', action: 'allow' },
     );
   }
   if (!readOnly) {

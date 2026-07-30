@@ -253,7 +253,7 @@ export function restoreProjectState(
     throw new Error(`项目 ${preview.projectId} 已存在，恢复操作不会覆盖现有数据库。`);
   }
   const stoppedTaskIds: string[] = [];
-  const safeStatuses = new Set(['DRAFT', 'WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL', 'STOPPED', 'DELIVERED', 'ARCHIVED']);
+  const safeStatuses = new Set(['DRAFT', 'WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL', 'STOPPED', 'DELIVERED', 'ARCHIVED', 'CANCELLED']);
   database.transaction(() => {
     insertRaw(database, 'projects', {
       ...manifest.payload.project,
@@ -354,7 +354,8 @@ export function restoreProjectState(
       insertRaw(database, 'run_snapshots', rebaseArtifactPath(item, manifest.payload.project, projectSpacePath));
     }
     for (const item of manifest.payload.workflowEvents) {
-      const { seq: _seq, ...event } = item;
+      const event = { ...item };
+      delete event.seq;
       insertRaw(database, 'workflow_events', event, true);
     }
     const timestamp = new Date().toISOString();
@@ -495,7 +496,10 @@ function rows(database: SqliteDatabase, sql: string, ...parameters: string[]): R
 }
 
 function stringValue(value: unknown): string {
-  return typeof value === 'string' ? value : value === null || value === undefined ? '' : String(value);
+  if (typeof value === 'string') return value;
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  return JSON.stringify(value) ?? '';
 }
 
 function sha256(value: string | Buffer): string {

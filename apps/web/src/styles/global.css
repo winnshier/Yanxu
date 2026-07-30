@@ -46,9 +46,50 @@ button, input, textarea, select { font: inherit; }
 .form-grid-two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .mono-text { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 12px; }
 .artifact-content { max-height: 28rem; overflow: auto; white-space: pre-wrap; }
+.markdown-content { white-space: normal; line-height: 1.7; }
+.markdown-content > :first-child { margin-top: 0; }
+.markdown-content > :last-child { margin-bottom: 0; }
+.markdown-content h1 { font-size: 24px; }
+.markdown-content h2 { margin-top: 1.5em; font-size: 20px; }
+.markdown-content h3 { margin-top: 1.35em; font-size: 17px; }
+.markdown-content ul, .markdown-content ol { padding-inline-start: 1.6em; }
+.markdown-content pre {
+  padding: 12px 14px;
+  overflow: auto;
+  border-radius: 8px;
+  background: #f5f7fa;
+}
+.markdown-content code {
+  padding: .12em .32em;
+  border-radius: 4px;
+  background: #f1f3f6;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: .9em;
+}
+.markdown-content pre code { padding: 0; background: transparent; }
+.markdown-content table { width: 100%; margin: 12px 0; border-collapse: collapse; }
+.markdown-content th, .markdown-content td { padding: 8px 10px; border: 1px solid #dfe3ea; text-align: left; }
+.markdown-content th { background: #f7f8fb; }
+.markdown-content blockquote {
+  margin-inline: 0;
+  padding: 2px 14px;
+  border-inline-start: 4px solid #b8c6ec;
+  color: #64708a;
+  background: #f7f9ff;
+}
 .tag-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 14px; }
 .card-caption { margin-top: 8px !important; margin-bottom: 0 !important; }
 .settings-card { margin-top: 16px; }
+.plan-question-card + .plan-question-card { margin-top: 12px; }
+.plan-question-option {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #e7eaf0;
+  border-radius: 8px;
+  background: #fafbfc;
+}
+.plan-question-option:hover { border-color: #91a7ff; background: #f7f9ff; }
+.plan-question-description { margin: 4px 0 0 24px !important; white-space: normal; }
 .knowledge-search { max-width: 460px; margin-bottom: 18px; }
 .knowledge-content { margin-bottom: 0 !important; white-space: pre-line; }
 .branch-route-row { margin-bottom: 12px; padding: 12px 14px 0; border: 1px solid #e7eaf0; border-radius: 10px; background: #fafbfc; }
