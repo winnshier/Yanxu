@@ -61,6 +61,7 @@ import type { SqliteDatabase } from './database.js';
 import { DomainError } from './errors.js';
 import { classifyExecutionFailure } from './execution-failure.js';
 import { scanProjectDirectory } from './directory-scanner.js';
+import { commandPatternsForPlanPermissions } from './plan-permissions.js';
 import { buildIndexedPlanningContext, type PlanningDirectoryContext } from './planning-context.js';
 import { commitProjectSpace as commitProjectSpaceGit, ensureProjectSpace, writeVersionedArtifact } from './project-space.js';
 import {
@@ -1925,6 +1926,7 @@ export class YanxuStore {
     let nextStatus: TaskStatus;
     let nextJob: { type: string; priority: number; payload?: Record<string, unknown> } | null = null;
     let resetRunningStep = false;
+    let resetBlockedStepId: string | null = null;
 
     if (planningInterrupted) {
       if (interruptedStatus === 'WAITING_PLAN_APPROVAL' || interruptedStatus === 'WAITING_REAPPROVAL') {
@@ -1947,6 +1949,9 @@ export class YanxuStore {
       const requiredWorkspaceCount = runSnapshot?.plan.branchRoutes.length ?? 0;
       const runningStep = task.steps.find((step) => step.status === 'running');
       const pendingStep = task.steps.find((step) => step.status === 'pending');
+      const blockedStep = task.status === 'BLOCKED'
+        ? task.steps.find((step) => step.status === 'failed')
+        : undefined;
       if (workspaceCount < requiredWorkspaceCount) {
         nextStatus = 'PREPARING';
         if (!hasRunnableJob('PREPARE_WORKSPACE')) nextJob = { type: 'PREPARE_WORKSPACE', priority: 80 };
@@ -1956,6 +1961,10 @@ export class YanxuStore {
           resetRunningStep = true;
           nextJob = { type: 'RUN_SKILL_STEP', priority: 85 };
         }
+      } else if (blockedStep) {
+        nextStatus = 'RETRYING';
+        resetBlockedStepId = blockedStep.id;
+        nextJob = { type: 'RUN_SKILL_STEP', priority: 85 };
       } else if (!this.requiredGatesSatisfied(task) && (!pendingStep || pendingStep.skillId === 'delivery-review')) {
         nextStatus = 'VALIDATING';
         if (!hasRunnableJob('RUN_QUALITY_GATE')) nextJob = { type: 'RUN_QUALITY_GATE', priority: 75 };
@@ -1986,6 +1995,12 @@ export class YanxuStore {
           WHERE task_id = ? AND status = 'running' AND position < 1000
         `).run(task.id);
         this.database.prepare('UPDATE tasks SET active_step_id = NULL WHERE id = ?').run(task.id);
+      }
+      if (resetBlockedStepId) {
+        this.database.prepare(`
+          UPDATE task_steps SET status = 'pending', completed_at = NULL
+          WHERE id = ? AND task_id = ? AND status = 'failed'
+        `).run(resetBlockedStepId, task.id);
       }
       this.updateTaskState(task.id, task.stateVersion, nextStatus, 'task.resume', reason || this.commandMessage('resume'), {
         previousStatus: task.status,
@@ -5086,6 +5101,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           commands.add(`cd ${commandRoot} && ${gate.command}`);
           commands.add(`cd ${commandRoot} && ${gate.command} *`);
         }
+        for (const pattern of commandPatternsForPlanPermissions(plan)) commands.add(pattern);
       }
       return {
         id: id('permission-manifest'),

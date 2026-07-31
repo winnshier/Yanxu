@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { SkillDefinition } from '@yanxu/contracts';
 import { permissionRules } from '@yanxu/executors';
-import { normalizeSkillResultOutcome, skillResultSchema, validateSkillResult, type SkillResult } from './scheduler.js';
+import {
+  nonBlockingSkillOutcomeGuidance,
+  normalizeSkillResultOutcome,
+  requirementRevisionGuidance,
+  skillResultSchema,
+  validateSkillResult,
+  type SkillResult,
+} from './scheduler.js';
 
 const reviewSkill: SkillDefinition = {
   id: 'delivery-review',
@@ -14,6 +21,20 @@ const reviewSkill: SkillDefinition = {
   completionChecks: ['结论引用实际证据', '偏差和限制未被隐藏'],
   permissions: ['workspace.read'],
   canBlockDelivery: true,
+  version: '1.0.0',
+};
+
+const implementationSkill: SkillDefinition = {
+  id: 'implementation',
+  name: '内容实施',
+  roleId: 'development',
+  description: '在隔离工作区实施变更。',
+  inputs: ['TechnicalPlan'],
+  outputs: ['代码变更'],
+  artifactTypes: ['implementation-report'],
+  completionChecks: ['变更位于批准范围', '实际文件清单可由 Git 重建'],
+  permissions: ['workspace.write', 'command.execute'],
+  canBlockDelivery: false,
   version: '1.0.0',
 };
 
@@ -39,13 +60,36 @@ describe('skill output contracts', () => {
     const schema = skillResultSchema(reviewSkill) as {
       required: string[];
       properties: {
+        status: { enum: string[] };
         artifacts: { items: { properties: { type: { enum: string[] } } } };
         completionChecks: { items: { properties: { check: { enum: string[] } } } };
       };
     };
+    expect(schema.properties.status.enum).toEqual(['succeeded', 'changes_required', 'blocked']);
     expect(schema.properties.artifacts.items.properties.type.enum).toEqual(['delivery-review']);
     expect(schema.properties.completionChecks.items.properties.check.enum).toEqual(reviewSkill.completionChecks);
     expect(schema.required).toContain('findings');
+  });
+
+  it('does not offer changes_required to a non-blocking skill', () => {
+    const schema = skillResultSchema(implementationSkill) as {
+      properties: { status: { enum: string[] } };
+    };
+    expect(schema.properties.status.enum).toEqual(['succeeded', 'blocked']);
+    expect(nonBlockingSkillOutcomeGuidance(implementationSkill)).toContain('不能返回 changes_required');
+  });
+
+  it('treats sensitive files as forbidden output during requirement replanning', () => {
+    const guidance = requirementRevisionGuidance(
+      '执行工作区检测到敏感文件改动：dir-a:yanxu-h5/.env.production。请生成需要用户重新确认的修订计划。',
+    );
+    expect(guidance).toContain('形成新版规格后返回 succeeded');
+    expect(guidance).toContain('从需求范围、目录影响和后续实现清单中彻底移除');
+    expect(guidance).toContain('内容白名单、示例值或用户审批重新纳入');
+    expect(guidance).toContain('禁止用另一个 .env 变体替代');
+    expect(guidance).toContain('src/config/app.ts');
+    expect(requirementRevisionGuidance('保留所有 .env* 文件不得作为实现产出的修订。'))
+      .toContain('最终 RequirementSpec 的计划产出路径中不得出现任何 .env 文件');
   });
 
   it('rejects a nominal success that omits required evidence or fails a completion check', () => {
@@ -155,7 +199,30 @@ describe('skill output contracts', () => {
     expect(rules).toContainEqual({ permission: 'webfetch', pattern: '*', action: 'deny' });
     expect(rules).toContainEqual({ permission: 'bash', pattern: 'curl *', action: 'deny' });
     expect(rules).toContainEqual({ permission: 'bash', pattern: 'pnpm install*', action: 'deny' });
+    expect(rules).toContainEqual({ permission: 'bash', pattern: 'npm --prefix * install*', action: 'deny' });
     expect(rules).toContainEqual({ permission: 'bash', pattern: 'pip install *', action: 'deny' });
+  });
+
+  it('lets an implementation report an actionable runtime block but not request downstream correction', () => {
+    const blocked: SkillResult = {
+      status: 'blocked',
+      summary: '依赖安装被运行时拒绝。',
+      artifacts: [{ type: 'implementation-report', content: '# Implementation\n\n现场已保留。' }],
+      issues: ['计划批准的 npm install 没有进入运行时白名单。'],
+      assumptions: [],
+      requestedScopeChanges: [],
+      reportedChecks: [],
+      completionChecks: [
+        { check: '变更位于批准范围', status: 'passed', evidence: 'Git 状态仅包含批准目录。' },
+        { check: '实际文件清单可由 Git 重建', status: 'failed', evidence: '尚未形成 checkpoint。' },
+      ],
+    };
+
+    expect(() => validateSkillResult(implementationSkill, blocked)).not.toThrow();
+    expect(() => validateSkillResult(implementationSkill, { ...blocked, issues: [] }))
+      .toThrow('必须说明可操作的阻塞原因');
+    expect(() => validateSkillResult(implementationSkill, { ...blocked, status: 'changes_required' }))
+      .toThrow('不能要求下游整改');
   });
 
   it('requires test design to return structured task-specific gate metadata', () => {

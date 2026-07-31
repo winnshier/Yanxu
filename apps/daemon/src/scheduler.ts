@@ -10,7 +10,7 @@ import type {
   TaskFileDiff,
   TaskPlan,
 } from '@yanxu/contracts';
-import { DomainError, GitWorkspaceManager } from '@yanxu/core';
+import { commandPatternsForPlanPermissions, DomainError, GitWorkspaceManager } from '@yanxu/core';
 import type { ClaimedJob, YanxuStore } from '@yanxu/core';
 import { OpenCodeAdapter } from '@yanxu/executors';
 import type { ExecutorAdapter, RuntimeHandle } from '@yanxu/executors';
@@ -223,6 +223,9 @@ export interface SkillResult {
 }
 
 export function skillResultSchema(skill: SkillDefinition): Record<string, unknown> {
+  const allowedStatuses = skill.canBlockDelivery
+    ? ['succeeded', 'changes_required', 'blocked']
+    : ['succeeded', 'blocked'];
   const testGateMetadataSchema = {
     type: 'object',
     additionalProperties: true,
@@ -249,7 +252,7 @@ export function skillResultSchema(skill: SkillDefinition): Record<string, unknow
   return {
   type: 'object', additionalProperties: false,
   properties: {
-    status: { type: 'string', enum: ['succeeded', 'changes_required', 'blocked'] },
+    status: { type: 'string', enum: allowedStatuses },
     summary: { type: 'string' },
     artifacts: {
       type: 'array',
@@ -314,6 +317,19 @@ export function skillResultSchema(skill: SkillDefinition): Record<string, unknow
   };
 }
 
+export function nonBlockingSkillOutcomeGuidance(skill: SkillDefinition): string {
+  if (skill.canBlockDelivery) return '';
+  return '此 Skill 不能返回 changes_required：只要自身产物已按要求完成就返回 succeeded；计划修改或需要用户重新确认只是后续编排状态，不代表本 Skill 要求下游整改。需要扩大任务范围时填写 requestedScopeChanges，运行环境或必要输入导致无法继续时才返回 blocked，并在 issues 中给出可操作原因。';
+}
+
+export function requirementRevisionGuidance(revisionFeedback?: string): string {
+  if (!revisionFeedback) return '';
+  const sensitiveChangeGuidance = /敏感文件(?:改动|修订)|sensitive_change|\.env(?:[.*]|$)/i.test(revisionFeedback)
+    ? ' revisionFeedback 涉及敏感文件时，所有以 .env 开头的文件（包括 .env、.env.local、.env.development、.env.production、.env.example 等）都属于运行时禁止产出：必须从需求范围、目录影响和后续实现清单中彻底移除，禁止用另一个 .env 变体替代，也不能通过内容白名单、示例值或用户审批重新纳入；确需非敏感配置时只能改用普通源码配置文件（例如 src/config/app.ts）或代码默认值。最终 RequirementSpec 的计划产出路径中不得出现任何 .env 文件。'
+    : '';
+  return `这是一次规格修订。逐条吸收 revisionFeedback 并成功形成新版规格后返回 succeeded；是否进入用户重新确认由研序编排器处理，不要因此返回 changes_required。${sensitiveChangeGuidance}`;
+}
+
 export function validateSkillResult(skill: SkillDefinition, result: SkillResult): void {
   const artifactTypes = new Set(result.artifacts.map((artifact) => artifact.type));
   const missingArtifacts = skill.artifactTypes.filter((artifactType) => !artifactTypes.has(artifactType));
@@ -356,12 +372,20 @@ export function validateSkillResult(skill: SkillDefinition, result: SkillResult)
       { skillId: skill.id, findings: blockingFindings, legacyIssues: hasLegacyBlockingIssues ? result.issues : [] },
     );
   }
-  if (!skill.canBlockDelivery && result.status !== 'succeeded') {
+  if (!skill.canBlockDelivery && result.status === 'changes_required') {
     throw new DomainError(
       'SKILL_OUTCOME_NOT_ALLOWED',
-      `${skill.name} 不能直接给出阻断结论，应通过范围变更或结构化问题请求重新规划。`,
+      `${skill.name} 不能要求下游整改；需要扩大范围时应返回 requestedScopeChanges，运行环境无法继续时应返回 blocked。`,
       422,
       { skillId: skill.id, outcome: result.status },
+    );
+  }
+  if (result.status === 'blocked' && result.issues.length === 0) {
+    throw new DomainError(
+      'SKILL_BLOCK_REASON_REQUIRED',
+      `${skill.name} 返回 blocked 时必须说明可操作的阻塞原因。`,
+      422,
+      { skillId: skill.id },
     );
   }
 };
@@ -643,6 +667,7 @@ export class Scheduler {
       'pwd',
       'ls',
       'ls -la',
+      ...commandPatternsForPlanPermissions(snapshot.plan),
       ...(permissionManifest?.allowedCommandPatterns
         ?? (step.skillId === 'implementation' || step.skillId === 'test-execution'
           ? this.allowedStepCommands(permissionDirectoryIds, snapshot)
@@ -783,11 +808,13 @@ export class Scheduler {
       }
       if (result.output.status !== 'succeeded') {
         const status = result.output.status;
-        for (const workspace of workspaces) {
-          this.git.discardUnapprovedAttempt(
-            workspace,
-            baseCommits.get(workspace.directoryId) ?? workspace.baselineCommit,
-          );
+        if (status === 'changes_required') {
+          for (const workspace of workspaces) {
+            this.git.discardUnapprovedAttempt(
+              workspace,
+              baseCommits.get(workspace.directoryId) ?? workspace.baselineCommit,
+            );
+          }
         }
         const outcomeTask = this.store.handleNonPassingStep(
           taskId,
@@ -918,7 +945,7 @@ export class Scheduler {
     const reviewRule = step.skillId === 'delivery-review'
       ? ' 评审必须先核对 ChangeManifest 和 Git 实际文件：实施步骤 files=0、checkpoint 等于 baseline，或计划要求的目标文件不存在时，必须判定 changes_required。上下文中的 Artifact 摘要被截断时，应从授权只读工作区读取 ChangeManifest 对应文件，不得把截断误判为文件缺失。每个问题必须写入 findings，包含 severity、category、证据、定位、建议和 blocking；critical/major 一律阻塞交付并返回 changes_required，minor/suggestion 可以随 succeeded 交付但必须保留在报告。issues 仅用于兼容旧输出；一旦填写会按阻塞问题保守处理。'
       : '';
-    return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required，无法安全继续时返回 blocked；其余 Skill 不得用这两个状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
+    return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required；任何 Skill 因工具权限、运行环境或缺少必要输入而无法安全继续时返回 blocked，并在 issues 中写明可操作原因；其他情况不得用非成功状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
   }
 
   private async composePlan(
@@ -1335,6 +1362,8 @@ ${JSON.stringify({
 
 规划硬性校验：
 - 若任务会在关联目录下新建子项目，所有 qualityGates 必须通过命令自身显式定位到子项目（例如 npm --prefix <子目录> run test），不能假设门禁执行器会自动切换到新子目录。
+- commandArgv 的每个命令行 token 必须是独立数组元素，例如 test ! -f app/.env 应写为 ["test","!","-f","app/.env"]，不得把 "! -f app/.env" 合成一个参数。
+- 敏感文件改动已由研序在 checkpoint 前独立检查；revisionFeedback 若来自 sensitive_change，只需把相关文件从计划产出中移除，不要额外增加仅检查文件不存在的 shell 门禁。
 - 产品研发中只要存在可自动验证的业务逻辑，就必须规划对应测试框架、测试文件和可执行 test 门禁；typecheck、lint、build 不能代替业务测试。
 - 涉及金额、价格、余额或预算时，必须使用整数最小货币单位或明确的十进制定点方案；禁止把 JavaScript number + toFixed 当作精度保证。
 
@@ -1395,7 +1424,7 @@ ${JSON.stringify(input, null, 2)}`;
         .at(-1)?.content ?? null,
       revisionFeedback: revisionFeedback ?? null,
     };
-    return `你正在研序中执行内置 Skill“${skill.name}”。这是用户确认计划前的正式需求规格步骤，只分析并返回结构化结果，不读取或修改本地文件，不执行命令，也不得调用任何工具、联网搜索或网页抓取。\n\nRequirementSpec 的 Markdown 必须包含：背景与目标、范围、非范围、用户可验收的成功标准、约束、项目目录影响、明确假设、风险、仍需用户回答的歧义。已有回答必须被吸收到规格正文，不能继续作为未解决问题重复提出。若是修改计划，必须逐条吸收 revisionFeedback，并明确规格相较上一版的变化。completionChecks 必须逐项给出可追溯证据。\n\n${JSON.stringify(input, null, 2)}`;
+    return `你正在研序中执行内置 Skill“${skill.name}”。这是用户确认计划前的正式需求规格步骤，只分析并返回结构化结果，不读取或修改本地文件，不执行命令，也不得调用任何工具、联网搜索或网页抓取。\n\nRequirementSpec 的 Markdown 必须包含：背景与目标、范围、非范围、用户可验收的成功标准、约束、项目目录影响、明确假设、风险、仍需用户回答的歧义。已有回答必须被吸收到规格正文，不能继续作为未解决问题重复提出。若是修改计划，必须逐条吸收 revisionFeedback，并明确规格相较上一版的变化。completionChecks 必须逐项给出可追溯证据。\n\n结果状态规则：${nonBlockingSkillOutcomeGuidance(skill)} ${requirementRevisionGuidance(revisionFeedback)}\n\n${JSON.stringify(input, null, 2)}`;
   }
 }
 

@@ -48,6 +48,7 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   private implementationAttempts = 0;
   private planningAttempts = 0;
   private blockedPlanningAttempt: number | null = null;
+  private blockNextImplementationResult = false;
   private readonly blocked = new Map<string, (error: Error) => void>();
   readonly prompts: Array<{ title: string; prompt: string }> = [];
   readonly executions: StructuredExecutionInput[] = [];
@@ -60,6 +61,10 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
 
   blockPlanningAttempt(attempt: number): void {
     this.blockedPlanningAttempt = attempt;
+  }
+
+  returnBlockedOnNextImplementation(): void {
+    this.blockNextImplementationResult = true;
   }
 
   probe(): Promise<ExecutorInstallation> {
@@ -144,11 +149,23 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
           `implementation attempt ${this.implementationAttempts}\n`,
         );
       }
-      return this.result<T>(sessionId, skillResult(
+      const output = skillResult(
         'implementation-report',
         '# Implementation\n\n已新增 feature.txt。',
         ['变更位于批准范围', '实际文件清单可由 Git 重建'],
-      ));
+      );
+      if (this.blockNextImplementationResult) {
+        this.blockNextImplementationResult = false;
+        output.status = 'blocked';
+        output.summary = '依赖安装被运行环境拒绝。';
+        output.issues = ['计划批准的安装命令未进入运行时白名单。'];
+        output.completionChecks[1] = {
+          check: '实际文件清单可由 Git 重建',
+          status: 'failed',
+          evidence: '现场文件已写入，但尚未形成 checkpoint。',
+        };
+      }
+      return this.result<T>(sessionId, output);
     }
     if (input.title.includes('测试设计')) {
       const output = skillResult(
@@ -486,6 +503,46 @@ describe('scheduler end-to-end', () => {
       fixture.database.close();
     }
   });
+
+  it('preserves workspace changes when an implementation reports a runtime block and resumes the failed step', async () => {
+    const fixture = createFixture(false);
+    fixture.adapter.returnBlockedOnNextImplementation();
+    try {
+      fixture.scheduler.start();
+      let task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      fixture.store.commandTask(task.id, 'confirm', task.stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'BLOCKED',
+      );
+
+      const workspace = fixture.store.getPreparedWorkspaces(task.id)[0];
+      expect(workspace).toBeDefined();
+      const preserved = spawnSync('git', ['-C', workspace?.workspacePath ?? '', 'status', '--short'], { encoding: 'utf8' });
+      expect(preserved.stdout).toContain('feature.txt');
+      expect(task.steps[0]).toMatchObject({ status: 'failed', attempt: 1 });
+      expect(fixture.store.listEvents(task.id)).toEqual(expect.arrayContaining([
+        expect.objectContaining({ type: 'skill_step.blocked' }),
+        expect.objectContaining({ type: 'task.blocked' }),
+      ]));
+
+      task = fixture.store.commandTask(task.id, 'resume', task.stateVersion);
+      expect(task.status).toBe('RETRYING');
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'DELIVERED',
+      );
+      expect(task.steps[0]).toMatchObject({ status: 'succeeded', attempt: 2 });
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 12_000);
 
   it('lets the active step reach a checkpoint before pausing and does not start the next step', async () => {
     const fixture = createFixture(true, false, false, true);

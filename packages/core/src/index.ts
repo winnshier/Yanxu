@@ -3,6 +3,7 @@ export * from './directory-scanner.js';
 export * from './errors.js';
 export * from './execution-failure.js';
 export * from './git-workspace.js';
+export * from './plan-permissions.js';
 export * from './planning-context.js';
 export * from './project-space.js';
 export * from './project-state.js';
