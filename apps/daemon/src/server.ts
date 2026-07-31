@@ -122,7 +122,12 @@ export async function createServer(
     };
   };
   server.get('/health', systemHealth);
-  server.get('/health/live', () => ({ status: 'live', service: 'yanxu-daemon', time: new Date().toISOString() }));
+  server.get('/health/live', () => ({
+    status: 'live',
+    service: 'yanxu-daemon',
+    pid: process.pid,
+    time: new Date().toISOString(),
+  }));
   server.get('/health/ready', (_request, reply) => {
     const health = systemHealth();
     return reply.status(health.status === 'ready' ? 200 : 503).send(health);

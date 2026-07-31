@@ -579,7 +579,12 @@ export class Scheduler {
   private async execute(job: ClaimedJob): Promise<void> {
     if (job.type === 'COMPOSE_PLAN') {
       const feedback = typeof job.payload.feedback === 'string' ? job.payload.feedback : undefined;
-      return this.composePlan(job.aggregateId, feedback, job.payload.autoResume === true);
+      return this.composePlan(
+        job.aggregateId,
+        feedback,
+        job.payload.autoResume === true,
+        job.payload.preservePreviousSteps === true,
+      );
     }
     if (job.type === 'PREPARE_WORKSPACE') return this.prepareWorkspace(job.aggregateId);
     if (job.type === 'RUN_SKILL_STEP') return this.runSkillStep(job);
@@ -916,7 +921,12 @@ export class Scheduler {
     return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required，无法安全继续时返回 blocked；其余 Skill 不得用这两个状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
   }
 
-  private async composePlan(taskId: string, revisionFeedback?: string, autoResume = false): Promise<void> {
+  private async composePlan(
+    taskId: string,
+    revisionFeedback?: string,
+    autoResume = false,
+    preservePreviousSteps = false,
+  ): Promise<void> {
     const task = this.store.getTask(taskId);
     const project = this.store.getProject(task.projectId);
     const settings = this.store.getSettings(this.executors.list());
@@ -996,7 +1006,14 @@ export class Scheduler {
           taskGrants: [],
           forbiddenReadPatterns: ['*'],
         },
-        prompt: this.planPrompt(task, project, requirementArtifact?.content ?? null, preApprovalSkillIds, revisionFeedback),
+        prompt: this.planPrompt(
+          task,
+          project,
+          requirementArtifact?.content ?? null,
+          preApprovalSkillIds,
+          revisionFeedback,
+          preservePreviousSteps,
+        ),
       });
       const draft: Partial<TaskPlan> = {
         ...result.output,
@@ -1065,7 +1082,7 @@ export class Scheduler {
           sourceModel: requirementModel,
           sourceSessionId: requirementSessionId,
         }]
-        : []);
+        : [], { preservePreviousSteps });
       if (autoResume) this.store.resumeAutomaticReplanIfSafe(task.id);
     } finally {
       await this.adapter.stopRuntime(runtime);
@@ -1193,6 +1210,7 @@ ${JSON.stringify({
     requirementSpec: string | null,
     preApprovalSkillIds: string[],
     revisionFeedback?: string,
+    preservePreviousSteps = false,
   ): string {
     const builtins = this.store.getBuiltins();
     const team = this.store.getTeam(task.teamId);
@@ -1274,13 +1292,14 @@ ${JSON.stringify({
       },
       previousPlan: task.plan,
       revisionFeedback: revisionFeedback ?? null,
+      revisionPolicy: preservePreviousSteps ? 'preserve_step_skill_sequence' : 'allow_step_changes',
     };
     const requirementInstruction = requirementSpec
       ? '确认前的 RequirementSpec 已由需求规格 Skill 生成；必须以它为需求基线。'
       : '本任务未选择确认前 RequirementSpec；直接依据用户需求和项目事实规划。如果缺少产品人员导致无法可靠澄清范围，必须提出明确的歧义问题或能力缺口，不能自行补全。';
     return `你是研序的全局计划协调器。${requirementInstruction}你负责组合可确认的执行计划，不修改任何文件，不执行项目命令，也不要把 requirement-specification 再列入执行步骤。
 
-基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题。提出问题前必须先分析并给出 2–3 个互斥、可直接执行的方案：推荐方案放在第一项且只能有一个 recommended=true；label 要简短；description 说明选择后的影响或取舍；value 是可直接吸收到计划里的完整答案。不要把“自行填写”作为方案，界面会统一提供自定义方案。权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}
+基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题。提出问题前必须先分析并给出 2–3 个互斥、可直接执行的方案：推荐方案放在第一项且只能有一个 recommended=true；label 要简短；description 说明选择后的影响或取舍；value 是可直接吸收到计划里的完整答案。不要把“自行填写”作为方案，界面会统一提供自定义方案。权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}${preservePreviousSteps ? '\n\n本次修改只用于吸收用户对歧义问题的回答：不得增删、替换或重排 previousPlan.steps 的 Skill 序列；可以在同一 Skill 内完善标题、说明、输入、产出、人员与目录。' : ''}
 
 ${JSON.stringify(input, null, 2)}`;
   }

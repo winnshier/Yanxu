@@ -108,7 +108,9 @@ describe('local daemon HTTP boundary', () => {
       expect(diagnostics.json()).toMatchObject({ databaseCheck: 'ok', workbenchHome: root });
 
       expect((await server.inject('/health')).json()).toMatchObject({ status: 'starting', database: 'ready' });
-      expect((await server.inject('/health/live')).statusCode).toBe(200);
+      const liveHealth = await server.inject('/health/live');
+      expect(liveHealth.statusCode).toBe(200);
+      expect(liveHealth.json()).toMatchObject({ service: 'yanxu-daemon', pid: process.pid });
       expect((await server.inject('/health/ready')).statusCode).toBe(503);
       scheduler.start();
       expect((await server.inject('/health')).json()).toMatchObject({

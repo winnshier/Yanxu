@@ -1122,6 +1122,7 @@ export class YanxuStore {
     taskId: string,
     planDraft?: Partial<TaskPlan>,
     preApprovalArtifactInputs: PreApprovalArtifactInput[] = [],
+    options: { preservePreviousSteps?: boolean } = {},
   ): Task {
     const task = this.getTask(taskId);
     if (task.status !== 'COMPOSING_PLAN' && task.status !== 'REPLANNING') {
@@ -1130,6 +1131,9 @@ export class YanxuStore {
     const project = this.getProject(task.projectId);
     const planVersion = (this.database.prepare('SELECT COALESCE(MAX(version), 0) AS version FROM plans WHERE task_id = ?').get(taskId) as { version: number }).version + 1;
     let plan = this.buildPlan(task, project, planVersion, planDraft);
+    if (task.status === 'REPLANNING' && options.preservePreviousSteps) {
+      plan = this.preservePreviousPlanSteps(task, plan);
+    }
     if (task.status === 'REPLANNING' && task.steps.some((step) => step.status !== 'pending')) {
       plan = this.alignReplannedSteps(task, plan);
     }
@@ -1617,13 +1621,16 @@ export class YanxuStore {
     const artifact = writeVersionedArtifact(
       project.projectSpacePath,
       `plans/${taskId}/revision-requests/v${task.plan.version}.md`,
-      `# 计划 v${task.plan.version} 修改请求\n\n${feedback}\n`,
+      `# 计划 v${task.plan.version} 修改请求\n\n- 步骤结构：${
+        input.allowStepChanges === true ? '允许人工要求增删或重排' : '保持原 Skill 序列，仅完善内容'
+      }\n\n${feedback}\n`,
     );
     this.database.transaction(() => {
       this.updateTaskState(taskId, task.stateVersion, 'REPLANNING', 'plan.revision_requested', '用户请求协调器修改计划。', {
         planId: task.plan?.id,
         planVersion: task.plan?.version,
         feedback,
+        allowStepChanges: input.allowStepChanges === true,
         artifactPath: artifact.path,
       });
       this.enqueueJobOrAssertRunnable(
@@ -1631,7 +1638,11 @@ export class YanxuStore {
         taskId,
         `task:${taskId}:replan:${task.stateVersion + 1}`,
         100,
-        { feedback, previousPlanVersion: task.plan?.version },
+        {
+          feedback,
+          previousPlanVersion: task.plan?.version,
+          preservePreviousSteps: input.allowStepChanges !== true,
+        },
       );
     })();
     this.recordProjectSpaceCommit(project.projectSpacePath, `docs: request plan revision for ${taskId}`, taskId);
@@ -4865,6 +4876,31 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       });
     }
     return { ...plan, steps: aligned };
+  }
+
+  private preservePreviousPlanSteps(task: Task, plan: TaskPlan): TaskPlan {
+    const previousSteps = task.plan?.steps ?? [];
+    if (previousSteps.length === 0) return plan;
+    const used = new Set<string>();
+    const steps = previousSteps.map((previous, position) => {
+      const proposed = plan.steps.find((step) =>
+        step.skillId === previous.skillId && !used.has(step.id));
+      if (proposed) {
+        used.add(proposed.id);
+        return { ...proposed, position };
+      }
+      return {
+        ...previous,
+        id: id('planstep'),
+        position,
+      };
+    });
+    this.validatePlanSteps(task, this.getProject(task.projectId), steps);
+    return {
+      ...plan,
+      steps,
+      branchRoutes: this.resolveBranchRoutes(task, this.getProject(task.projectId), steps, plan.branchRoutes),
+    };
   }
 
   private replaceStepsForComposedPlan(task: Task, plan: TaskPlan, preserveCompleted: boolean): void {

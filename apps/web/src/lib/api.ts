@@ -33,6 +33,40 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 let csrfToken = '';
 let sessionPromise: Promise<LocalSession> | null = null;
 
+const emptyQualitySummary: TaskEvidence['qualitySummary'] = {
+  status: 'not_configured',
+  configured: 0,
+  required: 0,
+  passed: 0,
+  failed: 0,
+  waived: 0,
+  latestAttemptAt: null,
+  blockingFindings: [],
+  advisoryFindings: [],
+};
+
+export function normalizeTaskEvidence(value: Partial<TaskEvidence>): TaskEvidence {
+  return {
+    requirementVersions: value.requirementVersions ?? [],
+    preApprovalArtifacts: value.preApprovalArtifacts ?? [],
+    permissionManifests: value.permissionManifests ?? [],
+    permissionRequests: value.permissionRequests ?? [],
+    attachments: value.attachments ?? [],
+    artifacts: value.artifacts ?? [],
+    artifactPreviews: value.artifactPreviews ?? [],
+    sessions: value.sessions ?? [],
+    contextPacks: value.contextPacks ?? [],
+    changeManifests: value.changeManifests ?? [],
+    designedQualityGates: value.designedQualityGates ?? [],
+    qualitySummary: value.qualitySummary ?? emptyQualitySummary,
+    gateAttempts: value.gateAttempts ?? [],
+    deliveryConflicts: value.deliveryConflicts ?? [],
+    recoveries: value.recoveries ?? [],
+    deliveryActions: value.deliveryActions ?? [],
+    deliveryReport: value.deliveryReport ?? null,
+  };
+}
+
 export async function ensureSession(): Promise<LocalSession> {
   sessionPromise ??= fetch('/api/session', { credentials: 'same-origin' })
     .then(async (response) => {
@@ -82,7 +116,7 @@ export const api = {
   tasks: (archived = false) => request<Task[]>(`/api/tasks?archived=${archived}`),
   task: (id: string) => request<Task>(`/api/tasks/${id}`),
   taskPlans: (id: string) => request<TaskPlan[]>(`/api/tasks/${id}/plans`),
-  taskEvidence: (id: string) => request<TaskEvidence>(`/api/tasks/${id}/evidence`),
+  taskEvidence: (id: string) => request<Partial<TaskEvidence>>(`/api/tasks/${id}/evidence`).then(normalizeTaskEvidence),
   taskDiagnostics: (id: string) => request<TaskDiagnostics>(`/api/tasks/${id}/diagnostics`),
   taskRuntimeLog: (id: string, cursor?: number) => request<TaskLogChunk>(
     `/api/tasks/${id}/runtime-log${cursor === undefined ? '' : `?cursor=${cursor}`}`,

@@ -15,24 +15,83 @@ if ! command -v pnpm >/dev/null 2>&1; then
 fi
 
 YANXU_URL="http://127.0.0.1:${YANXU_PORT:-43120}"
+YANXU_HOME_PATH="${YANXU_HOME:-$(node -e 'process.stdout.write(require("node:os").homedir() + "/.yanxu")')}"
+YANXU_DAEMON_LOCK="$YANXU_HOME_PATH/system/daemon.lock"
 
-yanxu_is_running() {
+yanxu_live_pid() {
   node -e '
     const endpoint = new URL("/health/live", process.argv[1]);
     const timeout = AbortSignal.timeout(1500);
     fetch(endpoint, { signal: timeout })
       .then(async (response) => {
         const body = await response.json().catch(() => null);
-        process.exit(response.ok && body?.service === "yanxu-daemon" ? 0 : 1);
+        if (!response.ok || body?.service !== "yanxu-daemon") process.exit(1);
+        if (Number.isInteger(body.pid) && body.pid > 0) process.stdout.write(String(body.pid));
       })
       .catch(() => process.exit(1));
   ' "$YANXU_URL"
 }
 
-open_yanxu() {
-  if [ "${YANXU_OPEN_BROWSER:-1}" = "1" ] && [ "$(uname -s)" = "Darwin" ]; then
-    /usr/bin/open "$YANXU_URL"
+yanxu_lock_pid() {
+  node -e '
+    const fs = require("node:fs");
+    try {
+      const owner = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      if (Number.isInteger(owner.pid) && owner.pid > 0) process.stdout.write(String(owner.pid));
+    } catch {
+      process.exit(1);
+    }
+  ' "$YANXU_DAEMON_LOCK"
+}
+
+yanxu_process_is_daemon() {
+  process_command=$(ps -p "$1" -o command= 2>/dev/null || true)
+  case "$process_command" in
+    *"apps/daemon/dist/index.js"*|*"tsx watch src/index.ts"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+stop_previous_yanxu() {
+  lock_pid=$(yanxu_lock_pid 2>/dev/null || true)
+  live_pid=$(yanxu_live_pid 2>/dev/null || true)
+
+  if [ -z "$lock_pid" ]; then
+    if [ -n "$live_pid" ]; then
+      echo "[yanxu] A Yanxu daemon is responding at $YANXU_URL, but it is not owned by $YANXU_DAEMON_LOCK."
+      echo "[yanxu] Refusing to stop an unverified process. Stop it manually or use the matching YANXU_HOME."
+      exit 1
+    fi
+    return
   fi
+
+  if ! kill -0 "$lock_pid" 2>/dev/null; then
+    return
+  fi
+  if [ -n "$live_pid" ] && [ "$live_pid" != "$lock_pid" ]; then
+    echo "[yanxu] The daemon lock belongs to PID $lock_pid, but $YANXU_URL belongs to PID $live_pid."
+    echo "[yanxu] Refusing to stop either process automatically."
+    exit 1
+  fi
+  if ! yanxu_process_is_daemon "$lock_pid"; then
+    echo "[yanxu] PID $lock_pid from the daemon lock is not a recognizable Yanxu daemon."
+    echo "[yanxu] Refusing to stop an unverified process. Remove the stale lock only after checking that PID."
+    exit 1
+  fi
+
+  echo "[yanxu] Stopping the previous Yanxu daemon (PID $lock_pid) ..."
+  kill -TERM "$lock_pid"
+  attempts=0
+  while kill -0 "$lock_pid" 2>/dev/null && [ "$attempts" -lt 100 ]; do
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$lock_pid" 2>/dev/null; then
+    echo "[yanxu] The previous daemon did not stop within 10 seconds."
+    echo "[yanxu] Startup is cancelled to avoid running mixed frontend and backend versions."
+    exit 1
+  fi
+  echo "[yanxu] Previous daemon stopped."
 }
 
 # pnpm 11 defaults verify-deps-before-run to "install", which can launch a
@@ -60,14 +119,11 @@ fi
 
 case "${1:-start}" in
   dev)
+    stop_previous_yanxu
     exec pnpm dev
     ;;
   start)
-    if yanxu_is_running; then
-      echo "[yanxu] Yanxu is already running at $YANXU_URL. Reusing the existing daemon."
-      open_yanxu
-      exit 0
-    fi
+    stop_previous_yanxu
     echo "[yanxu] Building the application..."
     pnpm build
     export YANXU_OPEN_BROWSER="${YANXU_OPEN_BROWSER:-1}"

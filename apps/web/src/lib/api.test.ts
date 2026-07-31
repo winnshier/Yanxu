@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { api } from './api.js';
+import { api, normalizeTaskEvidence } from './api.js';
 
 function jsonResponse(body: unknown) {
   return {
@@ -34,5 +34,20 @@ describe('api request headers', () => {
       'content-type': 'application/json',
       'x-yanxu-csrf': 'test-csrf',
     });
+  });
+
+  it('normalizes evidence from an older daemon instead of crashing the execution page', () => {
+    const evidence = normalizeTaskEvidence({
+      artifacts: [],
+      deliveryReport: null,
+    });
+
+    expect(evidence.qualitySummary).toMatchObject({
+      status: 'not_configured',
+      configured: 0,
+      blockingFindings: [],
+    });
+    expect(evidence.designedQualityGates).toEqual([]);
+    expect(evidence.permissionManifests).toEqual([]);
   });
 });

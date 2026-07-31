@@ -236,4 +236,12 @@ describe('task observability components', () => {
     expect(markup).toContain('12,345');
     expect(markup).toContain('Runtime crash');
   });
+
+  it('shows a diagnostic request failure instead of an endless loading card', () => {
+    const markup = renderToStaticMarkup(
+      <TaskDiagnosticsPanel diagnostics={undefined} error={new Error('接口不存在。')} />,
+    );
+    expect(markup).toContain('运行诊断加载失败');
+    expect(markup).toContain('接口不存在。');
+  });
 });

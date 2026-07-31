@@ -86,6 +86,7 @@ export type AnswerPlanInput = Static<typeof answerPlanSchema>;
 export const requestPlanRevisionSchema = Type.Object({
   stateVersion: Type.Number({ minimum: 0 }),
   feedback: Type.String({ minLength: 1, maxLength: 4000 }),
+  allowStepChanges: Type.Optional(Type.Boolean()),
 });
 export type RequestPlanRevisionInput = Static<typeof requestPlanRevisionSchema>;
 

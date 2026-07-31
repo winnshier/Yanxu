@@ -319,6 +319,117 @@ describe('dynamic execution plans', () => {
     database.close();
   });
 
+  it('preserves the approved skill sequence while incorporating ambiguity answers', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-preserve-answer-steps-'));
+    temporaryDirectories.push(root);
+    const projectDirectory = join(root, 'project');
+    const workbench = join(root, 'workbench');
+    mkdirSync(projectDirectory);
+    const database = openDatabase(join(workbench, 'system', 'app.db'));
+    const store = new YanxuStore(database, workbench);
+    const developer = store.createAgent({
+      name: '研发一号',
+      roleId: 'development',
+      executor: 'opencode',
+      model: 'test-model',
+    }, availableOpenCode);
+    const reviewer = store.createAgent({
+      name: '评审一号',
+      roleId: 'review',
+      executor: 'opencode',
+      model: 'test-model',
+    }, availableOpenCode);
+    const team = store.createTeam({ name: '研发评审团队', memberIds: [developer.id, reviewer.id] });
+    const project = store.createProject({ name: '步骤保持项目', directoryPath: projectDirectory });
+    const directoryId = project.directories[0]?.id ?? '';
+    let task = store.createTask({
+      projectId: project.id,
+      teamId: team.id,
+      title: '实现并评审功能',
+      description: '实现功能后必须独立评审。',
+      expectedOutput: '通过评审的功能',
+    });
+    task = store.submitTask(task.id, task.stateVersion);
+    const initialSteps: TaskPlan['steps'] = [{
+      id: 'implementation',
+      position: 0,
+      skillId: 'implementation',
+      agentId: developer.id,
+      title: '实现功能',
+      description: '完成批准范围内的实现。',
+      inputs: ['任务需求'],
+      expectedOutput: '实现报告',
+      directoryIds: [directoryId],
+    }, {
+      id: 'review',
+      position: 1,
+      skillId: 'delivery-review',
+      agentId: reviewer.id,
+      title: '独立评审',
+      description: '核对实现、门禁和风险。',
+      inputs: ['实现报告'],
+      expectedOutput: '交付评审',
+      directoryIds: [directoryId],
+    }];
+    task = store.saveComposedPlan(task.id, {
+      goal: '实现并评审功能',
+      scope: ['功能实现', '交付评审'],
+      nonScope: [],
+      successCriteria: ['实现通过独立评审'],
+      assumptions: [],
+      risks: [],
+      questions: [],
+      permissions: ['读取和写入隔离工作区'],
+      steps: initialSteps,
+      qualityGates: [],
+    });
+
+    task = store.requestPlanRevision(task.id, {
+      stateVersion: task.stateVersion,
+      feedback: '吸收用户答案，但不要改变执行步骤。',
+      allowStepChanges: false,
+    });
+    task = store.saveComposedPlan(task.id, {
+      goal: '按用户答案实现并评审功能',
+      scope: ['功能实现', '交付评审'],
+      nonScope: [],
+      successCriteria: ['实现通过独立评审'],
+      assumptions: [],
+      risks: [],
+      questions: [],
+      permissions: ['读取和写入隔离工作区'],
+      steps: [initialSteps[0]!],
+      qualityGates: [],
+    }, [], { preservePreviousSteps: true });
+
+    expect(task.plan?.steps.map((step) => step.skillId))
+      .toEqual(['implementation', 'delivery-review']);
+    expect(task.plan?.steps[1]).toMatchObject({
+      title: '独立评审',
+      agentId: reviewer.id,
+    });
+
+    task = store.requestPlanRevision(task.id, {
+      stateVersion: task.stateVersion,
+      feedback: '这是人工结构调整，删除独立评审步骤。',
+      allowStepChanges: true,
+    });
+    task = store.saveComposedPlan(task.id, {
+      goal: '只实现功能',
+      scope: ['功能实现'],
+      nonScope: ['交付评审'],
+      successCriteria: ['实现完成'],
+      assumptions: [],
+      risks: [],
+      questions: [],
+      permissions: ['读取和写入隔离工作区'],
+      steps: [initialSteps[0]!],
+      qualityGates: [],
+    }, [], { preservePreviousSteps: false });
+    expect(task.plan?.steps.map((step) => step.skillId)).toEqual(['implementation']);
+    database.close();
+  });
+
   it('detects an externally modified plan artifact before confirmation', () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-project-space-integrity-'));
     temporaryDirectories.push(root);

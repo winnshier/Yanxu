@@ -180,12 +180,17 @@ export function TaskDetailPage() {
           requestRevision.mutate({
             stateVersion: result.stateVersion,
             feedback: '用户已经回答全部歧义问题。请逐项吸收答案，完善目标、范围、成功标准、执行步骤、目录、权限和质量门禁；不要重复已经解决的问题。',
+            allowStepChanges: false,
           });
         } else {
           command.mutate(commandFor(result, 'confirm'));
         }
       } else if (variables.action === 'replan' && variables.revisionFeedback) {
-        requestRevision.mutate({ stateVersion: result.stateVersion, feedback: variables.revisionFeedback });
+        requestRevision.mutate({
+          stateVersion: result.stateVersion,
+          feedback: variables.revisionFeedback,
+          allowStepChanges: true,
+        });
       } else {
         message.success('计划修订已保存为新版本');
       }
@@ -445,7 +450,7 @@ export function TaskDetailPage() {
       ]} />
       <DeliveryConflictPanel conflicts={evidence.data?.deliveryConflicts ?? []} />
       {evidence.data?.deliveryReport && <Card type="inner" title="交付报告正文" className="settings-card">
-        <Typography.Paragraph className="artifact-content">{evidence.data.deliveryReport.markdown}</Typography.Paragraph>
+        <MarkdownContent content={evidence.data.deliveryReport.markdown} className="artifact-content" />
         <Typography.Text className="mono-text" type="secondary">{evidence.data.deliveryReport.contentHash.slice(0, 12)}</Typography.Text>
       </Card>}
       {(evidence.data?.deliveryActions.length ?? 0) > 0 && <List
@@ -465,7 +470,12 @@ export function TaskDetailPage() {
       </Space></Card> : <Alert type="info" showIcon message="任务通过测试与评审后生成交付报告" description="确认交付时可以保留本地任务分支自行合并，或由研序合并到任务指定的目标分支。" />,
     },
     {
-      key: 'diagnostics', label: '运行诊断', children: <TaskDiagnosticsPanel diagnostics={diagnostics.data} />,
+      key: 'diagnostics', label: '运行诊断', children: <TaskDiagnosticsPanel
+        diagnostics={diagnostics.data}
+        loading={diagnostics.isLoading}
+        error={diagnostics.error}
+        onRetry={() => { void diagnostics.refetch(); }}
+      />,
     },
     {
       key: 'history', label: '历史', children: <TaskHistory events={events.data ?? []} evidence={evidence.data} />,
@@ -539,8 +549,27 @@ export function TaskDetailPage() {
   );
 }
 
-export function TaskDiagnosticsPanel({ diagnostics }: { diagnostics: TaskDiagnostics | undefined }) {
-  if (!diagnostics) return <Card loading />;
+export function TaskDiagnosticsPanel({
+  diagnostics,
+  loading = false,
+  error,
+  onRetry,
+}: {
+  diagnostics: TaskDiagnostics | undefined;
+  loading?: boolean;
+  error?: Error | null;
+  onRetry?: () => void;
+}) {
+  if (error) return <Alert
+    type="error"
+    showIcon
+    message="运行诊断加载失败"
+    description={error.message}
+    action={onRetry ? <Button size="small" danger onClick={onRetry}>重试</Button> : undefined}
+  />;
+  if (!diagnostics) return loading
+    ? <Card loading />
+    : <Alert type="info" showIcon message="暂无运行诊断" description="任务产生执行记录后会在这里汇总耗时、失败分类和恢复记录。" />;
   const failureLabels: Record<TaskDiagnostics['failures'][number]['category'], string> = {
     transient: '瞬时故障',
     invalid_output: '输出不合法',
