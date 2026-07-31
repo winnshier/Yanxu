@@ -1,9 +1,9 @@
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
-import type { Task, TaskEvidence } from '@yanxu/contracts';
+import type { Task, TaskDiagnostics, TaskEvidence } from '@yanxu/contracts';
 import { TaskTrack } from './TaskTrack.js';
-import { DeliveryConflictPanel, TaskHistory } from '../pages/TaskDetailPage.js';
+import { DeliveryConflictPanel, TaskDiagnosticsPanel, TaskHistory } from '../pages/TaskDetailPage.js';
 
 const task: Task = {
   id: 'task_test',
@@ -139,6 +139,17 @@ describe('task observability components', () => {
       contextPacks: [],
       changeManifests: [],
       designedQualityGates: [],
+      qualitySummary: {
+        status: 'not_configured',
+        configured: 0,
+        required: 0,
+        passed: 0,
+        failed: 0,
+        waived: 0,
+        latestAttemptAt: null,
+        blockingFindings: [],
+        advisoryFindings: [],
+      },
       gateAttempts: [],
       deliveryConflicts: [{
         id: 'conflict_history',
@@ -182,5 +193,47 @@ describe('task observability components', () => {
     expect(markup).toContain('语义冲突');
     expect(markup).toContain('daemon_restarted');
     expect(markup).toContain('保存任务草稿');
+  });
+
+  it('renders classified failures and execution cost in task diagnostics', () => {
+    const decision = {
+      seq: 2,
+      id: 'event_blocked',
+      aggregateType: 'task',
+      aggregateId: 'task_test',
+      type: 'task.blocked',
+      actorType: 'system' as const,
+      message: '相同失败重复出现，已停止盲目重试。',
+      payload: {},
+      occurredAt: '2026-07-27T00:02:00.000Z',
+    };
+    const diagnostics: TaskDiagnostics = {
+      taskId: 'task_test',
+      generatedAt: '2026-07-27T00:02:00.000Z',
+      status: 'BLOCKED',
+      currentStep: { id: 'step_implementation', title: '内容实施', attempt: 2 },
+      statusReason: { type: decision.type, message: decision.message, occurredAt: decision.occurredAt },
+      duration: { totalMs: 120_000, modelMs: 70_000, gateMs: 5_000, waitingMs: 45_000 },
+      sessions: { total: 2, running: 0, succeeded: 0, failed: 2, interrupted: 0 },
+      jobs: { total: 1, ready: 0, leased: 0, succeeded: 0, failed: 1, cancelled: 0, retries: 1 },
+      planning: { versions: 1, currentVersion: 1, replans: 0 },
+      context: { packs: 2, estimatedTokens: 12_345, truncatedPacks: 1 },
+      recoveries: 0,
+      quality: {
+        status: 'not_configured', configured: 0, required: 0, passed: 0, failed: 0, waived: 0,
+        latestAttemptAt: null, blockingFindings: [], advisoryFindings: [],
+      },
+      failures: [{
+        jobId: 'job_test', jobType: 'RUN_SKILL_STEP', category: 'transient', code: null,
+        message: 'Runtime crash', fingerprint: 'abcdef1234567890', retryable: true, suggestedAction: 'retry',
+        repeated: true, attempt: 2, maxAttempts: 3, context: null, occurredAt: decision.occurredAt,
+      }],
+      recentDecisions: [decision],
+    };
+    const markup = renderToStaticMarkup(<TaskDiagnosticsPanel diagnostics={diagnostics} />);
+    expect(markup).toContain('相同失败重复出现');
+    expect(markup).toContain('重复指纹，停止盲重试');
+    expect(markup).toContain('12,345');
+    expect(markup).toContain('Runtime crash');
   });
 });

@@ -268,6 +268,7 @@ export async function createServer(
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId', (request) => store.getTask(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/plans', (request) => store.listTaskPlans(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/evidence', (request) => store.getTaskEvidence(request.params.taskId));
+  server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/diagnostics', (request) => store.getTaskDiagnostics(request.params.taskId));
   server.get<{
     Params: { taskId: string };
     Querystring: { cursor?: string; limit?: string };

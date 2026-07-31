@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join, relative } from 'node:path';
 import type {
   PlanQuestionOption,
+  ReviewFinding,
   SkillArtifactOutput,
   SkillDefinition,
   TaskContextPack,
@@ -210,6 +211,7 @@ export interface SkillResult {
   summary: string;
   artifacts: SkillArtifactOutput[];
   issues: string[];
+  findings?: ReviewFinding[];
   assumptions: string[];
   requestedScopeChanges: string[];
   reportedChecks: string[];
@@ -268,6 +270,24 @@ export function skillResultSchema(skill: SkillDefinition): Record<string, unknow
       },
     },
     issues: { type: 'array', items: { type: 'string' } },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          severity: { type: 'string', enum: ['critical', 'major', 'minor', 'suggestion'] },
+          category: { type: 'string', enum: ['correctness', 'security', 'testing', 'maintainability', 'scope', 'documentation', 'other'] },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          evidence: { type: 'string' },
+          location: { type: 'string' },
+          recommendation: { type: 'string' },
+          blocking: { type: 'boolean' },
+        },
+        required: ['severity', 'category', 'title', 'description', 'evidence', 'recommendation', 'blocking'],
+      },
+    },
     assumptions: { type: 'array', items: { type: 'string' } },
     requestedScopeChanges: { type: 'array', items: { type: 'string' } },
     reportedChecks: { type: 'array', items: { type: 'string' } },
@@ -289,6 +309,7 @@ export function skillResultSchema(skill: SkillDefinition): Record<string, unknow
   required: [
     'status', 'summary', 'artifacts', 'issues', 'assumptions',
     'requestedScopeChanges', 'reportedChecks', 'completionChecks',
+    ...(skill.id === 'delivery-review' ? ['findings'] : []),
   ],
   };
 }
@@ -323,12 +344,16 @@ export function validateSkillResult(skill: SkillDefinition, result: SkillResult)
       { skillId: skill.id, failedChecks },
     );
   }
-  if (skill.id === 'delivery-review' && result.status === 'succeeded' && result.issues.length > 0) {
+  const blockingFindings = (result.findings ?? []).filter((finding) =>
+    finding.blocking || ['critical', 'major'].includes(finding.severity));
+  const hasLegacyBlockingIssues = !(result.findings?.length) && result.issues.length > 0;
+  if (skill.id === 'delivery-review' && result.status === 'succeeded'
+    && (blockingFindings.length > 0 || hasLegacyBlockingIssues)) {
     throw new DomainError(
       'DELIVERY_REVIEW_ISSUES_REQUIRE_CHANGES',
       `${skill.name} 仍报告待处理问题时不能返回成功。`,
       422,
-      { skillId: skill.id, issues: result.issues },
+      { skillId: skill.id, findings: blockingFindings, legacyIssues: hasLegacyBlockingIssues ? result.issues : [] },
     );
   }
   if (!skill.canBlockDelivery && result.status !== 'succeeded') {
@@ -342,11 +367,27 @@ export function validateSkillResult(skill: SkillDefinition, result: SkillResult)
 };
 
 export function normalizeSkillResultOutcome(skill: SkillDefinition, result: SkillResult): SkillResult {
-  if (skill.id !== 'delivery-review' || result.status !== 'succeeded' || result.issues.length === 0) return result;
+  if (skill.id !== 'delivery-review') return result;
+  const legacyFindings: ReviewFinding[] = result.issues.map((issue) => ({
+    severity: 'major',
+    category: 'other',
+    title: issue.slice(0, 120),
+    description: issue,
+    evidence: '来自旧版 issues 字段，缺少结构化定位；按保守规则处理。',
+    recommendation: '修复后重新执行评审，并提供可追溯证据。',
+    blocking: true,
+  }));
+  const findings = [...(result.findings ?? []), ...legacyFindings].map((finding) => ({
+    ...finding,
+    blocking: finding.blocking || ['critical', 'major'].includes(finding.severity),
+  }));
+  const blockingCount = findings.filter((finding) => finding.blocking).length;
+  if (result.status !== 'succeeded' || blockingCount === 0) return { ...result, findings };
   return {
     ...result,
+    findings,
     status: 'changes_required',
-    summary: `${result.summary} 研序检测到评审仍报告 ${result.issues.length} 项待处理问题，已自动改判为需要整改。`,
+    summary: `${result.summary} 研序检测到评审仍报告 ${blockingCount} 项阻塞问题，已自动改判为需要整改。`,
   };
 }
 
@@ -517,6 +558,7 @@ export class Scheduler {
   private async runJob(job: ClaimedJob): Promise<void> {
     const heartbeat = setInterval(() => this.store.heartbeatJob(job.id, this.instanceId), 10_000);
     try {
+      this.store.assertJobExecutionCurrent(job);
       await this.execute(job);
       this.store.succeedJob(job.id, this.instanceId);
     } catch (error) {
@@ -525,9 +567,9 @@ export class Scheduler {
       const jobWasSuperseded = ['STOPPED', 'CANCELLED', 'PAUSED', 'WAITING_REAPPROVAL', 'BLOCKED'].includes(task.status)
         || (task.status === 'REPLANNING' && job.type !== 'COMPOSE_PLAN');
       if (jobWasSuperseded) {
-        this.store.succeedJob(job.id, this.instanceId);
+        this.store.discardClaimedJob(job, message.slice(0, 4_000));
       }
-      else this.store.failJob(job, message.slice(0, 4000));
+      else this.store.failJob(job, error);
     } finally {
       clearInterval(heartbeat);
       this.activeJobs.delete(job.id);
@@ -540,7 +582,7 @@ export class Scheduler {
       return this.composePlan(job.aggregateId, feedback, job.payload.autoResume === true);
     }
     if (job.type === 'PREPARE_WORKSPACE') return this.prepareWorkspace(job.aggregateId);
-    if (job.type === 'RUN_SKILL_STEP') return this.runSkillStep(job.aggregateId);
+    if (job.type === 'RUN_SKILL_STEP') return this.runSkillStep(job);
     if (job.type === 'RUN_QUALITY_GATE') return this.runGates(job.aggregateId);
     throw new Error(`Job type ${job.type} is not implemented yet.`);
   }
@@ -568,8 +610,10 @@ export class Scheduler {
     this.store.savePreparedWorkspaces(taskId, workspaces);
   }
 
-  private async runSkillStep(taskId: string): Promise<void> {
+  private async runSkillStep(job: ClaimedJob): Promise<void> {
+    const taskId = job.aggregateId;
     const step = this.store.startOrResumeStep(taskId);
+    this.store.assertJobExecutionCurrent(job, 'before_result', step);
     if (!step.agentId) throw new Error(`No agent is assigned to skill ${step.skillId}.`);
     const snapshot = this.store.getRunSnapshot(taskId);
     if (!snapshot) throw new Error('Confirmed task run snapshot is missing.');
@@ -648,6 +692,7 @@ export class Scheduler {
       });
       result.output = normalizeSkillResultOutcome(skill, result.output);
       validateSkillResult(skill, result.output);
+      this.store.assertJobExecutionCurrent(job, 'before_result', step);
       const taskAfterExecution = this.store.getTask(taskId);
       if (!['RUNNING', 'RETRYING', 'PAUSED'].includes(taskAfterExecution.status)) {
         this.store.recordSessionFailure(sessionRecordId, step.id, `执行在任务状态 ${taskAfterExecution.status} 下结束，结果未入库。`);
@@ -866,7 +911,7 @@ export class Scheduler {
       ? '当前步骤必须使用 OpenCode 的 Write/Edit 文件工具把批准的代码或文档真实写入授权隔离工作区。创建新文件时直接把授权工作区内的绝对文件路径交给 Write；Write 会递归创建缺失的父目录，不要先调用 mkdir，也不要用 echo、cat 或重定向代替文件工具。Artifact 只是实现报告，不能代替工作区文件；返回 succeeded 前必须通过 Git status/diff 确认至少一个批准范围内的文件发生变更，否则研序会拒绝本次结果。'
       : '当前步骤工作区只读；不要在代码仓库或临时目录创建产物，完整内容必须通过 artifacts 返回，研序会将其版本化写入 ProjectSpace。';
     const reviewRule = step.skillId === 'delivery-review'
-      ? ' 评审必须先核对 ChangeManifest 和 Git 实际文件：实施步骤 files=0、checkpoint 等于 baseline，或计划要求的目标文件不存在时，必须判定 changes_required。上下文中的 Artifact 摘要被截断时，应从授权只读工作区读取 ChangeManifest 对应文件，不得把截断误判为文件缺失。issues 数组只能填写必须整改后才能交付的问题；只要 issues 非空就必须返回 changes_required。非阻塞建议写入评审 Artifact 或 assumptions，不得一边报告代码、配置、测试或验收缺陷，一边返回 succeeded。'
+      ? ' 评审必须先核对 ChangeManifest 和 Git 实际文件：实施步骤 files=0、checkpoint 等于 baseline，或计划要求的目标文件不存在时，必须判定 changes_required。上下文中的 Artifact 摘要被截断时，应从授权只读工作区读取 ChangeManifest 对应文件，不得把截断误判为文件缺失。每个问题必须写入 findings，包含 severity、category、证据、定位、建议和 blocking；critical/major 一律阻塞交付并返回 changes_required，minor/suggestion 可以随 succeeded 交付但必须保留在报告。issues 仅用于兼容旧输出；一旦填写会按阻塞问题保守处理。'
       : '';
     return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required，无法安全继续时返回 blocked；其余 Skill 不得用这两个状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
   }

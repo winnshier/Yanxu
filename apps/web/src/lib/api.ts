@@ -1,7 +1,7 @@
 import type {
   AgentProfile, AnswerPlanInput, CreateAgentInput, CreateProjectRequest, CreateTaskRequest, CreateTeamInput, DirectoryProfileVersion,
   DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SkillDefinition, SystemSettings,
-  RequestPlanRevisionInput, SystemDiagnostics, SystemHealth, Task, TaskCommandInput, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent,
+  RequestPlanRevisionInput, SystemDiagnostics, SystemHealth, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent,
 } from '@yanxu/contracts';
 
 export class ApiError extends Error {
@@ -83,6 +83,7 @@ export const api = {
   task: (id: string) => request<Task>(`/api/tasks/${id}`),
   taskPlans: (id: string) => request<TaskPlan[]>(`/api/tasks/${id}/plans`),
   taskEvidence: (id: string) => request<TaskEvidence>(`/api/tasks/${id}/evidence`),
+  taskDiagnostics: (id: string) => request<TaskDiagnostics>(`/api/tasks/${id}/diagnostics`),
   taskRuntimeLog: (id: string, cursor?: number) => request<TaskLogChunk>(
     `/api/tasks/${id}/runtime-log${cursor === undefined ? '' : `?cursor=${cursor}`}`,
   ),

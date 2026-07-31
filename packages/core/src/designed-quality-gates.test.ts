@@ -35,6 +35,30 @@ afterEach(() => {
 });
 
 describe('test-designed quality gates', () => {
+  it('reports no configured gates explicitly instead of treating zero gates as passed', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-no-gates-'));
+    temporaryDirectories.push(root);
+    const repository = join(root, 'repository');
+    mkdirSync(repository);
+    const database = openDatabase(join(root, 'workbench', 'system', 'app.db'));
+    const store = new YanxuStore(database, join(root, 'workbench'));
+    const developer = store.createAgent({
+      name: '研发', roleId: 'development', executor: 'opencode', model: 'test-model',
+    }, availableOpenCode);
+    const team = store.createTeam({ name: '无门禁团队', memberIds: [developer.id] });
+    const project = store.createProject({ name: '无门禁项目', directoryPath: repository });
+    const task = store.createTask({ projectId: project.id, teamId: team.id, title: '无门禁任务', description: '验证显式状态。' });
+    expect(store.getTaskQualitySummary(task.id)).toMatchObject({
+      status: 'not_configured', configured: 0, passed: 0, failed: 0,
+    });
+    store.saveGateResults(task.id, []);
+    expect(store.listEvents(task.id)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'quality_gate.skipped', payload: expect.objectContaining({ reason: 'not_configured' }) }),
+    ]));
+    expect(store.listEvents(task.id).some((event) => event.type === 'quality_gate.completed')).toBe(false);
+    database.close();
+  });
+
   it('persists a narrower task-specific gate without mutating the confirmed plan', () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-designed-gates-'));
     temporaryDirectories.push(root);

@@ -19,10 +19,12 @@ import type {
   DeliveryAction,
   DeliveryConflict,
   DirectoryProfileVersion,
+  ExecutionFailureRecord,
   ExecutionPlanStep,
   ExecutorInstallation,
   ExecutorRuntimeValidation,
   GateAttempt,
+  JobExecutionContext,
   KnowledgeItem,
   PermissionManifest,
   PermissionRequest,
@@ -35,6 +37,7 @@ import type {
   ProjectSpaceIntegrityReport,
   ProjectSpaceRestorePreview,
   QualityGate,
+  ReviewFinding,
   RequestPlanRevisionInput,
   SkillArtifactOutput,
   SystemSettings,
@@ -42,6 +45,7 @@ import type {
   Task,
   TaskAttachment,
   TaskContextPack,
+  TaskDiagnostics,
   TaskEvidence,
   TaskPlan,
   TaskRunSnapshot,
@@ -55,6 +59,7 @@ import type {
 } from '@yanxu/contracts';
 import type { SqliteDatabase } from './database.js';
 import { DomainError } from './errors.js';
+import { classifyExecutionFailure } from './execution-failure.js';
 import { scanProjectDirectory } from './directory-scanner.js';
 import { buildIndexedPlanningContext, type PlanningDirectoryContext } from './planning-context.js';
 import { commitProjectSpace as commitProjectSpaceGit, ensureProjectSpace, writeVersionedArtifact } from './project-space.js';
@@ -1526,6 +1531,7 @@ export class YanxuStore {
         };
       }),
       designedQualityGates: this.listDesignedQualityGates(taskId),
+      qualitySummary: this.getTaskQualitySummary(taskId),
       gateAttempts: gateRows.map((row) => {
         const log = readArtifactContent(row.log_path);
         return {
@@ -1883,6 +1889,7 @@ export class YanxuStore {
         `docs: cancel task ${taskId}`, taskId);
     }
     if (command === 'self_merge') this.createDeliveryReport(taskId);
+    if (command === 'self_merge' || command === 'merge') this.createKnowledgeCandidatesForArchivedTask(taskId);
     return this.getTask(taskId);
   }
 
@@ -2129,6 +2136,114 @@ export class YanxuStore {
     }));
   }
 
+  getTaskDiagnostics(taskId: string): TaskDiagnostics {
+    const task = this.getTask(taskId);
+    const generatedAt = now();
+    const events = this.listEvents(taskId);
+    const sessions = this.database.prepare(`
+      SELECT status, started_at, completed_at FROM agent_sessions WHERE task_id = ? ORDER BY started_at
+    `).all(taskId) as Array<{
+      status: 'running' | 'succeeded' | 'failed' | 'interrupted';
+      started_at: string;
+      completed_at: string | null;
+    }>;
+    const jobs = this.database.prepare(`
+      SELECT status, attempt FROM jobs WHERE aggregate_id = ? ORDER BY created_at
+    `).all(taskId) as Array<{ status: string; attempt: number }>;
+    const gates = this.database.prepare(`
+      SELECT started_at, completed_at FROM gate_attempts WHERE task_id = ? ORDER BY started_at
+    `).all(taskId) as Array<{ started_at: string; completed_at: string }>;
+    const contexts = this.database.prepare(`
+      SELECT estimated_tokens, truncated FROM context_packs WHERE task_id = ?
+    `).all(taskId) as Array<{ estimated_tokens: number; truncated: number }>;
+    const planCount = (this.database.prepare('SELECT COUNT(*) AS count FROM plans WHERE task_id = ?').get(taskId) as { count: number }).count;
+    const recoveryCount = (this.database.prepare('SELECT COUNT(*) AS count FROM recovery_records WHERE task_id = ?').get(taskId) as { count: number }).count;
+    const endAt = ['DELIVERED', 'ARCHIVED', 'CANCELLED'].includes(task.status) ? task.updatedAt : generatedAt;
+    const elapsed = (startedAt: string, completedAt: string | null) => Math.max(
+      0,
+      new Date(completedAt ?? generatedAt).getTime() - new Date(startedAt).getTime(),
+    );
+    const totalMs = elapsed(task.createdAt, endAt);
+    const modelMs = sessions.reduce((sum, session) => sum + elapsed(session.started_at, session.completed_at), 0);
+    const gateMs = gates.reduce((sum, gate) => sum + elapsed(gate.started_at, gate.completed_at), 0);
+    const decisionTypes = new Set([
+      'task.analysis_requested', 'plan.composed', 'plan.recomposed', 'task.confirm', 'plan.auto_reapproved',
+      'task.retrying', 'task.review_retrying', 'task.replan_requested', 'task.blocked', 'task.delivered',
+      'task.stop', 'task.pause', 'task.resume', 'task.self_merge', 'task.merge', 'task.cancel', 'task.reopen',
+      'delivery.merged', 'quality_gate.started', 'quality_gate.completed',
+      'quality_gate.skipped', 'scope.change_detected', 'permission.requested', 'permission.responded',
+      'recovery.daemon_restart', 'recovery.orphaned_task', 'job.stale_discarded',
+    ]);
+    const recentDecisions = events.filter((event) => decisionTypes.has(event.type)).slice(-12);
+    const latestDecision = recentDecisions.at(-1) ?? events.at(-1) ?? null;
+    const failures = events.filter((event) => event.type === 'job.failure_classified').map((event): ExecutionFailureRecord => ({
+      jobId: String(event.payload.jobId ?? ''),
+      jobType: String(event.payload.jobType ?? 'UNKNOWN'),
+      category: event.payload.category as ExecutionFailureRecord['category'],
+      code: typeof event.payload.code === 'string' ? event.payload.code : null,
+      message: String(event.payload.error ?? event.message),
+      fingerprint: String(event.payload.fingerprint ?? ''),
+      retryable: event.payload.retryable === true,
+      suggestedAction: event.payload.suggestedAction as ExecutionFailureRecord['suggestedAction'],
+      repeated: event.payload.repeated === true,
+      attempt: Number(event.payload.attempt ?? 0),
+      maxAttempts: Number(event.payload.maxAttempts ?? 0),
+      context: event.payload.runContext as ExecutionFailureRecord['context'] ?? null,
+      occurredAt: event.occurredAt,
+    }));
+    const currentStep = task.steps.find((step) => step.status === 'running')
+      ?? (task.activeStepId ? task.steps.find((step) => step.id === task.activeStepId) : undefined)
+      ?? null;
+    const countJobs = (status: string) => jobs.filter((job) => job.status === status).length;
+    return {
+      taskId,
+      generatedAt,
+      status: task.status,
+      currentStep: currentStep ? { id: currentStep.id, title: currentStep.title, attempt: currentStep.attempt } : null,
+      statusReason: latestDecision ? {
+        type: latestDecision.type,
+        message: latestDecision.message,
+        occurredAt: latestDecision.occurredAt,
+      } : null,
+      duration: {
+        totalMs,
+        modelMs,
+        gateMs,
+        waitingMs: Math.max(0, totalMs - modelMs - gateMs),
+      },
+      sessions: {
+        total: sessions.length,
+        running: sessions.filter((session) => session.status === 'running').length,
+        succeeded: sessions.filter((session) => session.status === 'succeeded').length,
+        failed: sessions.filter((session) => session.status === 'failed').length,
+        interrupted: sessions.filter((session) => session.status === 'interrupted').length,
+      },
+      jobs: {
+        total: jobs.length,
+        ready: countJobs('READY'),
+        leased: countJobs('LEASED'),
+        succeeded: countJobs('SUCCEEDED'),
+        failed: countJobs('FAILED'),
+        cancelled: countJobs('CANCELLED'),
+        retries: events.filter((event) => event.type === 'job.retry_scheduled').length,
+      },
+      planning: {
+        versions: planCount,
+        currentVersion: task.plan?.version ?? null,
+        replans: events.filter((event) => ['task.replan_requested', 'plan.revision_requested'].includes(event.type)).length,
+      },
+      context: {
+        packs: contexts.length,
+        estimatedTokens: contexts.reduce((sum, context) => sum + context.estimated_tokens, 0),
+        truncatedPacks: contexts.filter((context) => Boolean(context.truncated)).length,
+      },
+      recoveries: recoveryCount,
+      quality: this.getTaskQualitySummary(taskId),
+      failures,
+      recentDecisions,
+    };
+  }
+
   listKnowledge(projectId: string): KnowledgeItem[] {
     this.getProject(projectId);
     return (this.database.prepare('SELECT * FROM knowledge_items WHERE project_id = ? ORDER BY updated_at DESC').all(projectId) as KnowledgeRow[])
@@ -2297,6 +2412,94 @@ export class YanxuStore {
     })();
   }
 
+  assertJobExecutionCurrent(
+    job: ClaimedJob,
+    phase: 'before_execution' | 'before_result' = 'before_execution',
+    runningStep?: Pick<TaskStep, 'id' | 'attempt'>,
+  ): void {
+    const context = job.payload.runContext as JobExecutionContext | undefined;
+    if (!context) return; // Existing queued jobs created before this invariant was introduced remain runnable.
+    const task = this.getTask(job.aggregateId);
+    if (phase === 'before_execution' && task.stateVersion !== context.taskStateVersion) {
+      throw new DomainError('RUN_CONTEXT_STALE', '后台作业对应的任务状态版本已经变化，不能继续执行。', 409, {
+        jobId: job.id,
+        expectedStateVersion: context.taskStateVersion,
+        actualStateVersion: task.stateVersion,
+      });
+    }
+    const allowedStatuses: Record<string, TaskStatus[]> = {
+      COMPOSE_PLAN: ['COMPOSING_PLAN', 'REPLANNING'],
+      PREPARE_WORKSPACE: ['PREPARING', 'QUEUED'],
+      RUN_SKILL_STEP: ['RUNNING', 'RETRYING', 'PAUSED'],
+      RUN_QUALITY_GATE: ['VALIDATING'],
+    };
+    const allowed = allowedStatuses[job.type] ?? [];
+    if (allowed.length > 0 && !allowed.includes(task.status)) {
+      throw new DomainError('RUN_CONTEXT_STALE', `后台作业状态已过期：${job.type} 不能在 ${task.status} 状态执行。`, 409, {
+        jobId: job.id,
+        phase,
+        expectedStatuses: allowed,
+        actualStatus: task.status,
+      });
+    }
+
+    const snapshot = job.type === 'COMPOSE_PLAN' ? null : this.getRunSnapshot(task.id);
+    const latestTaskVersion = job.type === 'COMPOSE_PLAN'
+      ? this.getLatestTaskVersion(task.id)
+      : snapshot?.taskVersion ?? this.getLatestTaskVersion(task.id);
+    const mismatch =
+      latestTaskVersion.id !== context.taskVersionId
+      || latestTaskVersion.version !== context.taskVersion
+      || (context.planId !== null && snapshot?.planId !== context.planId)
+      || (context.planVersion !== null && snapshot?.planVersion !== context.planVersion);
+    if (mismatch) {
+      throw new DomainError('RUN_CONTEXT_STALE', '后台作业引用的需求或计划版本已经过期，结果不能写入当前任务。', 409, {
+        jobId: job.id,
+        phase,
+        expected: context,
+        actual: {
+          taskVersionId: latestTaskVersion.id,
+          taskVersion: latestTaskVersion.version,
+          planId: snapshot?.planId ?? null,
+          planVersion: snapshot?.planVersion ?? null,
+        },
+      });
+    }
+
+    if (job.type !== 'RUN_SKILL_STEP' || !context.stepId || context.expectedStepAttempt === null) return;
+    const step = task.steps.find((item) => item.id === context.stepId);
+    const currentRunnable = task.steps.find((item) => item.status === 'running')
+      ?? task.steps.find((item) => item.status === 'pending');
+    const actualAttempt = runningStep?.attempt ?? step?.attempt ?? null;
+    const attemptMatches = phase === 'before_execution'
+      ? actualAttempt !== null && [context.expectedStepAttempt - 1, context.expectedStepAttempt].includes(actualAttempt)
+      : actualAttempt === context.expectedStepAttempt;
+    if (!step || currentRunnable?.id !== context.stepId || runningStep?.id && runningStep.id !== context.stepId || !attemptMatches) {
+      throw new DomainError('RUN_CONTEXT_STALE', '后台作业引用的步骤或执行轮次已经过期，结果不能写入当前任务。', 409, {
+        jobId: job.id,
+        phase,
+        expectedStepId: context.stepId,
+        expectedStepAttempt: context.expectedStepAttempt,
+        actualStepId: runningStep?.id ?? currentRunnable?.id ?? null,
+        actualStepAttempt: actualAttempt,
+      });
+    }
+  }
+
+  discardClaimedJob(job: ClaimedJob, reason: string): void {
+    const result = this.database.prepare(`
+      UPDATE jobs SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
+      WHERE id = ? AND status = 'LEASED' AND lease_owner = ?
+    `).run(reason, now(), job.id, job.leaseOwner);
+    if (result.changes !== 1) return;
+    this.appendEvent('task', job.aggregateId, 'job.stale_discarded', 'scheduler', '旧运行结果已丢弃，没有改变当前任务。', {
+      jobId: job.id,
+      jobType: job.type,
+      reason,
+      runContext: job.payload.runContext ?? null,
+    });
+  }
+
   ensureTaskDirectoriesGit(taskId: string): Project {
     const task = this.getTask(taskId);
     if (!task.plan) throw new DomainError('PLAN_REQUIRED', '任务缺少已确认计划。', 409);
@@ -2447,6 +2650,7 @@ export class YanxuStore {
       assumptions?: string[];
       reportedChecks?: string[];
       requestedScopeChanges?: string[];
+      findings?: ReviewFinding[];
     },
     checkpoints: Array<{ directoryId: string; baseCommit: string; commit: string; inspection: GitChangeInspection }>,
   ): Task {
@@ -2583,6 +2787,7 @@ export class YanxuStore {
           changedFiles: checkpoint.inspection.files.map((file) => file.path),
         })),
         issues: result.issues ?? [],
+        findings: result.findings ?? [],
         designedQualityGates: designedQualityGates.map((gate) => ({
           id: gate.id,
           name: gate.name,
@@ -2630,6 +2835,7 @@ export class YanxuStore {
       summary: string;
       artifacts: SkillArtifactOutput[];
       issues?: string[];
+      findings?: ReviewFinding[];
       completionChecks?: Array<{ check: string; status: 'passed' | 'failed'; evidence: string }>;
     },
     retryLimit: number,
@@ -2714,6 +2920,7 @@ export class YanxuStore {
           outcome: result.status,
           summary: result.summary,
           issues: result.issues ?? [],
+          findings: result.findings ?? [],
           completionChecks: result.completionChecks ?? [],
           artifactVersions: artifactVersions.map((artifact) => ({
             id: artifact.id,
@@ -2765,6 +2972,12 @@ export class YanxuStore {
   }
 
   saveGateResults(taskId: string, results: GateResultInput[]): void {
+    if (results.length === 0) {
+      this.appendEvent('task', taskId, 'quality_gate.skipped', 'scheduler', '当前任务未配置可执行质量门禁。', {
+        reason: 'not_configured',
+      });
+      return;
+    }
     const statement = this.database.prepare(`
       INSERT INTO gate_results(id, task_id, gate_id, directory_id, command, status, exit_code, log_path, started_at, completed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2814,6 +3027,48 @@ export class YanxuStore {
       SELECT COALESCE(MAX(attempt), 0) AS attempt FROM gate_attempts WHERE task_id = ?
     `).get(taskId) as { attempt: number };
     return row.attempt + 1;
+  }
+
+  getTaskQualitySummary(taskId: string): TaskEvidence['qualitySummary'] {
+    const task = this.getTask(taskId);
+    const gates = this.getEffectiveQualityGates(taskId);
+    const attempts = this.database.prepare(`
+      SELECT * FROM gate_attempts WHERE task_id = ? ORDER BY attempt DESC, completed_at DESC
+    `).all(taskId) as GateAttemptRow[];
+    const latestByGate = new Map<string, GateAttemptRow>();
+    for (const attempt of attempts) if (!latestByGate.has(attempt.gate_id)) latestByGate.set(attempt.gate_id, attempt);
+    const latestReview = this.listEvents(taskId).filter((event) =>
+      ['skill_step.succeeded', 'skill_step.changes_required', 'skill_step.blocked'].includes(event.type)
+      && event.payload.skillId === 'delivery-review').at(-1);
+    const findings = Array.isArray(latestReview?.payload.findings)
+      ? latestReview.payload.findings as ReviewFinding[]
+      : [];
+    const blockingFindings = findings.filter((finding) =>
+      finding.blocking || ['critical', 'major'].includes(finding.severity));
+    const advisoryFindings = findings.filter((finding) => !blockingFindings.includes(finding));
+    const configured = gates.length;
+    const waived = gates.filter((gate) => gate.status === 'waived').length;
+    const passed = gates.filter((gate) => latestByGate.get(gate.id)?.status === 'passed').length;
+    const failed = gates.filter((gate) => latestByGate.get(gate.id)?.status === 'failed').length;
+    const requiredGates = gates.filter((gate) => gate.required && gate.status !== 'waived');
+    let status: TaskEvidence['qualitySummary']['status'];
+    if (configured === 0) status = 'not_configured';
+    else if (failed > 0 || blockingFindings.length > 0) status = 'failed';
+    else if (task.status === 'VALIDATING') status = 'running';
+    else if (waived === configured) status = 'waived';
+    else if (requiredGates.length === 0 || requiredGates.every((gate) => latestByGate.get(gate.id)?.status === 'passed')) status = 'passed';
+    else status = 'pending';
+    return {
+      status,
+      configured,
+      required: requiredGates.length,
+      passed,
+      failed,
+      waived,
+      latestAttemptAt: attempts[0]?.completed_at ?? null,
+      blockingFindings,
+      advisoryFindings,
+    };
   }
 
   continueAfterGates(taskId: string): Task {
@@ -3029,11 +3284,14 @@ export class YanxuStore {
     const workspaces = this.getPreparedWorkspaces(taskId);
     const gates = this.database.prepare(`SELECT gate_id, command, status, exit_code, log_path FROM gate_results WHERE task_id = ?`).all(taskId);
     const evidence = this.getTaskEvidence(taskId);
+    const diagnostics = this.getTaskDiagnostics(taskId);
     const report = {
       taskId, title: task.title, goal: task.plan?.goal ?? task.description, status: task.status,
       workspaces: workspaces.map((workspace) => ({ directoryId: workspace.directoryId, taskBranch: workspace.taskBranch, targetBranch: workspace.targetBranch, path: workspace.workspacePath })),
       steps: task.steps.map((step) => ({ title: step.title, skillId: step.skillId, status: step.status, summary: step.summary, attempts: step.attempt })),
       gates,
+      qualitySummary: evidence.qualitySummary,
+      diagnostics,
       evidence: {
         requirementVersions: evidence.requirementVersions,
         preApprovalArtifacts: evidence.preApprovalArtifacts,
@@ -3042,6 +3300,7 @@ export class YanxuStore {
         contextPacks: evidence.contextPacks,
         changeManifests: evidence.changeManifests,
         designedQualityGates: evidence.designedQualityGates,
+        qualitySummary: evidence.qualitySummary,
         gateAttempts: evidence.gateAttempts,
         deliveryConflicts: evidence.deliveryConflicts,
         recoveries: evidence.recoveries,
@@ -3079,10 +3338,33 @@ ${evidence.changeManifests.length
 
 ## 质量门禁
 
+状态：${evidence.qualitySummary.status} · 已配置 ${evidence.qualitySummary.configured} · 通过 ${evidence.qualitySummary.passed} · 失败 ${evidence.qualitySummary.failed} · 豁免 ${evidence.qualitySummary.waived}
+
 ${evidence.gateAttempts.length
     ? evidence.gateAttempts.map((attempt) =>
       `- 第 ${attempt.attempt} 轮 · \`${attempt.commandArgv.join(' ')}\` · ${attempt.status} · exit ${attempt.exitCode ?? 'null'}${attempt.timedOut ? ' · timeout' : ''}`).join('\n')
     : '- 未配置自动化门禁'}
+
+## 评审发现
+
+${evidence.qualitySummary.blockingFindings.length
+    ? evidence.qualitySummary.blockingFindings.map((finding) =>
+      `- [阻塞/${finding.severity}] ${finding.title}：${finding.description}\n  - 证据：${finding.evidence}\n  - 建议：${finding.recommendation}`).join('\n')
+    : '- 无阻塞评审问题'}
+${evidence.qualitySummary.advisoryFindings.length
+    ? evidence.qualitySummary.advisoryFindings.map((finding) =>
+      `- [建议/${finding.severity}] ${finding.title}：${finding.description}\n  - 证据：${finding.evidence}`).join('\n')
+    : '- 无非阻塞建议'}
+
+## 运行诊断
+
+- 总耗时：${Math.round(diagnostics.duration.totalMs / 1000)} 秒
+- 模型执行：${Math.round(diagnostics.duration.modelMs / 1000)} 秒
+- 等待/排队/人工确认：${Math.round(diagnostics.duration.waitingMs / 1000)} 秒
+- 会话：${diagnostics.sessions.succeeded} 成功 / ${diagnostics.sessions.failed} 失败 / ${diagnostics.sessions.interrupted} 中断
+- 自动重试：${diagnostics.jobs.retries} 次；恢复：${diagnostics.recoveries} 次；重规划：${diagnostics.planning.replans} 次
+- 上下文：${diagnostics.context.packs} 个包，累计估算 ${diagnostics.context.estimatedTokens} tokens，截断 ${diagnostics.context.truncatedPacks} 次
+- 失败分类：${diagnostics.failures.length ? diagnostics.failures.map((failure) => `${failure.category}/${failure.suggestedAction}`).join('；') : '无'}
 
 ## 交付动作
 
@@ -3114,18 +3396,48 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(task_id) DO UPDATE SET artifact_path = excluded.artifact_path,
         content_hash = excluded.content_hash, content_json = excluded.content_json, created_at = excluded.created_at
     `).run(id('report'), taskId, artifact.path, artifact.hash, JSON.stringify(report), report.createdAt);
-    this.createKnowledgeCandidates(task, project, workspaces, gates as Array<{
-      gate_id: string; command: string; status: string; exit_code: number | null; log_path: string;
-    }>);
     this.recordProjectSpaceCommit(project.projectSpacePath, `docs: create delivery report for ${taskId}`, taskId);
   }
 
-  private createKnowledgeCandidates(
-    task: Task,
-    project: Project,
-    workspaces: PreparedWorkspace[],
-    gates: Array<{ gate_id: string; command: string; status: string; exit_code: number | null; log_path: string }>,
-  ): void {
+  private createKnowledgeCandidatesForArchivedTask(taskId: string): void {
+    const task = this.getTask(taskId);
+    if (task.status !== 'ARCHIVED') {
+      throw new DomainError('KNOWLEDGE_ARCHIVE_REQUIRED', '只有用户确认完成并归档后才能生成项目知识候选。', 409);
+    }
+    const project = this.getProject(task.projectId);
+    const workspaces = this.getPreparedWorkspaces(taskId);
+    const evidence = this.getTaskEvidence(taskId);
+    const reviewFindings = this.listEvents(taskId)
+      .filter((event) => ['skill_step.succeeded', 'skill_step.changes_required', 'skill_step.blocked'].includes(event.type)
+        && event.payload.skillId === 'delivery-review')
+      .flatMap((event) => Array.isArray(event.payload.findings) ? event.payload.findings as ReviewFinding[] : []);
+    const gateLessons = evidence.gateAttempts.filter((attempt) => attempt.status === 'failed').map((attempt) => {
+      const laterPassed = evidence.gateAttempts.some((candidate) =>
+        candidate.gateId === attempt.gateId && candidate.attempt > attempt.attempt && candidate.status === 'passed');
+      return [
+        `问题：质量门禁 \`${attempt.commandArgv.join(' ')}\` 在第 ${attempt.attempt} 轮失败（exit ${attempt.exitCode ?? 'null'}${attempt.timedOut ? '，超时' : ''}）。`,
+        `原因证据：${attempt.logExcerpt?.trim().slice(-1_000) || `日志保存在 ${attempt.logPath}`}。`,
+        '处理：任务回到已批准的实施步骤，携带失败日志进行修复，没有扩大原计划范围。',
+        `验证：${laterPassed ? '后续同一门禁已经通过。' : '归档时没有记录到后续同门禁通过证据，应谨慎复用。'}`,
+      ].join('\n');
+    });
+    const reviewLessons = reviewFindings.map((finding) => [
+      `问题：${finding.title}（${finding.severity}/${finding.category}${finding.location ? `，${finding.location}` : ''}）。`,
+      `原因证据：${finding.evidence}。`,
+      `处理：${finding.recommendation}。`,
+      `验证：最终质量状态为 ${evidence.qualitySummary.status}；该问题${finding.blocking ? '曾阻塞交付' : '作为非阻塞建议保留'}。`,
+    ].join('\n'));
+    const reusableLessons = [...gateLessons, ...reviewLessons];
+    const currentRequirement = evidence.requirementVersions.find((version) => version.id === task.plan?.taskVersionId)
+      ?? evidence.requirementVersions.at(-1);
+    const sourceLine = [
+      currentRequirement ? `TaskVersion v${currentRequirement.version} ${currentRequirement.contentHash.slice(0, 16)}` : null,
+      task.plan ? `Plan v${task.plan.version} ${task.plan.id}` : null,
+      evidence.artifacts.length
+        ? `Artifacts ${evidence.artifacts.filter((artifact) => artifact.status !== 'superseded').map((artifact) => `${artifact.artifactType}@${artifact.contentHash.slice(0, 12)}`).join('、')}`
+        : null,
+      evidence.deliveryReport ? `DeliveryReport ${evidence.deliveryReport.contentHash.slice(0, 16)}` : null,
+    ].filter(Boolean).join('；');
     const candidates = [
       {
         category: 'decision' as const,
@@ -3135,30 +3447,36 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           `范围：${task.plan?.scope.join('；') || '未单独列出'}`,
           `成功标准：${task.plan?.successCriteria.join('；') || '未单独列出'}`,
           `计划版本：v${task.plan?.version ?? 1}`,
+          `适用目录：${workspaces.map((workspace) => workspace.directoryId).join('；') || '无代码目录'}`,
+          `来源证据：${sourceLine || '交付报告'}`,
         ].join('\n'),
       },
-      {
+      ...(reusableLessons.length ? [{
         category: 'experience' as const,
         title: `交付经验：${task.title}`,
         content: [
-          `已完成步骤：${task.steps.filter((step) => step.status === 'succeeded').map((step) => `${step.title}${step.summary ? `（${step.summary}）` : ''}`).join('；') || '无'}`,
-          `质量门禁：${gates.map((gate) => `${gate.command}=${gate.status}${gate.exit_code === null ? '' : `(${gate.exit_code})`}`).join('；') || '未配置自动化门禁'}`,
-          `任务分支：${workspaces.map((workspace) => `${workspace.taskBranch} → ${workspace.targetBranch}`).join('；')}`,
-          `证据：ProjectSpace reports/${task.id}/delivery.md 与 tasks/${task.id}/steps/`,
+          ...reusableLessons.map((lesson, index) => `经验 ${index + 1}\n${lesson}`),
+          `适用边界：${task.plan?.scope.join('；') || task.description}；目录 ${workspaces.map((workspace) => workspace.directoryId).join('、') || '无'}。`,
+          `来源证据：${sourceLine || `ProjectSpace reports/${task.id}/delivery.md`}。`,
         ].join('\n'),
-      },
+      }] : []),
     ];
     const timestamp = now();
+    const createdCandidates: typeof candidates = [];
     this.database.transaction(() => {
       for (const candidate of candidates) {
         const existing = this.database.prepare(`
-          SELECT * FROM knowledge_items WHERE project_id = ? AND source_task_id = ? AND category = ? AND status = 'candidate'
+          SELECT * FROM knowledge_items WHERE project_id = ? AND source_task_id = ? AND category = ?
           ORDER BY version DESC LIMIT 1
         `).get(project.id, task.id, candidate.category) as KnowledgeRow | undefined;
+        const candidateHash = sha256(candidate.content);
+        if (existing?.title === candidate.title && sha256(existing.content) === candidateHash) continue;
         if (existing) {
-          this.database.prepare(`
-            UPDATE knowledge_items SET status = 'superseded', updated_at = ? WHERE id = ?
-          `).run(timestamp, existing.id);
+          if (existing.status === 'candidate') {
+            this.database.prepare(`
+              UPDATE knowledge_items SET status = 'superseded', updated_at = ? WHERE id = ?
+            `).run(timestamp, existing.id);
+          }
           this.database.prepare(`
             INSERT INTO knowledge_items(
               id, project_id, category, title, content, status, source_task_id,
@@ -3175,11 +3493,20 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           `).run(id('knowledge'), project.id, candidate.category, candidate.title, candidate.content,
             task.id, timestamp, timestamp);
         }
+        createdCandidates.push(candidate);
       }
-      this.appendEvent('project', project.id, 'knowledge.candidates_created', 'system', `任务“${task.title}”生成了待确认的项目知识。`, { taskId: task.id });
+      if (createdCandidates.length > 0) {
+        this.appendEvent('project', project.id, 'knowledge.candidates_created', 'system', `任务“${task.title}”生成了待确认的项目知识。`, {
+          taskId: task.id,
+          categories: createdCandidates.map((candidate) => candidate.category),
+          contentHashes: createdCandidates.map((candidate) => sha256(candidate.content)),
+        });
+      }
     })();
+    if (createdCandidates.length === 0) return;
     const markdown = `# ${task.title} · 知识候选\n\n> 内容来自已批准计划和实际交付证据，确认前不会进入项目检索上下文。\n\n${candidates.map((candidate) => `## ${candidate.title}\n\n${candidate.content}`).join('\n\n')}\n`;
     writeVersionedArtifact(project.projectSpacePath, `knowledge/candidates/${task.id}.md`, markdown);
+    this.recordProjectSpaceCommit(project.projectSpacePath, `docs: create knowledge candidates for ${task.id}`, task.id);
   }
 
   heartbeatJob(jobId: string, instanceId: string, leaseMilliseconds = 30_000): boolean {
@@ -3197,16 +3524,74 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     `).run(now(), jobId, instanceId);
   }
 
-  failJob(job: ClaimedJob, error: string): void {
+  failJob(job: ClaimedJob, error: unknown): void {
+    const failure = classifyExecutionFailure(error);
+    const errorMessage = failure.message.slice(0, 4_000);
+    const runContext = job.payload.runContext as JobExecutionContext | undefined;
+    if (runContext) {
+      const task = this.getTask(job.aggregateId);
+      if (task.stateVersion !== runContext.taskStateVersion) {
+        this.appendEvent('task', job.aggregateId, 'job.failure_classified', 'scheduler', '后台作业失败时任务版本已经变化，旧作业不会重试。', {
+          jobId: job.id,
+          jobType: job.type,
+          category: 'stale_execution',
+          code: 'RUN_CONTEXT_STALE',
+          error: errorMessage,
+          fingerprint: failure.fingerprint,
+          retryable: false,
+          suggestedAction: 'discard',
+          repeated: false,
+          attempt: job.attempt + 1,
+          maxAttempts: job.maxAttempts,
+          runContext,
+          actualStateVersion: task.stateVersion,
+          occurredAt: now(),
+        });
+        this.discardClaimedJob(job, `任务状态版本已从 ${runContext.taskStateVersion} 变化为 ${task.stateVersion}：${errorMessage}`);
+        return;
+      }
+    }
     const nextAttempt = job.attempt + 1;
-    if (nextAttempt < job.maxAttempts) {
+    const priorFailures = (this.database.prepare(`
+      SELECT payload_json FROM workflow_events
+      WHERE aggregate_type = 'task' AND aggregate_id = ? AND event_type = 'job.failure_classified'
+      ORDER BY seq DESC LIMIT 10
+    `).all(job.aggregateId) as Array<{ payload_json: string }>).map((row) => parseJson<{
+      jobType?: string; fingerprint?: string;
+    }>(row.payload_json, {}));
+    const previousSameJobType = priorFailures.find((item) => item.jobType === job.type);
+    const repeated = previousSameJobType?.fingerprint === failure.fingerprint;
+    const occurredAt = now();
+    this.appendEvent('task', job.aggregateId, 'job.failure_classified', 'scheduler', `后台作业失败：${failure.category}。`, {
+      jobId: job.id,
+      jobType: job.type,
+      category: failure.category,
+      code: failure.code,
+      error: errorMessage,
+      fingerprint: failure.fingerprint,
+      retryable: failure.retryable,
+      suggestedAction: failure.suggestedAction,
+      repeated,
+      attempt: nextAttempt,
+      maxAttempts: job.maxAttempts,
+      runContext: job.payload.runContext ?? null,
+      occurredAt,
+    });
+
+    if (failure.suggestedAction === 'discard') {
+      this.discardClaimedJob(job, errorMessage);
+      return;
+    }
+
+    if (failure.retryable && !repeated && nextAttempt < job.maxAttempts) {
       const availableAt = new Date(Date.now() + Math.min(30_000, 1000 * (2 ** nextAttempt))).toISOString();
       this.database.prepare(`
         UPDATE jobs SET status = 'READY', attempt = ?, available_at = ?, lease_owner = NULL, lease_expires_at = NULL,
           last_error = ?, updated_at = ? WHERE id = ? AND lease_owner = ?
-      `).run(nextAttempt, availableAt, error, now(), job.id, job.leaseOwner);
+      `).run(nextAttempt, availableAt, errorMessage, now(), job.id, job.leaseOwner);
       this.appendEvent('task', job.aggregateId, 'job.retry_scheduled', 'scheduler', `后台任务失败，将进行第 ${nextAttempt + 1} 次尝试。`, {
-        jobType: job.type, error, attempt: nextAttempt,
+        jobId: job.id, jobType: job.type, error: errorMessage, attempt: nextAttempt,
+        category: failure.category, fingerprint: failure.fingerprint,
       });
       return;
     }
@@ -3215,19 +3600,30 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       this.database.prepare(`
         UPDATE jobs SET status = 'FAILED', attempt = ?, lease_owner = NULL, lease_expires_at = NULL, last_error = ?, updated_at = ?
         WHERE id = ? AND lease_owner = ?
-      `).run(nextAttempt, error, now(), job.id, job.leaseOwner);
+      `).run(nextAttempt, errorMessage, now(), job.id, job.leaseOwner);
       const task = this.getTask(job.aggregateId);
       if (!['ARCHIVED', 'CANCELLED', 'DELIVERED', 'STOPPED'].includes(task.status)) {
-        shouldReplan = ['RUN_SKILL_STEP', 'RUN_QUALITY_GATE'].includes(job.type);
+        shouldReplan = failure.suggestedAction === 'replan'
+          || (['RUN_SKILL_STEP', 'RUN_QUALITY_GATE'].includes(job.type)
+            && !['permission', 'model_capability', 'git_conflict', 'system'].includes(failure.category));
         if (!shouldReplan) {
-          this.updateTaskState(task.id, task.stateVersion, 'BLOCKED', 'task.blocked', '自动重试已耗尽，需要人工处理。', { jobType: job.type, error });
+          const reason = repeated
+            ? '相同失败重复出现，已停止盲目重试，需要人工处理。'
+            : failure.retryable ? '自动重试已耗尽，需要人工处理。' : '该失败无法通过自动重试恢复，需要人工处理。';
+          this.updateTaskState(task.id, task.stateVersion, 'BLOCKED', 'task.blocked', reason, {
+            jobType: job.type,
+            error: errorMessage,
+            category: failure.category,
+            fingerprint: failure.fingerprint,
+            repeated,
+          });
         }
       }
     })();
     if (shouldReplan) {
       this.requestAutomaticReplan(
         job.aggregateId,
-        `${job.type} 在后台自动重试后仍失败：${error.slice(0, 2_000)}。请基于现有失败证据重新规划，不得扩大已批准范围。`,
+        `${job.type} 执行失败（${failure.category}）：${errorMessage.slice(0, 2_000)}。请基于现有失败证据重新规划，不得扩大已批准范围。`,
         `job_${job.type.toLowerCase()}_failed`,
         true,
       );
@@ -3681,11 +4077,34 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     payload: Record<string, unknown> = {},
   ): boolean {
     const timestamp = now();
+    const runContext = this.buildJobExecutionContext(type, aggregateId, timestamp);
+    const jobPayload = { ...payload, runContext };
     const result = this.database.prepare(`
       INSERT OR IGNORE INTO jobs(id, type, aggregate_id, payload_json, status, priority, available_at, dedupe_key, created_at, updated_at)
       VALUES (?, ?, ?, ?, 'READY', ?, ?, ?, ?, ?)
-    `).run(id('job'), type, aggregateId, JSON.stringify(payload), priority, timestamp, dedupeKey, timestamp, timestamp);
+    `).run(id('job'), type, aggregateId, JSON.stringify(jobPayload), priority, timestamp, dedupeKey, timestamp, timestamp);
     return result.changes === 1;
+  }
+
+  private buildJobExecutionContext(type: string, taskId: string, enqueuedAt: string): JobExecutionContext {
+    const task = this.getTask(taskId);
+    const snapshot = type === 'COMPOSE_PLAN' ? null : this.getRunSnapshot(taskId);
+    const taskVersion = type === 'COMPOSE_PLAN'
+      ? this.getLatestTaskVersion(taskId)
+      : snapshot?.taskVersion ?? this.getLatestTaskVersion(taskId);
+    const step = type === 'RUN_SKILL_STEP'
+      ? task.steps.find((item) => item.status === 'running') ?? task.steps.find((item) => item.status === 'pending') ?? null
+      : null;
+    return {
+      taskStateVersion: task.stateVersion,
+      taskVersionId: taskVersion.id,
+      taskVersion: taskVersion.version,
+      planId: snapshot?.planId ?? null,
+      planVersion: snapshot?.planVersion ?? null,
+      stepId: step?.id ?? null,
+      expectedStepAttempt: step ? step.attempt + (step.status === 'pending' ? 1 : 0) : null,
+      enqueuedAt,
+    };
   }
 
   private enqueueJobOrAssertRunnable(
@@ -3725,6 +4144,22 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       WHERE task_id = ?
       ORDER BY CASE status WHEN 'approved' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, version DESC
       LIMIT 1
+    `).get(taskId) as TaskVersionRow | undefined;
+    if (!row) throw new DomainError('TASK_VERSION_NOT_FOUND', '任务缺少可追溯的需求版本。', 409);
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      version: row.version,
+      status: row.status,
+      artifactPath: row.artifact_path,
+      contentHash: row.content_hash,
+      createdAt: row.created_at,
+    };
+  }
+
+  private getLatestTaskVersion(taskId: string): TaskVersionSummary {
+    const row = this.database.prepare(`
+      SELECT * FROM task_versions WHERE task_id = ? ORDER BY version DESC LIMIT 1
     `).get(taskId) as TaskVersionRow | undefined;
     if (!row) throw new DomainError('TASK_VERSION_NOT_FOUND', '任务缺少可追溯的需求版本。', 409);
     return {

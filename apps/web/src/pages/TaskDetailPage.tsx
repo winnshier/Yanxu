@@ -3,7 +3,7 @@ import { Alert, Button, Card, Checkbox, Descriptions, Divider, Form, Input, List
 import { CheckOutlined, DeleteOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'react-router-dom';
-import type { AnswerPlanInput, RequestPlanRevisionInput, Task, TaskCommandInput, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
+import type { AnswerPlanInput, RequestPlanRevisionInput, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
 import { api, ApiError } from '../lib/api.js';
 import {
   buildPlanQuestionFormAnswers,
@@ -43,6 +43,14 @@ interface CorrectionFormValues {
 
 function commandFor(task: Task, command: TaskCommandInput['command']): TaskCommandInput {
   return { command, stateVersion: task.stateVersion };
+}
+
+function formatDuration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1_000));
+  const hours = Math.floor(seconds / 3_600);
+  const minutes = Math.floor((seconds % 3_600) / 60);
+  const rest = seconds % 60;
+  return [hours ? `${hours} 小时` : '', minutes ? `${minutes} 分` : '', `${rest} 秒`].filter(Boolean).join(' ');
 }
 
 function describePlanChanges(current: TaskPlan, previous?: TaskPlan): string[] {
@@ -85,6 +93,7 @@ export function TaskDetailPage() {
   const plans = useQuery({ queryKey: ['task-plans', taskId], queryFn: () => api.taskPlans(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const events = useQuery({ queryKey: ['task-events', taskId], queryFn: () => api.taskEvents(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const evidence = useQuery({ queryKey: ['task-evidence', taskId], queryFn: () => api.taskEvidence(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
+  const diagnostics = useQuery({ queryKey: ['task-diagnostics', taskId], queryFn: () => api.taskDiagnostics(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const data = task.data;
   const project = useQuery({ queryKey: ['project', data?.projectId], queryFn: () => api.project(data?.projectId ?? ''), enabled: Boolean(data?.projectId) });
   const agents = useQuery({ queryKey: ['agents'], queryFn: api.agents });
@@ -456,6 +465,9 @@ export function TaskDetailPage() {
       </Space></Card> : <Alert type="info" showIcon message="任务通过测试与评审后生成交付报告" description="确认交付时可以保留本地任务分支自行合并，或由研序合并到任务指定的目标分支。" />,
     },
     {
+      key: 'diagnostics', label: '运行诊断', children: <TaskDiagnosticsPanel diagnostics={diagnostics.data} />,
+    },
+    {
       key: 'history', label: '历史', children: <TaskHistory events={events.data ?? []} evidence={evidence.data} />,
     },
   ] : [];
@@ -525,6 +537,86 @@ export function TaskDetailPage() {
       </QueryState>
     </div>
   );
+}
+
+export function TaskDiagnosticsPanel({ diagnostics }: { diagnostics: TaskDiagnostics | undefined }) {
+  if (!diagnostics) return <Card loading />;
+  const failureLabels: Record<TaskDiagnostics['failures'][number]['category'], string> = {
+    transient: '瞬时故障',
+    invalid_output: '输出不合法',
+    skill_contract: 'Skill 契约',
+    permission: '权限问题',
+    scope_change: '范围变化',
+    model_capability: '模型能力',
+    git_conflict: 'Git 冲突',
+    stale_execution: '旧运行结果',
+    system: '系统故障',
+  };
+  return <Space direction="vertical" size="middle" className="full-width">
+    {diagnostics.statusReason && <Alert
+      type={diagnostics.status === 'BLOCKED' ? 'error' : diagnostics.status === 'RETRYING' || diagnostics.status === 'REPLANNING' ? 'warning' : 'info'}
+      showIcon
+      message={`当前状态：${diagnostics.status}`}
+      description={`${diagnostics.statusReason.message} · ${new Date(diagnostics.statusReason.occurredAt).toLocaleString()}`}
+    />}
+    <div className="detail-grid">
+      <Card title="耗时构成">
+        <Descriptions column={1} size="small" items={[
+          { key: 'total', label: '任务总耗时', children: formatDuration(diagnostics.duration.totalMs) },
+          { key: 'model', label: '模型执行', children: formatDuration(diagnostics.duration.modelMs) },
+          { key: 'gate', label: '质量门禁', children: formatDuration(diagnostics.duration.gateMs) },
+          { key: 'waiting', label: '排队/等待/人工确认', children: formatDuration(diagnostics.duration.waitingMs) },
+        ]} />
+      </Card>
+      <Card title="执行健康度">
+        <Descriptions column={1} size="small" items={[
+          { key: 'session', label: '会话', children: `${diagnostics.sessions.succeeded} 成功 / ${diagnostics.sessions.failed} 失败 / ${diagnostics.sessions.interrupted} 中断` },
+          { key: 'job', label: '后台作业', children: `${diagnostics.jobs.succeeded} 成功 / ${diagnostics.jobs.failed} 失败 / ${diagnostics.jobs.cancelled} 取消` },
+          { key: 'retry', label: '自动重试 / 恢复', children: `${diagnostics.jobs.retries} / ${diagnostics.recoveries}` },
+          { key: 'plan', label: '计划版本 / 重规划', children: `${diagnostics.planning.versions} / ${diagnostics.planning.replans}` },
+        ]} />
+      </Card>
+      <Card title="上下文成本">
+        <Descriptions column={1} size="small" items={[
+          { key: 'packs', label: '上下文包', children: diagnostics.context.packs },
+          { key: 'tokens', label: '累计估算 Token', children: diagnostics.context.estimatedTokens.toLocaleString() },
+          { key: 'truncated', label: '发生截断', children: `${diagnostics.context.truncatedPacks} 次` },
+          { key: 'quality', label: '质量结论', children: <Tag color={diagnostics.quality.status === 'passed' ? 'green' : diagnostics.quality.status === 'failed' ? 'red' : 'orange'}>{diagnostics.quality.status}</Tag> },
+        ]} />
+      </Card>
+    </div>
+    <Card title={`失败分类时间线 · ${diagnostics.failures.length}`}>
+      <List
+        size="small"
+        locale={{ emptyText: '没有记录到后台执行失败' }}
+        dataSource={diagnostics.failures.slice().reverse()}
+        rowKey={(failure) => `${failure.jobId}-${failure.occurredAt}-${failure.attempt}`}
+        renderItem={(failure) => <List.Item>
+          <List.Item.Meta
+            title={<Space wrap>
+              <Tag color={failure.retryable ? 'orange' : failure.suggestedAction === 'discard' ? 'default' : 'red'}>{failureLabels[failure.category]}</Tag>
+              <Typography.Text strong>{failure.jobType}</Typography.Text>
+              <Tag>第 {failure.attempt} 次</Tag>
+              {failure.repeated && <Tag color="red">重复指纹，停止盲重试</Tag>}
+            </Space>}
+            description={<Space direction="vertical" size={2}>
+              <Typography.Text>{failure.message}</Typography.Text>
+              <Typography.Text type="secondary">动作：{failure.suggestedAction} · 指纹 {failure.fingerprint.slice(0, 12)} · {new Date(failure.occurredAt).toLocaleString()}</Typography.Text>
+            </Space>}
+          />
+        </List.Item>}
+      />
+    </Card>
+    <Card title="最近关键决策">
+      <Timeline items={diagnostics.recentDecisions.slice().reverse().map((event) => ({
+        key: event.id,
+        children: <div>
+          <Typography.Text strong>{event.message}</Typography.Text>
+          <div><Typography.Text type="secondary">{event.type} · {new Date(event.occurredAt).toLocaleString()}</Typography.Text></div>
+        </div>,
+      }))} />
+    </Card>
+  </Space>;
 }
 
 export function DeliveryConflictPanel({ conflicts }: {
@@ -799,10 +891,55 @@ function ExecutionEvidence({ taskId, evidence }: { taskId: string; evidence: Tas
         </List.Item>}
       />
     </Card>
-    <Card title={`质量门禁证据 · ${evidence.gateAttempts.length}`}>
+    <Card
+      title={`质量门禁与评审 · ${evidence.gateAttempts.length} 次执行`}
+      extra={<Tag color={
+        evidence.qualitySummary.status === 'passed' ? 'green'
+          : evidence.qualitySummary.status === 'failed' ? 'red'
+            : evidence.qualitySummary.status === 'not_configured' ? 'orange'
+              : evidence.qualitySummary.status === 'waived' ? 'default' : 'blue'
+      }>{({
+        not_configured: '未配置门禁',
+        pending: '等待门禁',
+        running: '门禁执行中',
+        passed: '门禁通过',
+        failed: '存在阻塞问题',
+        waived: '已全部豁免',
+      } as const)[evidence.qualitySummary.status]}</Tag>}
+    >
+      <Descriptions size="small" column={{ xs: 2, md: 5 }} items={[
+        { key: 'configured', label: '已配置', children: evidence.qualitySummary.configured },
+        { key: 'required', label: '必需', children: evidence.qualitySummary.required },
+        { key: 'passed', label: '通过', children: evidence.qualitySummary.passed },
+        { key: 'failed', label: '失败', children: evidence.qualitySummary.failed },
+        { key: 'waived', label: '豁免', children: evidence.qualitySummary.waived },
+      ]} />
+      {evidence.qualitySummary.blockingFindings.length > 0 && <Alert
+        className="settings-card"
+        type="error"
+        showIcon
+        message={`${evidence.qualitySummary.blockingFindings.length} 项阻塞评审问题`}
+        description={<List
+          size="small"
+          dataSource={evidence.qualitySummary.blockingFindings}
+          renderItem={(finding) => <List.Item>
+            <List.Item.Meta
+              title={<Space><Tag color="red">{finding.severity}</Tag><Typography.Text strong>{finding.title}</Typography.Text></Space>}
+              description={`${finding.description} · 证据：${finding.evidence}`}
+            />
+          </List.Item>}
+        />}
+      />}
+      {evidence.qualitySummary.advisoryFindings.length > 0 && <Alert
+        className="settings-card"
+        type="warning"
+        showIcon
+        message={`${evidence.qualitySummary.advisoryFindings.length} 项非阻塞建议`}
+        description={evidence.qualitySummary.advisoryFindings.map((finding) => finding.title).join('；')}
+      />}
       <List
         size="small"
-        locale={{ emptyText: '尚未运行质量门禁' }}
+        locale={{ emptyText: evidence.qualitySummary.status === 'not_configured' ? '当前任务未配置可执行质量门禁' : '尚未运行质量门禁' }}
         dataSource={evidence.gateAttempts}
         rowKey={(item) => item.id}
         renderItem={(item) => <List.Item>

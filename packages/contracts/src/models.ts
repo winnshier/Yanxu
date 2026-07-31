@@ -10,6 +10,46 @@ export type ExecutorHealth = 'available' | 'unavailable' | 'unchecked';
 export type TaskStepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
 export type KnowledgeCategory = 'profile' | 'decision' | 'experience' | 'candidate';
 
+export type ExecutionFailureCategory =
+  | 'transient'
+  | 'invalid_output'
+  | 'skill_contract'
+  | 'permission'
+  | 'scope_change'
+  | 'model_capability'
+  | 'git_conflict'
+  | 'stale_execution'
+  | 'system';
+
+export type ExecutionFailureAction = 'retry' | 'replan' | 'await_user' | 'discard';
+
+export interface JobExecutionContext {
+  taskStateVersion: number;
+  taskVersionId: string;
+  taskVersion: number;
+  planId: string | null;
+  planVersion: number | null;
+  stepId: string | null;
+  expectedStepAttempt: number | null;
+  enqueuedAt: string;
+}
+
+export interface ExecutionFailureRecord {
+  jobId: string;
+  jobType: string;
+  category: ExecutionFailureCategory;
+  code: string | null;
+  message: string;
+  fingerprint: string;
+  retryable: boolean;
+  suggestedAction: ExecutionFailureAction;
+  repeated: boolean;
+  attempt: number;
+  maxAttempts: number;
+  context: JobExecutionContext | null;
+  occurredAt: string;
+}
+
 export interface ProjectDirectory {
   id: string;
   projectId: string;
@@ -451,6 +491,31 @@ export interface GateAttempt {
   completedAt: string;
 }
 
+export type ReviewFindingSeverity = 'critical' | 'major' | 'minor' | 'suggestion';
+
+export interface ReviewFinding {
+  severity: ReviewFindingSeverity;
+  category: 'correctness' | 'security' | 'testing' | 'maintainability' | 'scope' | 'documentation' | 'other';
+  title: string;
+  description: string;
+  evidence: string;
+  location?: string;
+  recommendation: string;
+  blocking: boolean;
+}
+
+export interface TaskQualitySummary {
+  status: 'not_configured' | 'pending' | 'running' | 'passed' | 'failed' | 'waived';
+  configured: number;
+  required: number;
+  passed: number;
+  failed: number;
+  waived: number;
+  latestAttemptAt: string | null;
+  blockingFindings: ReviewFinding[];
+  advisoryFindings: ReviewFinding[];
+}
+
 export interface AgentSessionEvidence {
   id: string;
   taskId: string;
@@ -524,6 +589,7 @@ export interface TaskEvidence {
   contextPacks: Array<Pick<TaskContextPack, 'id' | 'stepId' | 'attempt' | 'contentHash' | 'manifestPath' | 'estimatedTokens' | 'truncated' | 'createdAt'>>;
   changeManifests: ChangeManifest[];
   designedQualityGates: QualityGate[];
+  qualitySummary: TaskQualitySummary;
   gateAttempts: GateAttempt[];
   deliveryConflicts: DeliveryConflict[];
   recoveries: RecoveryRecord[];
@@ -677,6 +743,42 @@ export interface SystemDiagnostics {
   gitVersion: string | null;
   workbenchHome: string;
   daemonLogPath: string;
+}
+
+export interface TaskDiagnostics {
+  taskId: string;
+  generatedAt: string;
+  status: TaskStatus;
+  currentStep: { id: string; title: string; attempt: number } | null;
+  statusReason: { type: string; message: string; occurredAt: string } | null;
+  duration: {
+    totalMs: number;
+    modelMs: number;
+    gateMs: number;
+    waitingMs: number;
+  };
+  sessions: {
+    total: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    interrupted: number;
+  };
+  jobs: {
+    total: number;
+    ready: number;
+    leased: number;
+    succeeded: number;
+    failed: number;
+    cancelled: number;
+    retries: number;
+  };
+  planning: { versions: number; currentVersion: number | null; replans: number };
+  context: { packs: number; estimatedTokens: number; truncatedPacks: number };
+  recoveries: number;
+  quality: TaskQualitySummary;
+  failures: ExecutionFailureRecord[];
+  recentDecisions: WorkflowEvent[];
 }
 
 export interface SystemSettings {

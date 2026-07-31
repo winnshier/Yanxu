@@ -576,13 +576,16 @@ describe('scheduler end-to-end', () => {
       expect(latestJob).toMatchObject({
         type: 'COMPOSE_PLAN',
         status: 'FAILED',
-        attempt: 3,
+        attempt: 2,
         last_error: 'Injected automatic replan failure.',
       });
-      expect(fixture.store.listEvents(task.id)).toEqual(expect.arrayContaining([
+      const failureEvents = fixture.store.listEvents(task.id);
+      expect(failureEvents).toEqual(expect.arrayContaining([
         expect.objectContaining({ type: 'job.retry_scheduled' }),
         expect.objectContaining({ type: 'task.blocked' }),
       ]));
+      expect(failureEvents.find((event) => event.type === 'job.failure_classified' && event.payload.repeated === true))
+        .toBeDefined();
     } finally {
       fixture.scheduler.stop();
       await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);

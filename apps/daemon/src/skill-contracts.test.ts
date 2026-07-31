@@ -37,6 +37,7 @@ function result(patch: Partial<SkillResult> = {}): SkillResult {
 describe('skill output contracts', () => {
   it('binds the structured output schema to the skill artifact and completion contracts', () => {
     const schema = skillResultSchema(reviewSkill) as {
+      required: string[];
       properties: {
         artifacts: { items: { properties: { type: { enum: string[] } } } };
         completionChecks: { items: { properties: { check: { enum: string[] } } } };
@@ -44,6 +45,7 @@ describe('skill output contracts', () => {
     };
     expect(schema.properties.artifacts.items.properties.type.enum).toEqual(['delivery-review']);
     expect(schema.properties.completionChecks.items.properties.check.enum).toEqual(reviewSkill.completionChecks);
+    expect(schema.required).toContain('findings');
   });
 
   it('rejects a nominal success that omits required evidence or fails a completion check', () => {
@@ -82,6 +84,38 @@ describe('skill output contracts', () => {
       issues: ['代码示例缺少必要导入，无法直接运行。'],
     });
     expect(() => validateSkillResult(reviewSkill, normalizeSkillResultOutcome(reviewSkill, reviewed))).not.toThrow();
+  });
+
+  it('allows non-blocking structured review advice without hiding it', () => {
+    const reviewed = normalizeSkillResultOutcome(reviewSkill, result({
+      findings: [{
+        severity: 'minor',
+        category: 'maintainability',
+        title: '可提取重复常量',
+        description: '不影响当前验收，但后续可以降低维护成本。',
+        evidence: 'src/example.ts 中出现两次相同常量。',
+        location: 'src/example.ts',
+        recommendation: '后续重构时提取常量。',
+        blocking: false,
+      }],
+    }));
+    expect(reviewed).toMatchObject({ status: 'succeeded' });
+    expect(reviewed.findings).toHaveLength(1);
+    expect(() => validateSkillResult(reviewSkill, reviewed)).not.toThrow();
+  });
+
+  it('keeps legacy issues blocking even when structured advice is also present', () => {
+    const reviewed = normalizeSkillResultOutcome(reviewSkill, result({
+      issues: ['运行时错误仍未修复。'],
+      findings: [{
+        severity: 'minor', category: 'maintainability', title: '命名可优化', description: '不影响验收。',
+        evidence: 'src/example.ts', recommendation: '后续重命名。', blocking: false,
+      }],
+    }));
+    expect(reviewed.status).toBe('changes_required');
+    expect(reviewed.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ severity: 'major', blocking: true, description: '运行时错误仍未修复。' }),
+    ]));
   });
 
   it('compiles confirmed workspace and command boundaries into runtime allows', () => {

@@ -1,6 +1,7 @@
 export * from './database.js';
 export * from './directory-scanner.js';
 export * from './errors.js';
+export * from './execution-failure.js';
 export * from './git-workspace.js';
 export * from './planning-context.js';
 export * from './project-space.js';
