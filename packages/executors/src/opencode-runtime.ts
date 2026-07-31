@@ -32,14 +32,42 @@ interface PromptResult<T = unknown> {
     structured?: T;
     error?: { name?: string; data?: { message?: string } };
   };
-  parts: Array<{ type: string; text?: string }>;
+  parts: Array<{
+    type: string;
+    text?: string;
+    tool?: string;
+    state?: { status?: string };
+  }>;
 }
 
 const structuredRepairAttempts = 2;
+const permissionPollingFailureLimit = 10;
+const fallbackOpenCodeToolIds = [
+  'bash',
+  'read',
+  'write',
+  'edit',
+  'apply_patch',
+  'patch',
+  'glob',
+  'grep',
+  'list',
+  'task',
+  'skill',
+  'webfetch',
+  'websearch',
+  'web-search-prime_web_search_prime',
+  'codesearch',
+  'lsp',
+  'todowrite',
+  'todoread',
+  'question',
+] as const;
 
 export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly runtimes = new Map<string, ManagedRuntime>();
   private readonly structuredOutputModes = new Map<string, StructuredOutputMode>();
+  private readonly disabledToolsByRuntime = new Map<string, Record<string, boolean>>();
 
   constructor(private readonly knownInstallation?: ExecutorInstallation) {}
 
@@ -109,7 +137,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     input.abortSignal?.addEventListener('abort', abort, { once: true });
     let promptSettled = false;
     const permissionWorker = this.processPermissions(client, runtime, session.id, input, () => promptSettled);
-    try {
+    const promptWorker = (async (): Promise<StructuredExecutionResult<T>> => {
       // OpenCode 1.17.x cannot reliably list messages created by
       // prompt_async when the request uses json_schema: the stored format is
       // rejected while deserializing the message list. Long-running work must
@@ -141,9 +169,20 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         continuingAfterSchemaFailure,
       );
       return { sessionId: session.id, output };
+    })();
+    const permissionGuard = permissionWorker.then<StructuredExecutionResult<T>>(() => {
+      if (!promptSettled) throw new Error('OpenCode permission monitor stopped before the prompt completed.');
+      return new Promise<StructuredExecutionResult<T>>(() => undefined);
+    });
+    let completed = false;
+    try {
+      const result = await Promise.race([promptWorker, permissionGuard]);
+      completed = true;
+      return result;
     } finally {
       promptSettled = true;
-      await permissionWorker;
+      if (!completed) abort();
+      await Promise.allSettled([permissionWorker]);
       input.abortSignal?.removeEventListener('abort', abort);
     }
   }
@@ -165,6 +204,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       input.prompt,
       input.abortSignal,
       { type: 'json_schema', schema: input.schema, retryCount: structuredRepairAttempts },
+      input.toolMode,
     );
     throwPromptError(data);
     if (data.info.structured === undefined) throw new Error('OpenCode did not return structured output.');
@@ -195,6 +235,8 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         modelID,
         prompt,
         input.abortSignal,
+        undefined,
+        input.toolMode,
       );
       throwPromptError(data);
       lastResponse = data.parts
@@ -219,6 +261,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     prompt: string,
     abortSignal?: AbortSignal,
     format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount: number },
+    toolMode: 'enabled' | 'disabled' = 'enabled',
   ): Promise<PromptResult<T>> {
     const existingResponse = await client.session.messages({
       sessionID: sessionId,
@@ -227,11 +270,15 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const existingMessageIds = new Set(
       unwrap<Array<PromptResult>>(existingResponse).map((message) => message.info.id).filter((value): value is string => Boolean(value)),
     );
+    const tools = toolMode === 'disabled'
+      ? await this.disabledToolConfiguration(client, runtime)
+      : undefined;
     await client.session.promptAsync({
       sessionID: sessionId,
       directory: runtime.workspacePath,
       model: { providerID, modelID },
       parts: [{ type: 'text', text: prompt }],
+      ...(tools ? { tools } : {}),
       ...(format ? { format } : {}),
     });
 
@@ -246,10 +293,15 @@ export class OpenCodeAdapter implements ExecutorAdapter {
           sessionID: sessionId,
           directory: runtime.workspacePath,
         });
+        const messages = unwrap<Array<PromptResult<T>>>(response);
+        if (toolMode === 'disabled') {
+          const attemptedTool = selectNewToolAttempt(messages, existingMessageIds);
+          if (attemptedTool) throw unexpectedToolCallError(attemptedTool);
+        }
         const statusResponse = await client.session.status({ directory: runtime.workspacePath });
         const sessionStatuses = unwrap<Record<string, { type: string }>>(statusResponse);
         const completed = selectNewCompletedPromptResult<T>(
-          unwrap<Array<PromptResult<T>>>(response),
+          messages,
           existingMessageIds,
           sessionStatuses[sessionId]?.type ?? 'idle',
         );
@@ -257,6 +309,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         if (completed) return completed;
       } catch (error) {
         if (abortSignal?.aborted) throw abortedSessionError();
+        if (error instanceof Error && error.name === 'OpenCodeUnexpectedToolCallError') throw error;
         if (runtime.process.exitCode !== null) {
           throw new Error(`OpenCode server exited with code ${runtime.process.exitCode}.`);
         }
@@ -279,6 +332,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const managed = this.runtimes.get(runtime.id);
     if (!managed) return;
     this.runtimes.delete(runtime.id);
+    this.disabledToolsByRuntime.delete(runtime.id);
     const client = this.client(managed);
     await Promise.allSettled(managed.sessionIds.map((sessionId) =>
       client.session.abort({ sessionID: sessionId, directory: managed.workspacePath })));
@@ -314,6 +368,29 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     return { id: runtime.id, executor: runtime.executor, workspacePath: runtime.workspacePath, endpoint: runtime.endpoint, sessionIds: runtime.sessionIds };
   }
 
+  private async disabledToolConfiguration(
+    client: SdkClient,
+    runtime: ManagedRuntime,
+  ): Promise<Record<string, boolean>> {
+    const cached = this.disabledToolsByRuntime.get(runtime.id);
+    if (cached) return cached;
+    let discoveredToolIds: string[] = [];
+    try {
+      const response = await client.tool.ids({ directory: runtime.workspacePath });
+      discoveredToolIds = unwrap<string[]>(response);
+    } catch {
+      // OpenCode releases before the tool-id endpoint still receive a bounded
+      // fallback list. Response polling below remains the final fail-closed
+      // guard for dynamically registered tools unknown to this adapter.
+    }
+    const tools = Object.fromEntries(
+      [...new Set([...fallbackOpenCodeToolIds, ...discoveredToolIds])]
+        .map((toolId) => [toolId, false]),
+    );
+    this.disabledToolsByRuntime.set(runtime.id, tools);
+    return tools;
+  }
+
   private async waitForHealth(runtime: ManagedRuntime): Promise<void> {
     const client = this.client(runtime);
     const startedAt = Date.now();
@@ -338,6 +415,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     settled: () => boolean,
   ): Promise<void> {
     const handled = new Set<string>();
+    let consecutivePollingErrors = 0;
     while (!settled()) {
       try {
         const response = await client.permission.list({ directory: runtime.workspacePath });
@@ -360,12 +438,30 @@ export class OpenCodeAdapter implements ExecutorAdapter {
             reply: decision,
           });
         }
-      } catch {
+        consecutivePollingErrors = 0;
+      } catch (error) {
         if (settled()) return;
+        consecutivePollingErrors += 1;
+        const failure = permissionPollingFailure(error, consecutivePollingErrors);
+        if (failure) throw failure;
       }
       if (!settled()) await new Promise((resolve) => setTimeout(resolve, 400));
     }
   }
+}
+
+export function permissionPollingFailure(
+  error: unknown,
+  consecutiveErrors: number,
+  limit = permissionPollingFailureLimit,
+): Error | null {
+  if (consecutiveErrors < limit) return null;
+  const cause = error instanceof Error ? error.message : String(error);
+  const failure = new Error(
+    `OpenCode permission polling failed ${consecutiveErrors} consecutive times: ${cause}`,
+  );
+  failure.name = 'OpenCodePermissionPollingError';
+  return failure;
 }
 
 function unwrap<T>(response: unknown): T {
@@ -403,6 +499,38 @@ export function selectNewCompletedPromptResult<T>(
     const messageTime = message.info.time?.completed ?? message.info.time?.created ?? Number.NEGATIVE_INFINITY;
     return messageTime > latestTime ? message : latest;
   }, undefined);
+}
+
+export interface OpenCodeToolAttempt {
+  messageId: string;
+  tool: string;
+  status: string;
+}
+
+export function selectNewToolAttempt(
+  messages: Array<PromptResult>,
+  existingMessageIds: ReadonlySet<string>,
+): OpenCodeToolAttempt | undefined {
+  for (const message of messages) {
+    const messageId = message.info.id;
+    if (message.info.role !== 'assistant' || !messageId || existingMessageIds.has(messageId)) continue;
+    const toolPart = message.parts.find((part) => part.type === 'tool');
+    if (!toolPart) continue;
+    return {
+      messageId,
+      tool: toolPart.tool ?? 'unknown',
+      status: toolPart.state?.status ?? 'unknown',
+    };
+  }
+  return undefined;
+}
+
+function unexpectedToolCallError(attempt: OpenCodeToolAttempt): Error {
+  const error = new Error(
+    `OpenCode attempted disabled tool "${attempt.tool}" (status: ${attempt.status}).`,
+  );
+  error.name = 'OpenCodeUnexpectedToolCallError';
+  return error;
 }
 
 function abortedSessionError(): Error {
@@ -528,6 +656,7 @@ export function permissionRules(
     { permission: 'bash', pattern: '* *.pem*', action: 'deny' },
     { permission: 'bash', pattern: '* *.key*', action: 'deny' },
     ...(policy?.networkPolicy === 'deny' ? [
+      { permission: 'web*' as const, pattern: '*', action: 'deny' as const },
       { permission: 'webfetch' as const, pattern: '*', action: 'deny' as const },
       { permission: 'websearch' as const, pattern: '*', action: 'deny' as const },
       { permission: 'bash' as const, pattern: 'curl *', action: 'deny' as const },

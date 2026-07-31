@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { selectNewCompletedPromptResult } from '@yanxu/executors';
+import { selectNewCompletedPromptResult, selectNewToolAttempt } from '@yanxu/executors';
 
 describe('OpenCode asynchronous prompt completion', () => {
   it('selects only a newly completed assistant message', () => {
@@ -77,5 +77,24 @@ describe('OpenCode asynchronous prompt completion', () => {
 
     expect(newestFirst?.info.id).toBe('final');
     expect(oldestFirst?.info.id).toBe('final');
+  });
+
+  it('detects a pending tool call in a new assistant message', () => {
+    const attempt = selectNewToolAttempt([
+      {
+        info: { id: 'old', role: 'assistant', time: { completed: 1 } },
+        parts: [{ type: 'tool', tool: 'read', state: { status: 'completed' } }],
+      },
+      {
+        info: { id: 'new', role: 'assistant', time: {} },
+        parts: [{ type: 'tool', tool: 'bash', state: { status: 'pending' } }],
+      },
+    ], new Set(['old']));
+
+    expect(attempt).toEqual({
+      messageId: 'new',
+      tool: 'bash',
+      status: 'pending',
+    });
   });
 });

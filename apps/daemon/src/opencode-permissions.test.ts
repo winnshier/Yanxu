@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { permissionRules } from '@yanxu/executors';
+import { permissionPollingFailure, permissionRules } from '@yanxu/executors';
 import { workspacePermissionPathPatterns } from './scheduler.js';
 
 describe('OpenCode workspace permissions', () => {
@@ -43,5 +43,14 @@ describe('OpenCode workspace permissions', () => {
     });
     expect(rules).not.toContainEqual({ permission: 'external_directory', pattern: '*', action: 'allow' });
     expect(rules).toContainEqual({ permission: 'edit', pattern: '*', action: 'deny' });
+    expect(rules).toContainEqual({ permission: 'web*', pattern: '*', action: 'deny' });
+  });
+
+  it('turns a persistent permission protocol error into an observable failure', () => {
+    const protocolError = new Error('Expected JSON value, got undefined at metadata.timeout');
+    expect(permissionPollingFailure(protocolError, 9)).toBeNull();
+    const failure = permissionPollingFailure(protocolError, 10);
+    expect(failure?.name).toBe('OpenCodePermissionPollingError');
+    expect(failure?.message).toContain('metadata.timeout');
   });
 });

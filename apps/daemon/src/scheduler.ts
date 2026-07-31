@@ -935,9 +935,17 @@ export class Scheduler {
     await this.executors.ensureAvailable('opencode');
 
     const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'coordinator', task.id);
-    const runtime = await this.adapter.startRuntime(project.projectSpacePath, runtimeDirectory);
-    this.runtimes.set(taskId, runtime);
+    const abortController = this.registerTaskAbortController(taskId);
+    const sessionTimeout = setTimeout(() => abortController.abort(), settings.sessionTimeoutMs);
+    let runtime: RuntimeHandle | null = null;
     try {
+      runtime = await this.adapter.startRuntime(project.projectSpacePath, runtimeDirectory);
+      this.runtimes.set(taskId, runtime);
+      if (abortController.signal.aborted) {
+        const error = new Error('OpenCode coordinator session was aborted.');
+        error.name = 'AbortError';
+        throw error;
+      }
       const requirementSkill = this.store.getBuiltins().skills.find((skill) => skill.id === 'requirement-specification');
       if (!requirementSkill) throw new Error('Built-in requirement specification skill is missing.');
       const team = this.store.getTeam(task.teamId);
@@ -951,6 +959,9 @@ export class Scheduler {
         title: `确认前技能选择 · ${task.title}`,
         model: settings.coordinatorModel,
         schema: preApprovalDecisionSchema,
+        abortSignal: abortController.signal,
+        permissionMode: 'managed',
+        toolMode: 'disabled',
         readOnly: true,
         policy: {
           allowedReadPatterns: [],
@@ -958,10 +969,18 @@ export class Scheduler {
           allowedBashPatterns: [],
           taskGrants: [],
           forbiddenReadPatterns: ['*'],
+          networkPolicy: 'deny',
+          dependencyInstallPolicy: 'deny',
         },
         prompt: this.preApprovalDecisionPrompt(task, project, Boolean(productAgent), revisionFeedback),
       });
-      const preApprovalSkillIds = [...new Set(decision.output.skillIds)]
+      const existingRequirementArtifact = this.store.getTaskEvidence(task.id).preApprovalArtifacts
+        .some((artifact) => artifact.artifactType === 'requirement-spec' && artifact.status !== 'superseded');
+      const preApprovalSkillIds = [...new Set([
+        ...decision.output.skillIds,
+        ...(task.plan?.preApprovalSkillIds ?? []),
+        ...(existingRequirementArtifact ? [requirementSkill.id] : []),
+      ])]
         .filter((skillId) => skillId === requirementSkill.id);
       const missingPreApprovalSkillIds = preApprovalSkillIds.filter((skillId) =>
         skillId === requirementSkill.id && !productAgent);
@@ -975,7 +994,9 @@ export class Scheduler {
           title: `需求规格 · ${task.title}`,
           model: requirementModel,
           schema: skillResultSchema(requirementSkill),
-          permissionMode: productAgent.permissionMode,
+          abortSignal: abortController.signal,
+          permissionMode: 'managed',
+          toolMode: 'disabled',
           readOnly: true,
           policy: {
             allowedReadPatterns: [],
@@ -983,6 +1004,8 @@ export class Scheduler {
             allowedBashPatterns: [],
             taskGrants: [],
             forbiddenReadPatterns: ['*'],
+            networkPolicy: 'deny',
+            dependencyInstallPolicy: 'deny',
           },
           prompt: this.requirementPrompt(task, project, requirementSkill, revisionFeedback),
         });
@@ -998,6 +1021,9 @@ export class Scheduler {
         title: `研序计划 · ${task.title}`,
         model: settings.coordinatorModel,
         schema: composedPlanSchema,
+        abortSignal: abortController.signal,
+        permissionMode: 'managed',
+        toolMode: 'disabled',
         readOnly: true,
         policy: {
           allowedReadPatterns: [],
@@ -1005,6 +1031,8 @@ export class Scheduler {
           allowedBashPatterns: [],
           taskGrants: [],
           forbiddenReadPatterns: ['*'],
+          networkPolicy: 'deny',
+          dependencyInstallPolicy: 'deny',
         },
         prompt: this.planPrompt(
           task,
@@ -1085,8 +1113,12 @@ export class Scheduler {
         : [], { preservePreviousSteps });
       if (autoResume) this.store.resumeAutomaticReplanIfSafe(task.id);
     } finally {
-      await this.adapter.stopRuntime(runtime);
-      if (this.runtimes.get(taskId) === runtime) this.runtimes.delete(taskId);
+      clearTimeout(sessionTimeout);
+      this.unregisterTaskAbortController(taskId, abortController);
+      if (runtime) {
+        await this.adapter.stopRuntime(runtime);
+        if (this.runtimes.get(taskId) === runtime) this.runtimes.delete(taskId);
+      }
     }
   }
 
@@ -1175,7 +1207,7 @@ export class Scheduler {
     hasRequirementAgent: boolean,
     revisionFeedback?: string,
   ): string {
-    return `你是研序的全局计划协调器。先决定用户确认计划前是否需要调用正式 Skill 生成产物；这里只做选择，不生成计划、不读取文件、不执行命令。
+    return `你是研序的全局计划协调器。先决定用户确认计划前是否需要调用正式 Skill 生成产物；这里只做选择，不生成计划、不读取文件、不执行命令，也不得调用任何工具、联网搜索或网页抓取。
 
 当前一期可选的确认前 Skill 只有 requirement-specification。以下情况通常需要它：新功能或新项目研发、会改变产品行为的改动、需求存在范围或验收歧义、用户要求修改已经生成的需求/计划。以下情况通常可以跳过：目标和验收已经非常明确的纯测试、纯评审、机械性维护或单纯文档整理。
 
@@ -1297,9 +1329,14 @@ ${JSON.stringify({
     const requirementInstruction = requirementSpec
       ? '确认前的 RequirementSpec 已由需求规格 Skill 生成；必须以它为需求基线。'
       : '本任务未选择确认前 RequirementSpec；直接依据用户需求和项目事实规划。如果缺少产品人员导致无法可靠澄清范围，必须提出明确的歧义问题或能力缺口，不能自行补全。';
-    return `你是研序的全局计划协调器。${requirementInstruction}你负责组合可确认的执行计划，不修改任何文件，不执行项目命令，也不要把 requirement-specification 再列入执行步骤。
+    return `你是研序的全局计划协调器。${requirementInstruction}你负责组合可确认的执行计划，不修改任何文件，不执行项目命令，不得调用任何工具、联网搜索或网页抓取，也不要把 requirement-specification 再列入执行步骤。
 
 基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题。提出问题前必须先分析并给出 2–3 个互斥、可直接执行的方案：推荐方案放在第一项且只能有一个 recommended=true；label 要简短；description 说明选择后的影响或取舍；value 是可直接吸收到计划里的完整答案。不要把“自行填写”作为方案，界面会统一提供自定义方案。权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}${preservePreviousSteps ? '\n\n本次修改只用于吸收用户对歧义问题的回答：不得增删、替换或重排 previousPlan.steps 的 Skill 序列；可以在同一 Skill 内完善标题、说明、输入、产出、人员与目录。' : ''}
+
+规划硬性校验：
+- 若任务会在关联目录下新建子项目，所有 qualityGates 必须通过命令自身显式定位到子项目（例如 npm --prefix <子目录> run test），不能假设门禁执行器会自动切换到新子目录。
+- 产品研发中只要存在可自动验证的业务逻辑，就必须规划对应测试框架、测试文件和可执行 test 门禁；typecheck、lint、build 不能代替业务测试。
+- 涉及金额、价格、余额或预算时，必须使用整数最小货币单位或明确的十进制定点方案；禁止把 JavaScript number + toFixed 当作精度保证。
 
 ${JSON.stringify(input, null, 2)}`;
   }
@@ -1358,7 +1395,7 @@ ${JSON.stringify(input, null, 2)}`;
         .at(-1)?.content ?? null,
       revisionFeedback: revisionFeedback ?? null,
     };
-    return `你正在研序中执行内置 Skill“${skill.name}”。这是用户确认计划前的正式需求规格步骤，只分析并返回结构化结果，不读取或修改本地文件，不执行命令。\n\nRequirementSpec 的 Markdown 必须包含：背景与目标、范围、非范围、用户可验收的成功标准、约束、项目目录影响、明确假设、风险、仍需用户回答的歧义。已有回答必须被吸收到规格正文，不能继续作为未解决问题重复提出。若是修改计划，必须逐条吸收 revisionFeedback，并明确规格相较上一版的变化。completionChecks 必须逐项给出可追溯证据。\n\n${JSON.stringify(input, null, 2)}`;
+    return `你正在研序中执行内置 Skill“${skill.name}”。这是用户确认计划前的正式需求规格步骤，只分析并返回结构化结果，不读取或修改本地文件，不执行命令，也不得调用任何工具、联网搜索或网页抓取。\n\nRequirementSpec 的 Markdown 必须包含：背景与目标、范围、非范围、用户可验收的成功标准、约束、项目目录影响、明确假设、风险、仍需用户回答的歧义。已有回答必须被吸收到规格正文，不能继续作为未解决问题重复提出。若是修改计划，必须逐条吸收 revisionFeedback，并明确规格相较上一版的变化。completionChecks 必须逐项给出可追溯证据。\n\n${JSON.stringify(input, null, 2)}`;
   }
 }
 

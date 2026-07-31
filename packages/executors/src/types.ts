@@ -16,6 +16,7 @@ export interface StructuredExecutionInput {
   schema: Record<string, unknown>;
   abortSignal?: AbortSignal;
   permissionMode?: 'standard' | 'managed';
+  toolMode?: 'enabled' | 'disabled';
   readOnly?: boolean;
   policy?: RuntimePermissionPolicy;
   onSessionStarted?: (sessionId: string) => void | Promise<void>;

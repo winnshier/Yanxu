@@ -350,8 +350,12 @@ export async function createServer(
       const results = await scheduler.mergeTask(request.params.taskId);
       store.recordDeliveryMerge(request.params.taskId, results);
     }
+    const taskBeforeCommand = store.getTask(request.params.taskId);
     const task = store.commandTask(request.params.taskId, request.body.command, request.body.stateVersion, request.body.reason);
-    if (request.body.command === 'stop') {
+    if (
+      request.body.command === 'stop'
+      || (request.body.command === 'pause' && taskBeforeCommand.status === 'REPLANNING')
+    ) {
       await scheduler.abortTask(request.params.taskId);
     }
     return task;

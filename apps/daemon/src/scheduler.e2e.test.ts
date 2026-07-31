@@ -47,6 +47,7 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   private sessionSequence = 0;
   private implementationAttempts = 0;
   private planningAttempts = 0;
+  private blockedPlanningAttempt: number | null = null;
   private readonly blocked = new Map<string, (error: Error) => void>();
   readonly prompts: Array<{ title: string; prompt: string }> = [];
   readonly executions: StructuredExecutionInput[] = [];
@@ -55,6 +56,10 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
 
   get runtimeStartCount(): number {
     return this.runtimeSequence;
+  }
+
+  blockPlanningAttempt(attempt: number): void {
+    this.blockedPlanningAttempt = attempt;
   }
 
   probe(): Promise<ExecutorInstallation> {
@@ -95,6 +100,19 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
     }
     if (input.title.startsWith('研序计划')) {
       this.planningAttempts += 1;
+      if (this.blockedPlanningAttempt === this.planningAttempts) {
+        this.blockedPlanningAttempt = null;
+        await new Promise<never>((_resolve, reject) => {
+          const finish = (error: Error) => {
+            input.abortSignal?.removeEventListener('abort', onAbort);
+            this.blocked.delete(input.runtime.id);
+            reject(error);
+          };
+          const onAbort = () => finish(new Error('Injected coordinator interruption.'));
+          this.blocked.set(input.runtime.id, finish);
+          input.abortSignal?.addEventListener('abort', onAbort, { once: true });
+        });
+      }
       if (this.configuration.failReplan && this.planningAttempts > 1) {
         throw new Error('Injected automatic replan failure.');
       }
@@ -276,6 +294,27 @@ describe('scheduler end-to-end', () => {
         preApprovalSkillIds: ['requirement-specification'],
         taskVersion: 2,
       });
+      const coordinatorExecutions = fixture.adapter.executions.filter((execution) =>
+        execution.title.startsWith('确认前技能选择')
+        || execution.title.startsWith('需求规格')
+        || execution.title.startsWith('研序计划'));
+      expect(coordinatorExecutions).toHaveLength(3);
+      for (const execution of coordinatorExecutions) {
+        expect(execution).toMatchObject({
+          permissionMode: 'managed',
+          toolMode: 'disabled',
+          readOnly: true,
+          policy: {
+            networkPolicy: 'deny',
+            dependencyInstallPolicy: 'deny',
+          },
+        });
+        expect(execution.abortSignal).toBeInstanceOf(AbortSignal);
+      }
+      const planExecution = coordinatorExecutions.find((execution) => execution.title.startsWith('研序计划'));
+      expect(planExecution?.prompt).toContain('npm --prefix <子目录> run test');
+      expect(planExecution?.prompt).toContain('typecheck、lint、build 不能代替业务测试');
+      expect(planExecution?.prompt).toContain('禁止把 JavaScript number + toFixed 当作精度保证');
 
       fixture.store.commandTask(task.id, 'confirm', task.stateVersion);
       const snapshot = fixture.store.getRunSnapshot(task.id);
@@ -586,6 +625,115 @@ describe('scheduler end-to-end', () => {
       ]));
       expect(failureEvents.find((event) => event.type === 'job.failure_classified' && event.payload.repeated === true))
         .toBeDefined();
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 20_000);
+
+  it('reversions an existing requirement artifact instead of dropping it during replanning', async () => {
+    const fixture = createFixture(true);
+    try {
+      fixture.scheduler.start();
+      let task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      expect(task.plan?.preApprovalSkillIds).toEqual(['requirement-specification']);
+      expect(fixture.store.getTaskEvidence(task.id).preApprovalArtifacts.at(-1))
+        .toMatchObject({ artifactType: 'requirement-spec', version: 1, status: 'generated' });
+
+      fixture.store.requestAutomaticReplan(
+        task.id,
+        '把已经确认的需求答案写回正式规格。',
+        'requirement_version_chain_test',
+        false,
+      );
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_REAPPROVAL',
+      );
+      expect(task.plan?.preApprovalSkillIds).toEqual(['requirement-specification']);
+      expect(task.plan?.preApprovalArtifacts).toEqual([
+        expect.objectContaining({ artifactType: 'requirement-spec', version: 2, status: 'generated' }),
+      ]);
+      expect(fixture.store.getTaskEvidence(task.id).preApprovalArtifacts).toEqual([
+        expect.objectContaining({ version: 1, status: 'superseded' }),
+        expect.objectContaining({ version: 2, status: 'generated' }),
+      ]);
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 20_000);
+
+  it('interrupts a paused replan and resumes it in a fresh coordinator session', async () => {
+    const fixture = createFixture(false);
+    fixture.adapter.blockPlanningAttempt(2);
+    try {
+      fixture.scheduler.start();
+      let task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      task = fixture.store.requestAutomaticReplan(
+        task.id,
+        '暂停重新规划回归测试。',
+        'scheduler_replan_pause_test',
+        false,
+      );
+      await waitFor(
+        () => fixture.adapter.executions.filter((execution) => execution.title.startsWith('研序计划')).length,
+        (count) => count === 2,
+      );
+
+      task = fixture.store.commandTask(task.id, 'pause', fixture.store.getTask(task.id).stateVersion);
+      expect(task.status).toBe('PAUSED');
+      await fixture.scheduler.abortTask(task.id);
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+
+      const interruptedJob = fixture.database.prepare(`
+        SELECT status, last_error FROM jobs
+        WHERE aggregate_id = ? ORDER BY created_at DESC LIMIT 1
+      `).get(task.id) as { status: string; last_error: string | null };
+      expect(interruptedJob.status).toBe('CANCELLED');
+      expect(interruptedJob.last_error).toContain('Injected coordinator interruption');
+
+      task = fixture.store.commandTask(task.id, 'resume', fixture.store.getTask(task.id).stateVersion);
+      expect(task.status).toBe('REPLANNING');
+      task = await waitFor(
+        () => fixture.store.getTask(fixture.taskId),
+        (current) => current.status === 'WAITING_REAPPROVAL',
+      );
+      expect(fixture.adapter.executions.filter((execution) => execution.title.startsWith('研序计划')))
+        .toHaveLength(3);
+    } finally {
+      fixture.scheduler.stop();
+      await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
+      fixture.database.close();
+    }
+  }, 20_000);
+
+  it('applies the configured session timeout to coordinator planning', async () => {
+    const fixture = createFixture(false);
+    fixture.adapter.blockPlanningAttempt(1);
+    fixture.store.updateSettings({ sessionTimeoutMs: 50 });
+    try {
+      fixture.scheduler.start();
+      const task = fixture.store.submitTask(fixture.taskId, fixture.store.getTask(fixture.taskId).stateVersion);
+      const recovered = await waitFor(
+        () => fixture.store.getTask(task.id),
+        (current) => current.status === 'WAITING_PLAN_APPROVAL',
+      );
+      expect(recovered.status).toBe('WAITING_PLAN_APPROVAL');
+      const events = fixture.store.listEvents(task.id);
+      const failureEvent = events.find((event) => event.type === 'job.failure_classified');
+      expect(failureEvent?.payload.error).toContain('Injected coordinator interruption');
+      expect(events.some((event) => event.type === 'job.retry_scheduled')).toBe(true);
     } finally {
       fixture.scheduler.stop();
       await waitFor(() => fixture.scheduler.health(), (health) => health.activeJobs === 0);
