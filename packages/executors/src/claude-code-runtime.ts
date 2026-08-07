@@ -16,6 +16,7 @@ import type {
   ExecutorAdapter,
   RuntimeHandle,
   RuntimePermissionPolicy,
+  RuntimeStartOptions,
   StructuredExecutionInput,
   StructuredExecutionResult,
 } from './types.js';
@@ -26,6 +27,7 @@ interface ClaudeRuntime extends RuntimeHandle {
   logPath: string;
   capabilityConfigDirectory: string;
   mcpConfigPath: string;
+  credentialEnvironment: Record<string, string>;
   activeProcesses: Map<string, ChildProcess>;
 }
 
@@ -52,7 +54,11 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
     return installation;
   }
 
-  async startRuntime(workspacePath: string, runtimeDirectory: string): Promise<RuntimeHandle> {
+  async startRuntime(
+    workspacePath: string,
+    runtimeDirectory: string,
+    options: RuntimeStartOptions = {},
+  ): Promise<RuntimeHandle> {
     const installation = await this.probe();
     if (installation.health !== 'available' || !installation.path) {
       throw new Error(installation.error ?? 'Claude Code CLI is unavailable.');
@@ -77,6 +83,7 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
       logPath: join(runtimeDirectory, 'runtime.log'),
       capabilityConfigDirectory,
       mcpConfigPath,
+      credentialEnvironment: { ...(options.environment ?? {}) },
       activeProcesses: new Map(),
     };
     this.runtimes.set(runtime.id, runtime);
@@ -191,6 +198,7 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
         cwd: runtime.workspacePath,
         env: {
           ...process.env,
+          ...runtime.credentialEnvironment,
           CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
           DISABLE_TELEMETRY: '1',
           DISABLE_ERROR_REPORTING: '1',

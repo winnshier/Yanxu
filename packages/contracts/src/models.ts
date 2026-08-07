@@ -21,6 +21,11 @@ export type CapabilityCommandStatus = 'not_applicable' | 'available' | 'missing'
 export type CapabilityRuntimeHealth = 'not_applicable' | 'unchecked' | 'healthy' | 'unhealthy' | 'needs_auth';
 
 export type ExecutionFailureCategory =
+  | 'infrastructure'
+  | 'network'
+  | 'configuration'
+  | 'context'
+  | 'business_result'
   | 'transient'
   | 'invalid_output'
   | 'skill_contract'
@@ -239,6 +244,7 @@ export interface CapabilitySecuritySummary {
   networkHosts: string[];
   environmentKeys: string[];
   headerKeys: string[];
+  localCredentialBindings: number;
   containsLiteralSecrets: boolean;
 }
 
@@ -695,6 +701,49 @@ export interface AgentSessionEvidence {
   completedAt: string | null;
 }
 
+export type ExecutionRunStatus = 'preparing' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'stopped';
+export type ExecutionTriggerSource = 'manual' | 'schedule' | 'recovery' | 'external_event';
+
+export interface ExecutorSessionRecord {
+  id: string;
+  taskId: string;
+  agentId: string;
+  executor: ExecutorType;
+  model: string;
+  externalSessionId: string;
+  status: 'active' | 'invalidated';
+  createdAt: string;
+  lastUsedAt: string;
+  invalidatedAt: string | null;
+  invalidationReason: string | null;
+}
+
+export interface ExecutionRun {
+  id: string;
+  taskId: string;
+  stepId: string;
+  jobId: string | null;
+  agentId: string;
+  executorSessionId: string | null;
+  externalSessionId: string | null;
+  retryOfRunId: string | null;
+  triggerSource: ExecutionTriggerSource;
+  status: ExecutionRunStatus;
+  phase: string;
+  failureCategory: ExecutionFailureCategory | null;
+  failureCode: string | null;
+  failureMessage: string | null;
+  nextAction: string | null;
+  workspaceReused: boolean;
+  sessionReused: boolean;
+  runtimeDirectory: string | null;
+  logPath: string | null;
+  resultPath: string | null;
+  startedAt: string;
+  heartbeatAt: string | null;
+  completedAt: string | null;
+}
+
 export interface DeliveryConflict {
   id: string;
   taskId: string;
@@ -750,6 +799,7 @@ export interface TaskEvidence {
     truncated: boolean;
   }>;
   sessions: AgentSessionEvidence[];
+  runs: ExecutionRun[];
   contextPacks: Array<Pick<TaskContextPack, 'id' | 'stepId' | 'attempt' | 'contentHash' | 'manifestPath' | 'estimatedTokens' | 'truncated' | 'createdAt'>>;
   changeManifests: ChangeManifest[];
   designedQualityGates: QualityGate[];
@@ -843,6 +893,9 @@ export interface Task {
     executor: ExecutorType | null;
     model: string | null;
     sessionId: string | null;
+    runId: string | null;
+    phase: string | null;
+    nextAction: string | null;
     startedAt: string | null;
     heartbeatAt: string | null;
   } | null;
@@ -942,6 +995,15 @@ export interface TaskDiagnostics {
     failed: number;
     interrupted: number;
   };
+  runs: {
+    total: number;
+    preparing: number;
+    running: number;
+    succeeded: number;
+    failed: number;
+    interrupted: number;
+    stopped: number;
+  };
   jobs: {
     total: number;
     ready: number;
@@ -956,6 +1018,7 @@ export interface TaskDiagnostics {
   recoveries: number;
   quality: TaskQualitySummary;
   failures: ExecutionFailureRecord[];
+  recentRuns: ExecutionRun[];
   recentDecisions: WorkflowEvent[];
 }
 

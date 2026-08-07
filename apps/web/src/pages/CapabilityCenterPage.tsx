@@ -1,20 +1,45 @@
 import { useMemo, useState } from 'react';
-import { Alert, Button, Card, Col, Descriptions, Empty, Input, Modal, Row, Segmented, Space, Tag, Typography, message } from 'antd';
-import { FolderOpenOutlined, GithubOutlined, ReloadOutlined, SafetyCertificateOutlined, ToolOutlined, UploadOutlined } from '@ant-design/icons';
+import { Alert, Button, Card, Descriptions, Dropdown, Empty, Input, Modal, Segmented, Space, Tag, Typography, message } from 'antd';
+import {
+  ApiOutlined,
+  CheckCircleFilled,
+  CloudDownloadOutlined,
+  ExclamationCircleFilled,
+  FolderOpenOutlined,
+  GithubOutlined,
+  ImportOutlined,
+  InfoCircleFilled,
+  ReloadOutlined,
+  SafetyCertificateOutlined,
+  ToolOutlined,
+  UploadOutlined,
+} from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { Capability } from '@yanxu/contracts';
 import { api } from '../lib/api.js';
 import { PageHeader } from '../components/PageHeader.js';
 import { QueryState } from '../components/QueryState.js';
 
-const lifecycleLabel: Record<Capability['lifecycleStatus'], string> = {
-  discovered: '已发现', imported: '已导入', installed: '已安装',
+const sourceTypeLabel: Record<Capability['source']['type'], string> = {
+  opencode: 'OpenCode 配置',
+  claude: 'Claude 配置',
+  builtin: '研序内置',
+  github: 'GitHub',
+  zip: 'ZIP 文件',
+  local_directory: '本地目录',
 };
 
-function capabilityColor(capability: Capability): string {
-  if (capability.parseStatus === 'invalid') return 'red';
-  if (capability.lifecycleStatus === 'installed') return 'green';
-  return 'blue';
+function capabilityStatus(capability: Capability) {
+  if (capability.parseStatus === 'invalid') {
+    return { className: 'is-error', icon: <ExclamationCircleFilled />, label: '配置无效' };
+  }
+  if (capability.security.containsLiteralSecrets) {
+    return { className: 'is-warning', icon: <ExclamationCircleFilled />, label: '需处理凭据' };
+  }
+  if (capability.lifecycleStatus === 'installed') {
+    return { className: 'is-success', icon: <CheckCircleFilled />, label: '已安装' };
+  }
+  return { className: 'is-pending', icon: <InfoCircleFilled />, label: '待安装' };
 }
 
 function displayManifestValue(value: unknown, fallback = '未声明'): string {
@@ -84,6 +109,17 @@ export function CapabilityCenterPage() {
     const needle = query.trim().toLowerCase();
     return !needle || `${item.name}\n${item.description}\n${item.source.ref}`.toLowerCase().includes(needle);
   }), [capabilities.data, kind, query]);
+  const summary = useMemo(() => {
+    const items = capabilities.data ?? [];
+    return {
+      total: items.length,
+      skills: items.filter((item) => item.kind === 'skill').length,
+      mcps: items.filter((item) => item.kind === 'mcp').length,
+      installed: items.filter((item) => item.lifecycleStatus === 'installed').length,
+      opencode: items.filter((item) => item.compatibility.includes('opencode')).length,
+      claude: items.filter((item) => item.compatibility.includes('claude')).length,
+    };
+  }, [capabilities.data]);
 
   return <div className="page-container capability-center-page">
     <PageHeader
@@ -91,60 +127,82 @@ export function CapabilityCenterPage() {
       title="能力中心"
       description="统一发现 OpenCode 与 Claude Code 的 Skill / MCP；安装后由项目显式启用，任务确认时冻结版本。"
       actions={<Space wrap>
-        <Button icon={<FolderOpenOutlined />} loading={importLocal.isPending} onClick={() => importLocal.mutate()}>导入本地 Skill</Button>
-        <Button icon={<UploadOutlined />} loading={importZip.isPending} onClick={() => importZip.mutate()}>导入 ZIP</Button>
-        <Button icon={<GithubOutlined />} onClick={() => setGithubOpen(true)}>从 GitHub 导入</Button>
+        <Dropdown menu={{
+          items: [
+            { key: 'local', icon: <FolderOpenOutlined />, label: '导入本地 Skill' },
+            { key: 'zip', icon: <UploadOutlined />, label: '从 ZIP 导入' },
+            { key: 'github', icon: <GithubOutlined />, label: '从 GitHub 导入' },
+          ],
+          onClick: ({ key }) => {
+            if (key === 'local') importLocal.mutate();
+            if (key === 'zip') importZip.mutate();
+            if (key === 'github') setGithubOpen(true);
+          },
+        }} trigger={['click']}>
+          <Button icon={<ImportOutlined />} loading={importLocal.isPending || importZip.isPending}>导入能力</Button>
+        </Dropdown>
         <Button type="primary" icon={<ReloadOutlined />} loading={discover.isPending} onClick={() => discover.mutate()}>扫描本机能力</Button>
       </Space>}
     />
-    <Alert
-      showIcon
-      type="info"
-      message="发现不等于启用"
-      description="扫描只读取元数据，不执行脚本；安装会复制到研序托管目录。能力还需在具体项目中启用，并由任务计划按需选择。"
-    />
-    <Card className="settings-card">
-      <Space wrap className="full-width" style={{ justifyContent: 'space-between' }}>
-        <Segmented value={kind} onChange={(value) => setKind(value as typeof kind)} options={[
-          { label: '全部', value: 'all' }, { label: 'Skill', value: 'skill' }, { label: 'MCP', value: 'mcp' },
-        ]} />
-        <Input.Search allowClear placeholder="搜索名称、说明或来源" value={query} onChange={(event) => setQuery(event.target.value)} style={{ maxWidth: 360 }} />
-      </Space>
-    </Card>
+    <section className="capability-summary" aria-label="能力概况">
+      <div className="capability-summary-total">
+        <span className="capability-summary-icon"><CloudDownloadOutlined /></span>
+        <span><strong>{summary.total}</strong><small>项能力已纳管</small></span>
+      </div>
+      <div className="capability-summary-metrics">
+        <button type="button" className={`capability-metric is-all ${kind === 'all' ? 'is-active' : ''}`} onClick={() => setKind('all')}>全部 <strong>{summary.total}</strong></button>
+        <button type="button" className={`capability-metric is-skill ${kind === 'skill' ? 'is-active' : ''}`} onClick={() => setKind('skill')}>Skill <strong>{summary.skills}</strong></button>
+        <button type="button" className={`capability-metric is-mcp ${kind === 'mcp' ? 'is-active' : ''}`} onClick={() => setKind('mcp')}>MCP <strong>{summary.mcps}</strong></button>
+        <span className="capability-metric is-installed">已安装 <strong>{summary.installed}</strong></span>
+        <span className="capability-metric is-opencode">OpenCode <strong>{summary.opencode}</strong></span>
+        <span className="capability-metric is-claude">Claude <strong>{summary.claude}</strong></span>
+      </div>
+    </section>
+    <div className="capability-notice"><SafetyCertificateOutlined />扫描只读取元数据，不执行能力脚本；安装后仍需由具体项目显式启用。</div>
     <QueryState loading={capabilities.isLoading} error={capabilities.error} onRetry={() => { void capabilities.refetch(); }}>
-      {filtered.length === 0 ? <Empty description="尚未发现能力，先扫描本机配置或导入本地 Skill" /> : <Row gutter={[16, 16]}>
-        {filtered.map((capability) => <Col key={capability.id} xs={24} xl={12}>
-          <Card
-            className="library-card"
-            title={<Space wrap>{capability.kind === 'skill' ? <ToolOutlined /> : <SafetyCertificateOutlined />}<Typography.Text strong>{capability.name}</Typography.Text><Tag>{capability.kind.toUpperCase()}</Tag></Space>}
-            extra={<Space>
-              <Button size="small" onClick={() => setSelectedCapability(capability)}>审查详情</Button>
-              {capability.lifecycleStatus !== 'installed' && capability.parseStatus === 'valid' && !capability.security.containsLiteralSecrets
-                ? <Button size="small" type="primary" loading={install.isPending && install.variables === capability.id} onClick={() => install.mutate(capability.id)}>安装</Button>
-                : null}
-            </Space>}
-          >
-            <Space direction="vertical" size={10} className="full-width">
-              <Typography.Paragraph type="secondary" ellipsis={{ rows: 2 }}>{capability.description || '暂无说明'}</Typography.Paragraph>
-              <Space wrap>
-                <Tag color={capabilityColor(capability)}>{lifecycleLabel[capability.lifecycleStatus]}</Tag>
-                <Tag color={capability.parseStatus === 'valid' ? 'green' : 'red'}>解析 {capability.parseStatus}</Tag>
-                <Tag>命令 {capability.commandStatus}</Tag>
-                <Tag>运行 {capability.runtimeHealth}</Tag>
-                {capability.compatibility.map((executor) => <Tag key={executor} color="geekblue">{executor}</Tag>)}
-              </Space>
-              <Typography.Text className="mono-text" type="secondary" copyable>{capability.source.ref}</Typography.Text>
-              <Typography.Text type="secondary">版本 {capability.version} · {capability.security.files.length} 个文件 · 环境引用 {capability.credentialRefs.length} 项</Typography.Text>
-              {capability.parseError && <Alert type="error" showIcon message={capability.parseError} />}
-              {(capability.security.executableFiles.length > 0 || capability.security.scripts.length > 0 || capability.security.containsLiteralSecrets) && <Alert type="warning" showIcon message="安全检查提示" description={[
-                capability.security.executableFiles.length ? `含可执行文件：${capability.security.executableFiles.join('、')}` : '',
-                capability.security.scripts.length ? `检测到脚本引用：${capability.security.scripts.join('、')}` : '',
-                capability.security.containsLiteralSecrets ? '检测到疑似明文凭据' : '',
-              ].filter(Boolean).join('；')} />}
-            </Space>
-          </Card>
-        </Col>)}
-      </Row>}
+      <section className="capability-library" aria-label="能力列表">
+        <div className="capability-library-toolbar">
+          <div>
+            <Typography.Title level={4}>能力列表</Typography.Title>
+            <Typography.Text type="secondary">当前显示 {filtered.length} 项</Typography.Text>
+          </div>
+          <Space wrap>
+            <Segmented value={kind} onChange={(value) => setKind(value as typeof kind)} options={[
+              { label: '全部', value: 'all' }, { label: 'Skill', value: 'skill' }, { label: 'MCP', value: 'mcp' },
+            ]} />
+            <Input.Search className="capability-search" allowClear placeholder="搜索名称、说明或来源" value={query} onChange={(event) => setQuery(event.target.value)} />
+          </Space>
+        </div>
+        {filtered.length === 0 ? <Empty description="尚未发现能力，先扫描本机配置或导入本地 Skill" /> : <div className="capability-list">
+          {filtered.map((capability) => {
+            const status = capabilityStatus(capability);
+            return <article className="capability-row" key={capability.id}>
+              <div className={`capability-kind-icon is-${capability.kind}`} aria-hidden="true">
+                {capability.kind === 'skill' ? <ToolOutlined /> : <ApiOutlined />}
+              </div>
+              <div className="capability-identity">
+                <div className="capability-name-line">
+                  <Typography.Text strong>{capability.name}</Typography.Text>
+                  <Tag bordered={false}>{capability.kind.toUpperCase()}</Tag>
+                  {capability.security.localCredentialBindings > 0 && <Tag bordered={false} color="green" icon={<SafetyCertificateOutlined />}>本机凭据 {capability.security.localCredentialBindings}</Tag>}
+                </div>
+                <Typography.Text type="secondary" ellipsis title={capability.description || '暂无说明'}>{capability.description || '暂无说明'}</Typography.Text>
+                <Typography.Text className="capability-source" type="secondary" ellipsis title={capability.source.ref}>{sourceTypeLabel[capability.source.type]} · {capability.source.ref}</Typography.Text>
+              </div>
+              <div className="capability-compatibility" aria-label="兼容 CLI">
+                {capability.compatibility.map((executor) => <span className={`executor-pill is-${executor}`} key={executor}>{executor === 'opencode' ? 'OpenCode' : 'Claude'}</span>)}
+              </div>
+              <div className={`capability-status ${status.className}`}>{status.icon}<span>{status.label}</span></div>
+              <div className="capability-row-actions">
+                <Button type="text" onClick={() => setSelectedCapability(capability)}>详情</Button>
+                {capability.lifecycleStatus !== 'installed' && capability.parseStatus === 'valid' && !capability.security.containsLiteralSecrets
+                  ? <Button type="primary" size="small" loading={install.isPending && install.variables === capability.id} onClick={() => install.mutate(capability.id)}>安装</Button>
+                  : null}
+              </div>
+            </article>;
+          })}
+        </div>}
+      </section>
     </QueryState>
     <Modal
       title="从 GitHub 导入标准 Skill"
@@ -182,10 +240,12 @@ export function CapabilityCenterPage() {
           { key: 'scripts', label: '脚本 / 安装内容', children: selectedCapability.security.scripts.join('、') || '未发现脚本文件' },
           { key: 'executables', label: '可执行文件', children: selectedCapability.security.executableFiles.join('、') || '无' },
           { key: 'network', label: '网络主机', children: selectedCapability.security.networkHosts.join('、') || '未识别' },
-          { key: 'credentials', label: '本地凭据引用', children: selectedCapability.credentialRefs.join('、') || '无' },
+          { key: 'credentials', label: '凭据处理', children: selectedCapability.security.localCredentialBindings > 0
+            ? `复用原 CLI 配置中的 ${selectedCapability.security.localCredentialBindings} 项本机凭据`
+            : selectedCapability.credentialRefs.join('、') || '无' },
           { key: 'headers', label: '环境 / Header 键', children: [...selectedCapability.security.environmentKeys, ...selectedCapability.security.headerKeys].join('、') || '无' },
         ]} />
-        {selectedCapability.security.containsLiteralSecrets && <Alert type="error" showIcon message="来源中检测到疑似明文凭据，当前版本已禁止安装" description="研序不会把原始明文写入 ProjectSpace；请先在来源配置中改成本地环境变量引用，再重新扫描或导入。" />}
+        {selectedCapability.security.containsLiteralSecrets && <Alert type="error" showIcon message="外部扩展中检测到疑似明文凭据，当前版本已禁止安装" description="GitHub、ZIP 或扩展文件不应携带密钥；请从扩展内容中移除凭据并改为环境变量引用后重新导入。" />}
         {typeof selectedCapability.manifest.contentPreview === 'string' && <Card size="small" title="SKILL.md 内容预览"><Typography.Paragraph className="mono-text" style={{ whiteSpace: 'pre-wrap' }}>{selectedCapability.manifest.contentPreview}</Typography.Paragraph></Card>}
       </Space>}
     </Modal>

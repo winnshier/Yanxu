@@ -15,7 +15,9 @@ describe('ClaudeCodeAdapter', () => {
   it('uses a resumable CLI session and validates Claude structured output', async () => {
     const fixture = createFakeClaude();
     const adapter = new ClaudeCodeAdapter(fixture.installation);
-    const runtime = await adapter.startRuntime(fixture.workspace, fixture.runtime);
+    const runtime = await adapter.startRuntime(fixture.workspace, fixture.runtime, {
+      environment: { YANXU_TEST_CREDENTIAL: 'runtime-secret' },
+    });
     let sessionId = '';
     const result = await adapter.executeStructured<{ summary: string }>({
       runtime,
@@ -36,7 +38,7 @@ describe('ClaudeCodeAdapter', () => {
       },
       onSessionStarted: (value) => { sessionId = value; },
     });
-    expect(result.output).toEqual({ summary: 'ok' });
+    expect(result.output).toEqual({ summary: 'credential-present' });
     expect(result.sessionId).toBe(sessionId);
     const settings = JSON.parse(readFileSync(join(fixture.runtime, `claude-settings-${sessionId}.json`), 'utf8')) as {
       permissions: { defaultMode: string; allow: string[]; deny: string[] };
@@ -45,6 +47,8 @@ describe('ClaudeCodeAdapter', () => {
     expect(settings.permissions.allow).toContain('Bash(git status*)');
     expect(settings.permissions.allow).toContain('Skill(review)');
     expect(settings.permissions.deny).toContain('WebFetch');
+    expect(readFileSync(join(fixture.runtime, 'runtime.log'), 'utf8')).not.toContain('runtime-secret');
+    expect(readFileSync(join(fixture.runtime, 'capability-config', '.mcp.json'), 'utf8')).not.toContain('runtime-secret');
     await adapter.stopRuntime(runtime);
   });
 
@@ -78,7 +82,7 @@ const sessionId = value('--resume') || value('--session-id');
 const finish = () => process.stdout.write(JSON.stringify({
   session_id: sessionId,
   is_error: false,
-  structured_output: { summary: 'ok' }
+  structured_output: { summary: process.env.YANXU_TEST_CREDENTIAL === 'runtime-secret' ? 'credential-present' : 'ok' }
 }));
 if (args.at(-1) === 'WAIT') setTimeout(finish, 5000); else finish();
 `, { mode: 0o700 });

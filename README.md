@@ -108,6 +108,7 @@ YANXU_HOME=/path/to/local-data YANXU_PORT=44000 ./yanxu
 - 工作台 API 需要 HttpOnly、SameSite=Strict 的本机会话 Cookie；所有修改请求还需要 CSRF 令牌。
 - 系统文件夹与附件选择只返回短期一次性 token，真实路径只在本地 Daemon 内解析。
 - `.env`、私钥等敏感文件不会进入任务基线，运行规则也拒绝读取常见密钥文件。
+- 本机 OpenCode/Claude Code 已配置的 MCP 凭据继续由原 CLI 配置托管；研序只保存定位引用，任务启动时临时注入子进程。第三方扩展自身携带的明文凭据仍禁止安装。
 - 默认禁止 `git push`、修改远程仓库、部署、`sudo` 和高风险递归删除。
 - 标准权限模式把未预授权动作送到调度台；全托管模式仍保留上述不可突破的硬边界。
 - “合并到目标分支”只操作本地 Git，不会推送远程。冲突时保留任务分支并要求用户决定。
@@ -129,6 +130,7 @@ pnpm build
 - [扩展接入指南](./docs/扩展接入指南.md)
 - [vNext 产品重构需求](./docs/Yanxu-vNext产品重构需求文档.md)
 - [vNext 研发版本计划](./docs/Yanxu-vNext研发版本计划.md)
+- [1.1–1.5 改进加强版本迭代计划](./docs/Yanxu-1.1-1.5改进加强版本迭代计划.md)
 
 工作区结构：
 

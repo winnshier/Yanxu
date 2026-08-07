@@ -10,6 +10,7 @@ import type {
   ExecutorAdapter,
   RuntimeHandle,
   RuntimePermissionPolicy,
+  RuntimeStartOptions,
   StructuredExecutionInput,
   StructuredExecutionResult,
 } from './types.js';
@@ -82,7 +83,11 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     return installation;
   }
 
-  async startRuntime(workspacePath: string, runtimeDirectory: string): Promise<RuntimeHandle> {
+  async startRuntime(
+    workspacePath: string,
+    runtimeDirectory: string,
+    options: RuntimeStartOptions = {},
+  ): Promise<RuntimeHandle> {
     const installation = await this.probe();
     if (installation.health !== 'available' || !installation.path) throw new Error(installation.error ?? 'OpenCode CLI is unavailable.');
     mkdirSync(runtimeDirectory, { recursive: true });
@@ -102,6 +107,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       cwd: workspacePath,
       env: {
         ...process.env,
+        ...options.environment,
         OPENCODE_SERVER_USERNAME: 'yanxu',
         OPENCODE_SERVER_PASSWORD: password,
         OPENCODE_DISABLE_AUTOUPDATE: 'true',

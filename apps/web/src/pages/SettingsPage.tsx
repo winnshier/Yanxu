@@ -18,7 +18,18 @@ export function SettingsPage() {
   useEffect(() => { if (settings.data) form.setFieldsValue(settings.data); }, [form, settings.data]);
   const probe = useMutation({
     mutationFn: api.probeExecutors,
-    onSuccess: (data) => { queryClient.setQueryData(['executors'], data); void queryClient.invalidateQueries({ queryKey: ['settings'] }); message.success('CLI 检测完成'); },
+    onSuccess: (data) => {
+      queryClient.setQueryData(['executors'], data);
+      void queryClient.invalidateQueries({ queryKey: ['settings'] });
+      const supported = data.filter((item) => item.id === 'opencode' || item.id === 'claude');
+      const available = supported.filter((item) => item.health === 'available').map((item) => item.name);
+      const unavailable = supported.filter((item) => item.health !== 'available').map((item) => item.name);
+      if (unavailable.length > 0) {
+        message.warning(`CLI 检测完成：${available.length ? `${available.join('、')} 可用；` : ''}${unavailable.join('、')} 未找到`);
+      } else {
+        message.success(`CLI 检测完成：${available.join('、')} 可用`);
+      }
+    },
     onError: (error: Error) => message.error(error.message),
   });
   const save = useMutation({

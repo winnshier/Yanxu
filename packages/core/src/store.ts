@@ -25,6 +25,8 @@ import type {
   DeliveryConflict,
   DirectoryProfileVersion,
   ExecutionFailureRecord,
+  ExecutionRun,
+  ExecutionTriggerSource,
   ExecutionPlanStep,
   ExecutorInstallation,
   ExecutorRuntimeValidation,
@@ -83,7 +85,12 @@ import {
 import { transitionTask, type TaskCommand } from './transitions.js';
 import { workingTreeFingerprint, type MergeResult, type PreparedWorkspace } from './git-workspace.js';
 import type { GitChangeInspection } from './git-workspace.js';
-import { discoverLocalCapabilities, inspectSkillDirectory, type DiscoveredCapability } from './capabilities.js';
+import {
+  discoverLocalCapabilities,
+  inspectSkillDirectory,
+  resolveLocalCredentialEnvironment,
+  type DiscoveredCapability,
+} from './capabilities.js';
 import { discoverRoleTemplates, type DiscoveredRoleTemplate } from './roles.js';
 
 interface ProjectRow {
@@ -324,6 +331,32 @@ interface AgentSessionRow {
   started_at: string;
   completed_at: string | null;
   error: string | null;
+}
+
+interface ExecutionRunRow {
+  id: string;
+  task_id: string;
+  step_id: string;
+  job_id: string | null;
+  agent_id: string;
+  executor_session_id: string | null;
+  external_session_id: string | null;
+  retry_of_run_id: string | null;
+  trigger_source: ExecutionTriggerSource;
+  status: ExecutionRun['status'];
+  phase: string;
+  failure_category: ExecutionRun['failureCategory'];
+  failure_code: string | null;
+  failure_message: string | null;
+  next_action: string | null;
+  workspace_reused: number;
+  session_reused: number;
+  runtime_directory: string | null;
+  log_path: string | null;
+  result_path: string | null;
+  started_at: string;
+  heartbeat_at: string | null;
+  completed_at: string | null;
 }
 
 interface DeliveryReportRow {
@@ -829,7 +862,7 @@ export class YanxuStore {
       });
     }
     if (capability.security.containsLiteralSecrets) {
-      throw new DomainError('CAPABILITY_LITERAL_SECRET_DETECTED', '能力来源中检测到疑似明文凭据，拒绝安装；请先改为本地环境变量引用。', 422, {
+      throw new DomainError('CAPABILITY_LITERAL_SECRET_DETECTED', '第三方扩展中检测到疑似明文凭据，拒绝安装；请移除密钥并改为环境变量引用。', 422, {
         capabilityId,
         source: capability.source.ref,
       });
@@ -1157,6 +1190,32 @@ export class YanxuStore {
     `).all(taskId) as TaskCapabilityRow[]).map((row) => this.taskCapabilityFromRow(row));
   }
 
+  resolveTaskCapabilityEnvironment(
+    taskId: string,
+    executor: TaskCapabilitySnapshot['executor'],
+  ): Record<string, string> {
+    const snapshots = this.listTaskCapabilitySnapshots(taskId).filter((item) => item.executor === executor);
+    const bindings = snapshots.flatMap((snapshot) => {
+      const value = snapshot.configuration.__yanxuLocalCredentialBindings;
+      return Array.isArray(value) ? value : [];
+    });
+    const resolved = resolveLocalCredentialEnvironment(bindings);
+    if (resolved.missing.length > 0) {
+      this.appendEvent('task', taskId, 'capability.credentials_unavailable', 'system',
+        '任务能力引用的本机 CLI 凭据当前不可用。', {
+          executor,
+          missing: resolved.missing,
+        });
+      throw new DomainError(
+        'CAPABILITY_LOCAL_CREDENTIAL_UNAVAILABLE',
+        `有 ${resolved.missing.length} 项本机 CLI 凭据无法读取，请检查原 OpenCode/Claude 配置后重试。`,
+        409,
+        { executor, missing: resolved.missing },
+      );
+    }
+    return resolved.environment;
+  }
+
   prepareTaskCapabilityProjection(
     taskId: string,
     executor: TaskCapabilitySnapshot['executor'],
@@ -1307,6 +1366,10 @@ export class YanxuStore {
   }
 
   private capabilityFromRow(row: CapabilityRow): Capability {
+    const security = parseJson<Capability['security']>(row.security_json, {
+      files: [], scripts: [], executableFiles: [], networkHosts: [], environmentKeys: [], headerKeys: [],
+      localCredentialBindings: 0, containsLiteralSecrets: false,
+    });
     return {
       id: row.id,
       originKey: row.origin_key,
@@ -1331,9 +1394,7 @@ export class YanxuStore {
       credentialRefs: parseJson(row.credential_refs_json, []),
       manifest: parseJson(row.manifest_json, {}),
       managedPath: row.managed_path,
-      security: parseJson(row.security_json, {
-        files: [], scripts: [], executableFiles: [], networkHosts: [], environmentKeys: [], headerKeys: [], containsLiteralSecrets: false,
-      }),
+      security: { ...security, localCredentialBindings: security.localCredentialBindings ?? 0 },
       lastDiscoveredAt: row.last_discovered_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
@@ -1457,7 +1518,13 @@ export class YanxuStore {
             executor: agent.executor,
           });
         }
-        const missingCredentials = capability.credentialRefs.filter((name) => !process.env[name]);
+        const localBindings = Array.isArray(capability.manifest.localCredentialBindings)
+          ? capability.manifest.localCredentialBindings
+          : [];
+        const localCredentialRefs = new Set(localBindings.flatMap((binding) =>
+          isRecordValue(binding) && typeof binding.reference === 'string' ? [binding.reference] : []));
+        const missingCredentials = capability.credentialRefs
+          .filter((name) => !localCredentialRefs.has(name) && !process.env[name]);
         if (missingCredentials.length > 0) {
           throw new DomainError('TASK_CAPABILITY_CREDENTIALS_MISSING', `能力 ${capability.name} 缺少本地凭据引用。`, 422, {
             capabilityId,
@@ -1488,7 +1555,10 @@ export class YanxuStore {
               __yanxuFiles: capability.security.files,
               __yanxuManifest: capability.manifest,
             }
-            : projectCapability.configuration,
+            : {
+              ...projectCapability.configuration,
+              __yanxuLocalCredentialBindings: localBindings,
+            },
           projectionPath: null,
           status: 'frozen',
           error: null,
@@ -2567,6 +2637,7 @@ export class YanxuStore {
     const sessionRows = this.database.prepare(`
       SELECT * FROM agent_sessions WHERE task_id = ? ORDER BY started_at
     `).all(taskId) as AgentSessionRow[];
+    const runs = this.listExecutionRuns(taskId);
     const deliveryReport = this.database.prepare(`
       SELECT artifact_path, content_hash, content_json, created_at
       FROM delivery_reports WHERE task_id = ?
@@ -2616,6 +2687,7 @@ export class YanxuStore {
         startedAt: row.started_at,
         completedAt: row.completed_at,
       })),
+      runs,
       contextPacks: contextRows.map((row) => ({
         id: row.id,
         stepId: row.step_id,
@@ -2687,6 +2759,35 @@ export class YanxuStore {
         createdAt: deliveryReport.created_at,
       } : null,
     };
+  }
+
+  listExecutionRuns(taskId: string): ExecutionRun[] {
+    this.getTask(taskId);
+    const rows = this.database.prepare(`
+      SELECT r.*, s.external_session_id
+      FROM execution_runs r
+      LEFT JOIN executor_sessions s ON s.id = r.executor_session_id
+      WHERE r.task_id = ? ORDER BY r.started_at DESC
+    `).all(taskId) as ExecutionRunRow[];
+    return rows.map((row) => this.executionRunFromRow(row));
+  }
+
+  getExecutionRun(taskId: string, runId: string): ExecutionRun {
+    this.getTask(taskId);
+    const row = this.database.prepare(`
+      SELECT r.*, s.external_session_id
+      FROM execution_runs r
+      LEFT JOIN executor_sessions s ON s.id = r.executor_session_id
+      WHERE r.task_id = ? AND r.id = ?
+    `).get(taskId, runId) as ExecutionRunRow | undefined;
+    if (!row) throw new DomainError('EXECUTION_RUN_NOT_FOUND', '运行记录不存在。', 404);
+    return this.executionRunFromRow(row);
+  }
+
+  listExecutionRunEvents(taskId: string, runId: string): WorkflowEvent[] {
+    this.getExecutionRun(taskId, runId);
+    return this.listEvents(taskId).filter((event) => event.payload.runId === runId
+      || event.payload.sessionRecordId === runId);
   }
 
   refreshDeliveryReport(taskId: string): void {
@@ -3291,6 +3392,7 @@ export class YanxuStore {
       started_at: string;
       completed_at: string | null;
     }>;
+    const runs = this.listExecutionRuns(taskId);
     const jobs = this.database.prepare(`
       SELECT status, attempt FROM jobs WHERE aggregate_id = ? ORDER BY created_at
     `).all(taskId) as Array<{ status: string; attempt: number }>;
@@ -3362,6 +3464,15 @@ export class YanxuStore {
         failed: sessions.filter((session) => session.status === 'failed').length,
         interrupted: sessions.filter((session) => session.status === 'interrupted').length,
       },
+      runs: {
+        total: runs.length,
+        preparing: runs.filter((run) => run.status === 'preparing').length,
+        running: runs.filter((run) => run.status === 'running').length,
+        succeeded: runs.filter((run) => run.status === 'succeeded').length,
+        failed: runs.filter((run) => run.status === 'failed').length,
+        interrupted: runs.filter((run) => run.status === 'interrupted').length,
+        stopped: runs.filter((run) => run.status === 'stopped').length,
+      },
       jobs: {
         total: jobs.length,
         ready: countJobs('READY'),
@@ -3384,6 +3495,7 @@ export class YanxuStore {
       recoveries: recoveryCount,
       quality: this.getTaskQualitySummary(taskId),
       failures,
+      recentRuns: runs.slice(0, 20),
       recentDecisions,
     };
   }
@@ -3756,41 +3868,152 @@ export class YanxuStore {
     return this.getTask(taskId).steps.find((item) => item.id === step.id) ?? step;
   }
 
-  createAgentSession(taskId: string, step: TaskStep, agent: AgentProfile): string {
-    const sessionId = id('session');
-    this.database.prepare(`
-      INSERT INTO agent_sessions(id, task_id, step_id, agent_id, executor, model, status, started_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
-    `).run(sessionId, taskId, step.id, agent.id, agent.executor, agent.model, now());
-    return sessionId;
+  createAgentSession(
+    taskId: string,
+    step: TaskStep,
+    agent: AgentProfile,
+    options: {
+      jobId?: string;
+      triggerSource?: ExecutionTriggerSource;
+      workspaceReused?: boolean;
+      runtimeDirectory?: string;
+    } = {},
+  ): string {
+    const runId = id('run');
+    const timestamp = now();
+    const previous = this.database.prepare(`
+      SELECT id FROM execution_runs
+      WHERE task_id = ? AND step_id = ? AND status != 'running'
+      ORDER BY started_at DESC LIMIT 1
+    `).get(taskId, step.id) as { id: string } | undefined;
+    this.database.transaction(() => {
+      // Keep the original evidence table populated for backwards-compatible reports and artifacts.
+      this.database.prepare(`
+        INSERT INTO agent_sessions(id, task_id, step_id, agent_id, executor, model, status, started_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
+      `).run(runId, taskId, step.id, agent.id, agent.executor, agent.model, timestamp);
+      this.database.prepare(`
+        INSERT INTO execution_runs(
+          id, task_id, step_id, job_id, agent_id, retry_of_run_id, trigger_source, status, phase,
+          workspace_reused, runtime_directory, started_at, heartbeat_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'preparing', 'preparing_runtime', ?, ?, ?, ?)
+      `).run(
+        runId,
+        taskId,
+        step.id,
+        options.jobId ?? null,
+        agent.id,
+        previous?.id ?? null,
+        options.triggerSource ?? 'manual',
+        Number(options.workspaceReused ?? Boolean(previous)),
+        options.runtimeDirectory ?? null,
+        timestamp,
+        timestamp,
+      );
+      this.appendEvent('task', taskId, 'run.created', 'scheduler', `已创建 ${step.title} 的独立运行记录。`, {
+        runId,
+        stepId: step.id,
+        jobId: options.jobId ?? null,
+        retryOfRunId: previous?.id ?? null,
+        triggerSource: options.triggerSource ?? 'manual',
+        workspaceReused: options.workspaceReused ?? Boolean(previous),
+      });
+    })();
+    return runId;
   }
 
   getResumableExternalSession(taskId: string, agentId: string): string | null {
     const row = this.database.prepare(`
       SELECT external_session_id
-      FROM agent_sessions
-      WHERE task_id = ? AND agent_id = ? AND external_session_id IS NOT NULL
-        AND status IN ('succeeded', 'failed', 'interrupted')
-      ORDER BY started_at DESC
+      FROM executor_sessions
+      WHERE task_id = ? AND agent_id = ? AND status = 'active'
+      ORDER BY last_used_at DESC
       LIMIT 1
     `).get(taskId, agentId) as { external_session_id: string } | undefined;
-    return row?.external_session_id ?? null;
+    if (row?.external_session_id) return row.external_session_id;
+    const legacy = this.database.prepare(`
+      SELECT external_session_id FROM agent_sessions
+      WHERE task_id = ? AND agent_id = ? AND external_session_id IS NOT NULL
+        AND status IN ('succeeded', 'failed', 'interrupted')
+      ORDER BY started_at DESC LIMIT 1
+    `).get(taskId, agentId) as { external_session_id: string } | undefined;
+    return legacy?.external_session_id ?? null;
   }
 
   recordExternalSessionId(sessionRecordId: string, externalSessionId: string): void {
     const session = this.database.prepare(`
-      SELECT task_id, step_id FROM agent_sessions WHERE id = ?
-    `).get(sessionRecordId) as { task_id: string; step_id: string } | undefined;
+      SELECT task_id, step_id, agent_id, executor, model FROM agent_sessions WHERE id = ?
+    `).get(sessionRecordId) as {
+      task_id: string; step_id: string; agent_id: string; executor: AgentProfile['executor']; model: string;
+    } | undefined;
     if (!session) throw new DomainError('AGENT_SESSION_NOT_FOUND', '执行会话不存在。', 404);
-    const result = this.database.prepare(`
-      UPDATE agent_sessions SET external_session_id = ?
-      WHERE id = ? AND status = 'running'
-    `).run(externalSessionId, sessionRecordId);
+    const timestamp = now();
+    const existing = this.database.prepare(`
+      SELECT id FROM executor_sessions
+      WHERE task_id = ? AND agent_id = ? AND executor = ? AND external_session_id = ?
+    `).get(session.task_id, session.agent_id, session.executor, externalSessionId) as { id: string } | undefined;
+    const executorSessionId = existing?.id ?? id('execsession');
+    const reused = Boolean(existing);
+    const result = this.database.transaction(() => {
+      if (existing) {
+        this.database.prepare(`
+          UPDATE executor_sessions SET status = 'active', model = ?, last_used_at = ?,
+            invalidated_at = NULL, invalidation_reason = NULL WHERE id = ?
+        `).run(session.model, timestamp, existing.id);
+      } else {
+        this.database.prepare(`
+          INSERT INTO executor_sessions(
+            id, task_id, agent_id, executor, model, external_session_id, status, created_at, last_used_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        `).run(executorSessionId, session.task_id, session.agent_id, session.executor, session.model,
+          externalSessionId, timestamp, timestamp);
+      }
+      const updated = this.database.prepare(`
+        UPDATE agent_sessions SET external_session_id = ? WHERE id = ? AND status = 'running'
+      `).run(externalSessionId, sessionRecordId);
+      this.database.prepare(`
+        UPDATE execution_runs SET executor_session_id = ?, session_reused = ?, status = 'running',
+          phase = 'executing', heartbeat_at = ? WHERE id = ? AND status IN ('preparing', 'running')
+      `).run(executorSessionId, Number(reused), timestamp, sessionRecordId);
+      return updated;
+    })();
     if (result.changes !== 1) return;
     this.appendEvent('task', session.task_id, 'agent_session.connected', 'executor', '本地执行器会话已建立。', {
       sessionRecordId,
+      runId: sessionRecordId,
+      executorSessionId,
       externalSessionId,
       stepId: session.step_id,
+      reused,
+    });
+  }
+
+  heartbeatExecutionRunForJob(jobId: string): void {
+    this.database.prepare(`
+      UPDATE execution_runs SET heartbeat_at = ? WHERE job_id = ? AND status IN ('preparing', 'running')
+    `).run(now(), jobId);
+  }
+
+  markExecutionRunPhase(runId: string, phase: string, nextAction: string | null = null): void {
+    this.database.prepare(`
+      UPDATE execution_runs SET phase = ?, next_action = ?, heartbeat_at = ?
+      WHERE id = ? AND status IN ('preparing', 'running')
+    `).run(phase, nextAction, now(), runId);
+  }
+
+  invalidateExecutorSession(runId: string, reason: string): void {
+    const run = this.database.prepare(`SELECT task_id, executor_session_id FROM execution_runs WHERE id = ?`)
+      .get(runId) as { task_id: string; executor_session_id: string | null } | undefined;
+    if (!run?.executor_session_id) return;
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE executor_sessions SET status = 'invalidated', invalidated_at = ?, invalidation_reason = ?
+      WHERE id = ? AND status = 'active'
+    `).run(timestamp, reason, run.executor_session_id);
+    this.appendEvent('task', run.task_id, 'executor_session.invalidated', 'executor', 'CLI 会话无法继续复用，后续运行将建立新会话。', {
+      runId,
+      executorSessionId: run.executor_session_id,
+      reason,
     });
   }
 
@@ -3926,8 +4149,13 @@ export class YanxuStore {
       this.database.prepare(`
         UPDATE agent_sessions SET external_session_id = ?, status = 'succeeded', result_path = ?, completed_at = ? WHERE id = ?
       `).run(externalSessionId, resultArtifact.path, now(), sessionRecordId);
+      this.database.prepare(`
+        UPDATE execution_runs SET status = 'succeeded', phase = 'run_completed', result_path = ?,
+          next_action = '等待系统验证或下一工作单元', heartbeat_at = ?, completed_at = ? WHERE id = ?
+      `).run(resultArtifact.path, now(), now(), sessionRecordId);
       this.database.prepare('UPDATE tasks SET active_step_id = NULL WHERE id = ?').run(taskId);
       this.appendEvent('task', taskId, step.kind === 'work_unit' ? 'work_unit.succeeded' : 'skill_step.succeeded', 'executor', `${step.title} 已完成。`, {
+        runId: sessionRecordId,
         stepId,
         skillId: step.skillId,
         artifactVersions: artifactVersions.map((artifact) => ({
@@ -4063,6 +4291,19 @@ export class YanxuStore {
         WHERE id = ?
       `).run(externalSessionId, resultArtifact.path, now(), sessionRecordId);
       this.database.prepare(`
+        UPDATE execution_runs SET status = 'succeeded', phase = 'business_result_received', result_path = ?,
+          failure_category = 'business_result', failure_code = ?, failure_message = ?, next_action = ?,
+          heartbeat_at = ?, completed_at = ? WHERE id = ?
+      `).run(
+        resultArtifact.path,
+        result.status === 'blocked' ? 'WORK_UNIT_BLOCKED' : 'CHANGES_REQUIRED',
+        result.summary,
+        result.status === 'blocked' ? '等待用户处理阻塞原因' : '按评审证据创建新的修复 Run',
+        now(),
+        now(),
+        sessionRecordId,
+      );
+      this.database.prepare(`
         UPDATE task_steps SET status = 'failed', completed_at = ?, summary = ? WHERE id = ?
       `).run(now(), result.summary, stepId);
       this.database.prepare('UPDATE tasks SET active_step_id = NULL WHERE id = ?').run(taskId);
@@ -4077,6 +4318,7 @@ export class YanxuStore {
           ? `${step.title} 判定当前任务无法安全继续。`
           : `${step.title} 发现必须整改的问题。`,
         {
+          runId: sessionRecordId,
           stepId,
           skillId: step.skillId,
           outcome: result.status,
@@ -4131,8 +4373,37 @@ export class YanxuStore {
   }
 
   recordSessionFailure(sessionRecordId: string, stepId: string, error: string): void {
-    this.database.prepare(`UPDATE agent_sessions SET status = 'failed', completed_at = ?, error = ? WHERE id = ?`).run(now(), error, sessionRecordId);
-    this.database.prepare(`UPDATE task_steps SET summary = ? WHERE id = ?`).run(error, stepId);
+    const failure = classifyExecutionFailure(new Error(error));
+    const timestamp = now();
+    this.database.transaction(() => {
+      this.database.prepare(`UPDATE agent_sessions SET status = 'failed', completed_at = ?, error = ? WHERE id = ?`)
+        .run(timestamp, error, sessionRecordId);
+      this.database.prepare(`
+        UPDATE execution_runs SET status = 'failed', phase = 'failed', failure_category = ?, failure_code = ?,
+          failure_message = ?, next_action = ?, heartbeat_at = ?, completed_at = ? WHERE id = ?
+      `).run(
+        failure.category,
+        failure.code,
+        error,
+        failure.suggestedAction === 'retry' ? '系统将在安全边界内创建重试 Run'
+          : failure.suggestedAction === 'replan' ? '需要基于失败证据重新规划'
+            : failure.suggestedAction === 'discard' ? '此运行已过期，不采纳结果'
+              : '等待用户处理后恢复',
+        timestamp,
+        timestamp,
+        sessionRecordId,
+      );
+      this.database.prepare(`UPDATE task_steps SET summary = ? WHERE id = ?`).run(error, stepId);
+      const task = this.database.prepare('SELECT task_id FROM execution_runs WHERE id = ?').get(sessionRecordId) as { task_id: string } | undefined;
+      if (task) this.appendEvent('task', task.task_id, 'run.failed', 'executor', '本次 CLI 运行失败。', {
+        runId: sessionRecordId,
+        category: failure.category,
+        code: failure.code,
+        retryable: failure.retryable,
+        suggestedAction: failure.suggestedAction,
+        error,
+      });
+    })();
   }
 
   saveGateResults(taskId: string, results: GateResultInput[]): void {
@@ -4996,6 +5267,34 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     return { roles: this.listRoleTemplates(false), skills: builtinSkills };
   }
 
+  private executionRunFromRow(row: ExecutionRunRow): ExecutionRun {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      stepId: row.step_id,
+      jobId: row.job_id,
+      agentId: row.agent_id,
+      executorSessionId: row.executor_session_id,
+      externalSessionId: row.external_session_id,
+      retryOfRunId: row.retry_of_run_id,
+      triggerSource: row.trigger_source,
+      status: row.status,
+      phase: row.phase,
+      failureCategory: row.failure_category,
+      failureCode: row.failure_code,
+      failureMessage: row.failure_message,
+      nextAction: row.next_action,
+      workspaceReused: Boolean(row.workspace_reused),
+      sessionReused: Boolean(row.session_reused),
+      runtimeDirectory: row.runtime_directory,
+      logPath: row.log_path,
+      resultPath: row.result_path,
+      startedAt: row.started_at,
+      heartbeatAt: row.heartbeat_at,
+      completedAt: row.completed_at,
+    };
+  }
+
   private projectFromRow(row: ProjectRow): Project {
     const directories = (this.database.prepare(`
       SELECT * FROM project_directories WHERE project_id = ? AND removed_at IS NULL ORDER BY scanned_at
@@ -5198,17 +5497,22 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       ?? steps.find((step) => step.id === row.active_step_id)
       ?? null;
     const activeSession = this.database.prepare(`
-      SELECT s.id, s.agent_id, s.executor, s.model, s.started_at, a.name AS agent_name
-      FROM agent_sessions s
-      LEFT JOIN agent_profiles a ON a.id = s.agent_id
-      WHERE s.task_id = ? AND (? IS NULL OR s.step_id = ?)
-      ORDER BY s.started_at DESC LIMIT 1
+      SELECT r.id, r.agent_id, a.executor, a.model, r.started_at, r.heartbeat_at,
+        r.phase, r.next_action, r.executor_session_id, a.name AS agent_name
+      FROM execution_runs r
+      LEFT JOIN agent_profiles a ON a.id = r.agent_id
+      WHERE r.task_id = ? AND r.status IN ('preparing', 'running') AND (? IS NULL OR r.step_id = ?)
+      ORDER BY r.started_at DESC LIMIT 1
     `).get(row.id, activeStep?.id ?? null, activeStep?.id ?? null) as {
       id: string;
       agent_id: string | null;
       executor: AgentProfile['executor'];
       model: string;
       started_at: string;
+      heartbeat_at: string | null;
+      phase: string;
+      next_action: string | null;
+      executor_session_id: string | null;
       agent_name: string | null;
     } | undefined;
     const assignedAgent = !activeSession && activeStep?.agentId
@@ -5226,9 +5530,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       agentName: activeSession?.agent_name ?? assignedAgent?.name ?? null,
       executor: activeSession?.executor ?? assignedAgent?.executor ?? null,
       model: activeSession?.model ?? assignedAgent?.model ?? null,
-      sessionId: activeSession?.id ?? null,
+      sessionId: activeSession?.executor_session_id ?? null,
+      runId: activeSession?.id ?? null,
+      phase: activeSession?.phase ?? (assignedAgent ? '等待创建运行' : null),
+      nextAction: activeSession?.next_action ?? (assignedAgent ? '等待调度器启动 CLI' : null),
       startedAt: activeSession?.started_at ?? activeStep?.startedAt ?? null,
-      heartbeatAt: jobHeartbeat?.heartbeat_at ?? null,
+      heartbeatAt: activeSession?.heartbeat_at ?? jobHeartbeat?.heartbeat_at ?? null,
     } : null;
     const succeeded = steps.filter((step) => step.status === 'succeeded' || step.status === 'skipped').length;
     return {
@@ -6710,7 +7017,7 @@ function assertNoLiteralCredential(value: unknown, parentKey = ''): void {
   for (const [key, item] of Object.entries(value)) {
     const fieldPath = `${parentKey}.${key}`;
     const usesEnvironmentReference = typeof item === 'string'
-      && /(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\})/.test(item);
+      && /(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*)/.test(item);
     if (typeof item === 'string'
       && (/\.headers?\./i.test(fieldPath)
         || /(token|secret|password|passwd|api[-_]?key|authorization|credential|private[-_]?key)/i.test(fieldPath))
@@ -6724,7 +7031,7 @@ function assertNoLiteralCredential(value: unknown, parentKey = ''): void {
         const hasLiteralUrlCredential = Boolean(url.username || url.password)
           || [...url.searchParams.entries()].some(([name, content]) =>
             /(token|secret|password|api[-_]?key|credential)/i.test(name)
-            && !/(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\})/.test(content));
+            && !/(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\}|\$[A-Za-z_][A-Za-z0-9_]*)/.test(content));
         if (hasLiteralUrlCredential) throw new DomainError('CAPABILITY_LITERAL_CREDENTIAL_REJECTED',
           'MCP URL 不能包含明文凭据，请改用本地环境变量引用。', 422);
       } catch (error) {
@@ -6778,8 +7085,12 @@ function toClaudeMcpConfiguration(configuration: Record<string, unknown>): Recor
 function convertCredentialReferences(value: unknown, target: 'opencode' | 'claude'): unknown {
   if (typeof value === 'string') {
     return target === 'opencode'
-      ? value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?[^}]*)?\}/g, '{env:$1}')
-      : value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+      ? value
+        .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?[^}]*)?\}/g, '{env:$1}')
+        .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, '{env:$1}')
+      : value
+        .replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}')
+        .replace(/\$([A-Za-z_][A-Za-z0-9_]*)/g, '${$1}');
   }
   if (Array.isArray(value)) return value.map((item) => convertCredentialReferences(item, target));
   if (isRecordValue(value)) return Object.fromEntries(Object.entries(value)

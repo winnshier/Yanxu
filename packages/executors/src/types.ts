@@ -8,6 +8,10 @@ export interface RuntimeHandle {
   sessionIds: string[];
 }
 
+export interface RuntimeStartOptions {
+  environment?: Record<string, string>;
+}
+
 export interface StructuredExecutionInput {
   runtime: RuntimeHandle;
   title: string;
@@ -54,7 +58,7 @@ export interface StructuredExecutionResult<T> {
 
 export interface ExecutorAdapter {
   probe(): Promise<ExecutorInstallation>;
-  startRuntime(workspacePath: string, runtimeDirectory: string): Promise<RuntimeHandle>;
+  startRuntime(workspacePath: string, runtimeDirectory: string, options?: RuntimeStartOptions): Promise<RuntimeHandle>;
   executeStructured<T>(input: StructuredExecutionInput): Promise<StructuredExecutionResult<T>>;
   abortSession(runtime: RuntimeHandle, sessionId: string): Promise<void>;
   stopRuntime(runtime: RuntimeHandle): Promise<void>;

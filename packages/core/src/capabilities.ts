@@ -18,7 +18,21 @@ const maximumFileBytes = 2 * 1024 * 1024;
 const maximumTotalBytes = 20 * 1024 * 1024;
 const scriptExtensions = new Set(['.js', '.mjs', '.cjs', '.ts', '.mts', '.cts', '.sh', '.bash', '.zsh', '.py', '.rb', '.pl']);
 const secretNamePattern = /(token|secret|password|passwd|api[-_]?key|authorization|credential|private[-_]?key)/i;
-const environmentReferencePattern = /(?:\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?[^}]*)?\})/g;
+const environmentReferencePattern = /(?:\{env:([A-Za-z_][A-Za-z0-9_]*)\}|\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?[^}]*)?\}|\$([A-Za-z_][A-Za-z0-9_]*))/g;
+
+export interface LocalCredentialBinding {
+  reference: string;
+  sourcePath: string;
+  sourceShape: 'opencode' | 'claude' | 'claude_state';
+  capabilityName: string;
+  scopeSuffix: string | null;
+  valuePath: Array<string | number>;
+}
+
+export interface LocalCredentialResolution {
+  environment: Record<string, string>;
+  missing: Array<{ reference: string; reason: string }>;
+}
 
 export interface DiscoveredCapability {
   originKey: string;
@@ -260,27 +274,67 @@ function inspectMcpConfig(entry: McpConfigSource): DiscoveredCapability[] {
     name,
     config,
     { ...entry.source, ref: scopeSuffix ? `${entry.path}#${scopeSuffix}` : entry.path },
+    {
+      sourcePath: entry.path,
+      sourceShape: entry.shape,
+      capabilityName: name,
+      scopeSuffix,
+    },
   ));
 }
 
-function inspectMcpDefinition(name: string, raw: unknown, mcpSource: CapabilitySource): DiscoveredCapability {
+function inspectMcpDefinition(
+  name: string,
+  raw: unknown,
+  mcpSource: CapabilitySource,
+  locator?: Omit<LocalCredentialBinding, 'reference' | 'valuePath'>,
+): DiscoveredCapability {
   const config = isRecord(raw) ? raw : {};
   const type = normalizeMcpType(config.type, config.url);
-  const command = normalizeCommand(config.command, config.args);
+  const normalizedCommand = normalizeCommandWithPaths(config.command, config.args);
+  const command = normalizedCommand.values;
   const url = typeof config.url === 'string' ? config.url : null;
+  const environmentContainer = isRecord(config.environment) ? 'environment' : isRecord(config.env) ? 'env' : 'environment';
   const environment = isRecord(config.environment) ? config.environment : isRecord(config.env) ? config.env : {};
   const headers = isRecord(config.headers) ? config.headers : {};
+  const localSource = Boolean(locator && (mcpSource.type === 'opencode' || mcpSource.type === 'claude'));
+  const localCredentialBindings: LocalCredentialBinding[] = [];
+  let unsafeLiteralDetected = false;
+  const protectLiteral = (value: string, valuePath: Array<string | number>, fallbackReference: string): string => {
+    if (extractEnvironmentReferences(value).length > 0) return value;
+    if (localSource && locator) {
+      const reference = localCredentialReference(locator, valuePath);
+      localCredentialBindings.push({ ...locator, reference, valuePath });
+      return `{env:${reference}}`;
+    }
+    unsafeLiteralDetected = true;
+    return `{env:${fallbackReference}}`;
+  };
   const discoveredCredentialRefs = [...new Set([
     ...Object.values(environment).flatMap((value) => extractEnvironmentReferences(String(value))),
     ...Object.values(headers).flatMap((value) => extractEnvironmentReferences(String(value))),
     ...(url ? extractEnvironmentReferences(url) : []),
   ])];
-  const containsLiteralSecrets = hasLiteralSecret(environment) || hasLiteralSecret(headers)
-    || command.some((value, index) => index > 0 && secretNamePattern.test(command[index - 1] ?? '') && !extractEnvironmentReferences(value).length);
-  const safeEnvironment = sanitizeKeyValueMap(environment);
-  const safeHeaders = sanitizeKeyValueMap(headers, true);
-  const safeCommand = sanitizeCommand(command);
-  const safeUrl = sanitizeUrl(url);
+  const safeEnvironment = Object.fromEntries(Object.entries(environment).map(([key, rawValue]) => {
+    const value = String(rawValue);
+    return [key, secretNamePattern.test(key) && value.length > 0
+      ? protectLiteral(value, [environmentContainer, key], `YANXU_${key.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`)
+      : value];
+  }));
+  const safeHeaders = Object.fromEntries(Object.entries(headers).map(([key, rawValue]) => {
+    const value = String(rawValue);
+    return [key, secretNamePattern.test(key) && value.length > 0
+      ? protectLiteral(value, ['headers', key], `YANXU_${key.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}`)
+      : value];
+  }));
+  const safeCommand = command.map((value, index) => index > 0 && secretNamePattern.test(command[index - 1] ?? '')
+    ? protectLiteral(value, normalizedCommand.paths[index] ?? ['command', index], 'YANXU_MCP_SECRET')
+    : value);
+  const literalUrlCredential = hasLiteralUrlCredential(url);
+  const safeUrl = literalUrlCredential && url
+    ? protectLiteral(url, ['url'], 'YANXU_MCP_URL')
+    : sanitizeUrl(url);
+  const containsLiteralSecrets = unsafeLiteralDetected;
   const parseError = type === 'local' && safeCommand.length === 0
     ? '本地 MCP 缺少 command。'
     : type === 'remote' && !safeUrl
@@ -299,10 +353,11 @@ function inspectMcpDefinition(name: string, raw: unknown, mcpSource: CapabilityS
   };
   const credentialRefs = [...new Set([
     ...discoveredCredentialRefs,
+    ...localCredentialBindings.map((binding) => binding.reference),
     ...extractEnvironmentReferences(JSON.stringify(configuration)),
   ])];
   const contentHash = sha256(JSON.stringify({ name, configuration, sourceVersion: mcpSource.version }));
-  const networkHosts = safeUrl ? hostnameOf(safeUrl) : [];
+  const networkHosts = url ? hostnameOf(url) : [];
   return discovered({
     kind: 'mcp',
     name,
@@ -316,7 +371,7 @@ function inspectMcpDefinition(name: string, raw: unknown, mcpSource: CapabilityS
     commandStatus,
     runtimeHealth: parseError ? 'unhealthy' : 'unchecked',
     credentialRefs,
-    manifest: { format: 'mcp', configuration },
+    manifest: { format: 'mcp', configuration, localCredentialBindings },
     security: {
       files: [mcpSource.ref.split('#')[0] ?? mcpSource.ref],
       scripts: [],
@@ -324,9 +379,46 @@ function inspectMcpDefinition(name: string, raw: unknown, mcpSource: CapabilityS
       networkHosts,
       environmentKeys: Object.keys(environment),
       headerKeys: Object.keys(headers),
+      localCredentialBindings: localCredentialBindings.length,
       containsLiteralSecrets,
     },
   });
+}
+
+export function resolveLocalCredentialEnvironment(rawBindings: unknown): LocalCredentialResolution {
+  const bindings = parseLocalCredentialBindings(rawBindings);
+  const environment: Record<string, string> = {};
+  const missing: LocalCredentialResolution['missing'] = [];
+  const documents = new Map<string, unknown>();
+  for (const binding of bindings) {
+    try {
+      let parsed = documents.get(binding.sourcePath);
+      if (parsed === undefined) {
+        parsed = parseJsonConfig(readFileSync(binding.sourcePath, 'utf8'));
+        documents.set(binding.sourcePath, parsed);
+      }
+      const definition = extractMcpDefinitions(parsed, binding.sourceShape)
+        .find((item) => item.name === binding.capabilityName && item.scopeSuffix === binding.scopeSuffix);
+      if (!definition) {
+        missing.push({ reference: binding.reference, reason: '来源配置中已找不到对应 MCP 定义' });
+        continue;
+      }
+      const rawValue = valueAtPath(definition.config, binding.valuePath);
+      if (rawValue === undefined || rawValue === null || String(rawValue).length === 0) {
+        missing.push({ reference: binding.reference, reason: '来源配置中的凭据值为空或已移除' });
+        continue;
+      }
+      const expanded = expandEnvironmentReferences(String(rawValue));
+      if (expanded.missing.length > 0) {
+        missing.push({ reference: binding.reference, reason: `来源引用的环境变量不可用：${expanded.missing.join('、')}` });
+        continue;
+      }
+      environment[binding.reference] = expanded.value;
+    } catch {
+      missing.push({ reference: binding.reference, reason: '本机来源配置无法读取或解析' });
+    }
+  }
+  return { environment, missing };
 }
 
 function discovered(input: Omit<DiscoveredCapability, 'originKey'>): DiscoveredCapability {
@@ -438,6 +530,7 @@ function analyzeSkillSecurity(root: string, files: string[], skillContent: strin
     networkHosts: hostnameOf(allText),
     environmentKeys: extractEnvironmentReferences(allText),
     headerKeys: [],
+    localCredentialBindings: 0,
     containsLiteralSecrets: /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|(?:api[_-]?key|access[_-]?token|secret|password)\s*[:=]\s*["'][^{$][^"']{7,}["']/i.test(allText),
   };
 }
@@ -548,36 +641,23 @@ function normalizeMcpType(value: unknown, url: unknown): 'local' | 'remote' | nu
   return null;
 }
 
-function normalizeCommand(command: unknown, args: unknown): string[] {
+function normalizeCommandWithPaths(
+  command: unknown,
+  args: unknown,
+): { values: string[]; paths: Array<Array<string | number>> } {
   const commandParts = Array.isArray(command)
     ? command.filter((item): item is string => typeof item === 'string')
     : typeof command === 'string' ? [command] : [];
   const argumentParts = Array.isArray(args) ? args.filter((item): item is string => typeof item === 'string') : [];
-  return [...commandParts, ...argumentParts];
-}
-
-function sanitizeKeyValueMap(value: Record<string, unknown>, headers = false): Record<string, string> {
-  return Object.fromEntries(Object.entries(value).map(([key, raw]) => {
-    const text = String(raw);
-    const references = extractEnvironmentReferences(text);
-    const safe = references.length > 0 || (!headers && !secretNamePattern.test(key))
-      ? text
-      : `{env:YANXU_${key.replace(/[^A-Za-z0-9]/g, '_').toUpperCase()}}`;
-    return [key, safe];
-  }));
-}
-
-function sanitizeCommand(command: string[]): string[] {
-  return command.map((value, index) => {
-    const previous = command[index - 1] ?? '';
-    return index > 0 && secretNamePattern.test(previous) && extractEnvironmentReferences(value).length === 0
-      ? '{env:YANXU_MCP_SECRET}'
-      : value;
-  });
+  const commandPaths = commandParts.map((_, index): Array<string | number> =>
+    Array.isArray(command) ? ['command', index] : ['command']);
+  const argumentPaths = argumentParts.map((_, index): Array<string | number> => ['args', index]);
+  return { values: [...commandParts, ...argumentParts], paths: [...commandPaths, ...argumentPaths] };
 }
 
 function sanitizeUrl(value: string | null): string | null {
   if (!value) return null;
+  if (extractEnvironmentReferences(value).length > 0) return value;
   try {
     const parsed = new URL(value);
     if (parsed.username || parsed.password) {
@@ -593,16 +673,84 @@ function sanitizeUrl(value: string | null): string | null {
   }
 }
 
-function hasLiteralSecret(value: Record<string, unknown>): boolean {
-  return Object.entries(value).some(([key, raw]) =>
-    secretNamePattern.test(key) && extractEnvironmentReferences(String(raw)).length === 0 && String(raw).length > 0);
+function hasLiteralUrlCredential(value: string | null): boolean {
+  if (!value) return false;
+  try {
+    const parsed = new URL(value);
+    const username = decodeURIComponent(parsed.username);
+    const password = decodeURIComponent(parsed.password);
+    if (username && extractEnvironmentReferences(username).length === 0) return true;
+    if (password && extractEnvironmentReferences(password).length === 0) return true;
+    return [...parsed.searchParams.entries()].some(([key, content]) =>
+      secretNamePattern.test(key) && extractEnvironmentReferences(content).length === 0 && content.length > 0);
+  } catch {
+    return false;
+  }
+}
+
+function localCredentialReference(
+  locator: Omit<LocalCredentialBinding, 'reference' | 'valuePath'>,
+  valuePath: Array<string | number>,
+): string {
+  return `YANXU_LOCAL_CREDENTIAL_${sha256(JSON.stringify({ ...locator, valuePath })).slice(0, 20).toUpperCase()}`;
+}
+
+function parseLocalCredentialBindings(value: unknown): LocalCredentialBinding[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): LocalCredentialBinding[] => {
+    if (!isRecord(item)
+      || typeof item.reference !== 'string'
+      || typeof item.sourcePath !== 'string'
+      || !['opencode', 'claude', 'claude_state'].includes(String(item.sourceShape))
+      || typeof item.capabilityName !== 'string'
+      || !(item.scopeSuffix === null || typeof item.scopeSuffix === 'string')
+      || !Array.isArray(item.valuePath)
+      || !item.valuePath.every((part) => typeof part === 'string' || Number.isInteger(part))) return [];
+    return [{
+      reference: item.reference,
+      sourcePath: item.sourcePath,
+      sourceShape: item.sourceShape as LocalCredentialBinding['sourceShape'],
+      capabilityName: item.capabilityName,
+      scopeSuffix: item.scopeSuffix,
+      valuePath: item.valuePath as Array<string | number>,
+    }];
+  });
+}
+
+function valueAtPath(value: unknown, path: Array<string | number>): unknown {
+  let current = value;
+  for (const part of path) {
+    if (typeof part === 'number') {
+      if (!Array.isArray(current)) return undefined;
+      current = current[part];
+      continue;
+    }
+    if (!isRecord(current)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function expandEnvironmentReferences(value: string): { value: string; missing: string[] } {
+  const missing = new Set<string>();
+  environmentReferencePattern.lastIndex = 0;
+  const expanded = value.replace(environmentReferencePattern, (_match, openCodeName, claudeName, shellName) => {
+    const name = String(openCodeName ?? claudeName ?? shellName ?? '');
+    const resolved = process.env[name];
+    if (resolved === undefined) {
+      missing.add(name);
+      return '';
+    }
+    return resolved;
+  });
+  return { value: expanded, missing: [...missing] };
 }
 
 function extractEnvironmentReferences(value: string): string[] {
   const result: string[] = [];
   environmentReferencePattern.lastIndex = 0;
   for (const match of value.matchAll(environmentReferencePattern)) {
-    const name = match[1] ?? match[2];
+    const name = match[1] ?? match[2] ?? match[3];
     if (name) result.push(name);
   }
   return [...new Set(result)];
@@ -627,7 +775,8 @@ function hostnameOf(value: string): string[] {
 
 function securitySummary(): CapabilitySecuritySummary {
   return {
-    files: [], scripts: [], executableFiles: [], networkHosts: [], environmentKeys: [], headerKeys: [], containsLiteralSecrets: false,
+    files: [], scripts: [], executableFiles: [], networkHosts: [], environmentKeys: [], headerKeys: [],
+    localCredentialBindings: 0, containsLiteralSecrets: false,
   };
 }
 

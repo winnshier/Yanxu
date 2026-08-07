@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { ExecutorInstallation } from '@yanxu/contracts';
-import { discoverLocalCapabilities } from './capabilities.js';
+import { discoverLocalCapabilities, resolveLocalCredentialEnvironment } from './capabilities.js';
 import { openDatabase } from './database.js';
 import { YanxuStore } from './store.js';
 
@@ -29,16 +29,52 @@ describe('capability registry', () => {
     mkdirSync(claudeSkill, { recursive: true });
     writeFileSync(join(openCodeSkill, 'SKILL.md'), '---\nname: frontend-review\ndescription: Review frontend code.\n---\n# Frontend review\n');
     writeFileSync(join(claudeSkill, 'SKILL.md'), '---\nname: api-review\ndescription: Review API code.\n---\n# API review\n');
+    const localSecret = 'local-token-that-must-not-be-persisted';
     writeFileSync(join(root, '.config', 'opencode', 'opencode.json'), JSON.stringify({
-      mcp: { context: { type: 'local', command: ['node', 'server.mjs'], environment: { API_TOKEN: '{env:TEST_API_TOKEN}' } } },
+      mcp: {
+        context: { type: 'local', command: ['node', 'server.mjs'], environment: { API_TOKEN: localSecret } },
+        referenced: { type: 'local', command: ['node', 'referenced.mjs'], environment: { API_TOKEN: '$TEST_API_TOKEN' } },
+      },
     }));
     const result = discoverLocalCapabilities([], root);
     expect(result.sourceErrors).toEqual([]);
     expect(result.capabilities).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: 'skill', name: 'frontend-review', parseStatus: 'valid' }),
       expect.objectContaining({ kind: 'skill', name: 'api-review', parseStatus: 'valid' }),
-      expect.objectContaining({ kind: 'mcp', name: 'context', credentialRefs: ['TEST_API_TOKEN'], runtimeHealth: 'unchecked' }),
+      expect.objectContaining({ kind: 'mcp', name: 'context', runtimeHealth: 'unchecked' }),
+      expect.objectContaining({ kind: 'mcp', name: 'referenced', credentialRefs: ['TEST_API_TOKEN'], runtimeHealth: 'unchecked' }),
     ]));
+    const context = result.capabilities.find((item) => item.name === 'context');
+    expect(context).toBeDefined();
+    expect(context?.security).toMatchObject({ containsLiteralSecrets: false, localCredentialBindings: 1 });
+    expect(JSON.stringify(context)).not.toContain(localSecret);
+    const resolved = resolveLocalCredentialEnvironment(context?.manifest.localCredentialBindings);
+    expect(resolved.missing).toEqual([]);
+    expect(Object.values(resolved.environment)).toEqual([localSecret]);
+    const referenced = result.capabilities.find((item) => item.name === 'referenced');
+    expect(referenced?.security.localCredentialBindings).toBe(0);
+  });
+
+  it('still blocks a third-party skill that embeds a literal credential', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-capability-secret-skill-'));
+    roots.push(root);
+    const skillRoot = join(root, 'unsafe-skill');
+    const workbench = join(root, 'workbench');
+    mkdirSync(skillRoot);
+    writeFileSync(join(skillRoot, 'SKILL.md'), [
+      '---',
+      'name: unsafe-skill',
+      'description: Contains an unsafe credential.',
+      '---',
+      'api_key = "third-party-literal-secret"',
+      '',
+    ].join('\n'));
+    const database = openDatabase(join(workbench, 'system', 'app.db'));
+    const store = new YanxuStore(database, workbench);
+    const capability = store.importLocalSkill(skillRoot);
+    expect(capability.security).toMatchObject({ containsLiteralSecrets: true, localCredentialBindings: 0 });
+    expect(() => store.installCapability(capability.id)).toThrow('疑似明文凭据');
+    database.close();
   });
 
   it('imports, installs, locks, freezes and projects a skill into an isolated task runtime', () => {

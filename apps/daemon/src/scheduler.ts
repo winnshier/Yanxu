@@ -805,7 +805,8 @@ export class Scheduler {
         const workspaceRoot = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'workspace');
         const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'executor');
         this.store.prepareTaskCapabilityProjection(taskId, agent.executor, runtimeDirectory);
-        const runtime = await adapter.startRuntime(workspaceRoot, runtimeDirectory);
+        const credentialEnvironment = this.store.resolveTaskCapabilityEnvironment(taskId, agent.executor);
+        const runtime = await adapter.startRuntime(workspaceRoot, runtimeDirectory, { environment: credentialEnvironment });
         binding = { runtime, adapter };
         this.runtimes.set(taskId, binding);
       }
@@ -1544,21 +1545,34 @@ ${JSON.stringify({
     });
     const projectCapabilities = this.store.listProjectCapabilities(project.id)
       .filter((item) => item.enabled)
-      .map((item) => ({
-        id: item.capabilityId,
-        name: item.capability.name,
-        kind: item.capability.kind,
-        description: item.capability.description,
-        version: item.lockedVersion,
-        compatibility: item.capability.compatibility,
-        credentialReady: item.capability.credentialRefs.every((name) => Boolean(process.env[name])),
-        security: {
-          fileCount: item.capability.security.files.length,
-          executableFiles: item.capability.security.executableFiles,
-          networkHosts: item.capability.security.networkHosts,
-          containsLiteralSecrets: item.capability.security.containsLiteralSecrets,
-        },
-      }));
+      .map((item) => {
+        const localCredentialRefs = new Set<string>();
+        const localCredentialBindings = item.capability.manifest.localCredentialBindings;
+        if (Array.isArray(localCredentialBindings)) {
+          for (const binding of localCredentialBindings as unknown[]) {
+            if (!binding || typeof binding !== 'object' || !('reference' in binding)) continue;
+            const reference = (binding as { reference?: unknown }).reference;
+            if (typeof reference === 'string') localCredentialRefs.add(reference);
+          }
+        }
+        return {
+          id: item.capabilityId,
+          name: item.capability.name,
+          kind: item.capability.kind,
+          description: item.capability.description,
+          version: item.lockedVersion,
+          compatibility: item.capability.compatibility,
+          credentialReady: item.capability.credentialRefs
+            .every((name) => localCredentialRefs.has(name) || Boolean(process.env[name])),
+          security: {
+            fileCount: item.capability.security.files.length,
+            executableFiles: item.capability.security.executableFiles,
+            networkHosts: item.capability.security.networkHosts,
+            localCredentialBindings: item.capability.security.localCredentialBindings,
+            containsLiteralSecrets: item.capability.security.containsLiteralSecrets,
+          },
+        };
+      });
     const input = {
       task: {
         title: task.title,
