@@ -3,7 +3,7 @@ import type { ExecutorInstallation, ExecutorType } from '@yanxu/contracts';
 
 const definitions: Array<{ id: ExecutorType; name: string; command: string; capabilities: string[] }> = [
   { id: 'opencode', name: 'OpenCode', command: 'opencode', capabilities: ['sessions', 'structured-output', 'permissions', 'abort', 'events'] },
-  { id: 'claude', name: 'Claude Code', command: 'claude', capabilities: [] },
+  { id: 'claude', name: 'Claude Code', command: 'claude', capabilities: ['sessions', 'structured-output', 'permissions', 'abort', 'events'] },
   { id: 'codex', name: 'Codex CLI', command: 'codex', capabilities: [] },
 ];
 
@@ -48,6 +48,11 @@ async function probeOne(definition: (typeof definitions)[number]): Promise<Execu
     if (modelResult.code === 0) {
       models = modelResult.stdout.split('\n').map((item) => item.trim()).filter((item) => item.includes('/'));
     }
+  }
+  if (definition.id === 'claude') {
+    // Claude Code accepts aliases and full model identifiers. Keep aliases
+    // available even though the CLI intentionally has no provider model list command.
+    models = ['sonnet', 'opus', 'haiku'];
   }
   return { ...definition, path, version, health: 'available', models: [...new Set(models)].sort(), lastCheckedAt: checkedAt, error: null };
 }

@@ -1,11 +1,12 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import type { ExecutorInstallation, ExecutorRuntimeValidation, ExecutorType } from '@yanxu/contracts';
-import { OpenCodeAdapter, probeExecutors } from '@yanxu/executors';
+import { ClaudeCodeAdapter, OpenCodeAdapter, probeExecutors, type ExecutorAdapter } from '@yanxu/executors';
 
 export class ExecutorRegistry {
   private installations: ExecutorInstallation[];
   private probePromise: Promise<ExecutorInstallation[]> | null = null;
+  private readonly adapters = new Map<ExecutorType, ExecutorAdapter>();
 
   constructor(
     initialInstallations: ExecutorInstallation[] = [
@@ -14,8 +15,12 @@ export class ExecutorRegistry {
     { id: 'codex', name: 'Codex CLI', command: 'codex', path: null, version: null, health: 'unchecked', capabilities: [], models: [], lastCheckedAt: null, error: null },
     ],
     private readonly probeExecutorsFn: typeof probeExecutors = probeExecutors,
+    adapterOverrides: Partial<Record<ExecutorType, ExecutorAdapter>> = {},
   ) {
     this.installations = initialInstallations;
+    for (const [executor, adapter] of Object.entries(adapterOverrides)) {
+      if (adapter) this.adapters.set(executor as ExecutorType, adapter);
+    }
   }
 
   list(): ExecutorInstallation[] {
@@ -53,13 +58,27 @@ export class ExecutorRegistry {
     return installation;
   }
 
+  async adapter(executor: ExecutorType): Promise<ExecutorAdapter> {
+    const installation = await this.ensureAvailable(executor);
+    const existing = this.adapters.get(executor);
+    if (existing) return existing;
+    const adapter = executor === 'opencode'
+      ? new OpenCodeAdapter(installation)
+      : executor === 'claude'
+        ? new ClaudeCodeAdapter(installation)
+        : null;
+    if (!adapter) throw new Error(`${installation.name} 尚未接入执行适配器。`);
+    this.adapters.set(executor, adapter);
+    return adapter;
+  }
+
   async validateRuntime(executor: ExecutorType, workbenchHome: string): Promise<ExecutorRuntimeValidation> {
     const checkedAt = new Date().toISOString();
-    if (executor !== 'opencode') {
+    if (executor === 'codex') {
       return {
         executor,
         status: 'failed',
-        message: '该执行器尚未接入运行时验证。',
+        message: 'Codex CLI 尚未接入运行时验证。',
         version: this.get(executor)?.version ?? null,
         capabilities: this.get(executor)?.capabilities ?? [],
         models: this.get(executor)?.models ?? [],
@@ -72,7 +91,7 @@ export class ExecutorRegistry {
       return {
         executor,
         status: 'failed',
-        message: 'OpenCode CLI 当前不可用，请先重新检测。',
+        message: `${installation?.name ?? executor} CLI 当前不可用，请先重新检测。`,
         version: installation?.version ?? null,
         capabilities: installation?.capabilities ?? [],
         models: installation?.models ?? [],
@@ -83,18 +102,20 @@ export class ExecutorRegistry {
     const workspacePath = join(workbenchHome, 'runtime', 'executor-validation', executor, 'workspace');
     const runtimePath = join(workbenchHome, 'runtime', 'executor-validation', executor, 'runtime');
     mkdirSync(workspacePath, { recursive: true });
-    const adapter = new OpenCodeAdapter(installation);
+    const adapter = await this.adapter(executor);
     try {
       const runtime = await adapter.startRuntime(workspacePath, runtimePath);
       await adapter.stopRuntime(runtime);
       return {
         executor,
         status: 'passed',
-        message: `OpenCode ${installation.version ?? ''} 的 serve、SDK health 与终止流程均可用。`.trim(),
+        message: executor === 'opencode'
+          ? `OpenCode ${installation.version ?? ''} 的 serve、SDK health 与终止流程均可用。`.trim()
+          : `Claude Code ${installation.version ?? ''} 的进程、任务配置投影与终止流程均可用；账号授权将在首次真实任务中验证。`.trim(),
         version: installation.version,
         capabilities: installation.capabilities,
         models: installation.models,
-        loginStatus: installation.models.length > 0 ? 'configured' : 'unknown',
+        loginStatus: executor === 'opencode' && installation.models.length > 0 ? 'configured' : 'unknown',
         checkedAt,
       };
     } catch (error) {
@@ -105,7 +126,7 @@ export class ExecutorRegistry {
         version: installation.version,
         capabilities: installation.capabilities,
         models: installation.models,
-        loginStatus: installation.models.length > 0 ? 'configured' : 'unknown',
+        loginStatus: executor === 'opencode' && installation.models.length > 0 ? 'configured' : 'unknown',
         checkedAt,
       };
     }

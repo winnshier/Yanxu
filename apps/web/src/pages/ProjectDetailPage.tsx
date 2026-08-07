@@ -29,6 +29,8 @@ export function ProjectDetailPage() {
   const projectSpaceOperations = useQuery({ queryKey: ['project-space-operations', projectId], queryFn: () => api.projectSpaceOperations(projectId), enabled: Boolean(projectId) });
   const projectSpaceIntegrity = useQuery({ queryKey: ['project-space-integrity', projectId], queryFn: () => api.projectSpaceIntegrity(projectId), enabled: Boolean(projectId) });
   const projectSettings = useQuery({ queryKey: ['project-settings', projectId], queryFn: () => api.projectSettings(projectId), enabled: Boolean(projectId) });
+  const capabilities = useQuery({ queryKey: ['capabilities'], queryFn: api.capabilities });
+  const projectCapabilities = useQuery({ queryKey: ['project-capabilities', projectId], queryFn: () => api.projectCapabilities(projectId), enabled: Boolean(projectId) });
   const teams = useQuery({ queryKey: ['teams'], queryFn: api.teams });
   const addDirectory = useMutation({
     mutationFn: async () => {
@@ -113,8 +115,25 @@ export function ProjectDetailPage() {
     },
     onError: (error: Error) => message.error(error.message),
   });
+  const updateCapability = useMutation({
+    mutationFn: ({ capabilityId, enabled }: { capabilityId: string; enabled: boolean }) =>
+      api.updateProjectCapability(projectId, capabilityId, { enabled }),
+    onSuccess: (_result, input) => {
+      void queryClient.invalidateQueries({ queryKey: ['project-capabilities', projectId] });
+      void queryClient.invalidateQueries({ queryKey: ['project-space-operations', projectId] });
+      message.success(input.enabled ? '能力已启用并写入项目锁文件' : '能力已从项目停用');
+    },
+    onError: (error: Error) => message.error(error.message),
+  });
 
   const data = project.data;
+  const availableProjectCapabilities = [
+    ...(capabilities.data ?? []).filter((item) => item.lifecycleStatus === 'installed'),
+    ...(projectCapabilities.data ?? [])
+      .filter((item) => item.enabled && !(capabilities.data ?? []).some((capability) =>
+        capability.id === item.capabilityId && capability.lifecycleStatus === 'installed'))
+      .map((item) => item.capability),
+  ];
   const items = data ? [
     {
       key: 'overview', label: '概览', children: <div className="detail-grid project-overview-grid">
@@ -169,6 +188,43 @@ export function ProjectDetailPage() {
       </Space>,
     },
     { key: 'tasks', label: '任务', children: (tasks.data?.length ?? 0) > 0 ? <Space direction="vertical" size={12} className="full-width">{tasks.data?.map((task) => <TaskTrack key={task.id} task={task} />)}</Space> : <Empty description="该项目还没有任务" /> },
+    {
+      key: 'capabilities', label: `项目能力 ${projectCapabilities.data?.filter((item) => item.enabled).length ?? 0}`, children: <Space direction="vertical" size={12} className="full-width">
+        <Alert showIcon type="info" message="项目只声明可用能力，不绑定固定角色或流程" description="任务协调器会从已启用能力中按 WorkUnit 选择；用户确认计划后，版本、配置、执行器与分配人员一起冻结。" />
+        {availableProjectCapabilities.length > 0
+          ? <List
+            dataSource={availableProjectCapabilities}
+            rowKey={(item) => item.id}
+            renderItem={(capability) => {
+              const projectCapability = projectCapabilities.data?.find((item) => item.capabilityId === capability.id);
+              const enabled = projectCapability?.enabled ?? false;
+              const hasUpdate = enabled && capability.lifecycleStatus === 'installed'
+                && projectCapability?.lockedHash !== capability.contentHash;
+              return <List.Item actions={[
+                ...(hasUpdate ? [<Button
+                  key="update"
+                  type="primary"
+                  loading={updateCapability.isPending && updateCapability.variables?.capabilityId === capability.id}
+                  onClick={() => updateCapability.mutate({ capabilityId: capability.id, enabled: true })}
+                >更新项目锁到 {capability.version}</Button>] : []),
+                <Button
+                  key="toggle"
+                  type={enabled ? 'default' : 'primary'}
+                  danger={enabled}
+                  loading={updateCapability.isPending && updateCapability.variables?.capabilityId === capability.id}
+                  onClick={() => updateCapability.mutate({ capabilityId: capability.id, enabled: !enabled })}
+                >{enabled ? '停用' : '启用到项目'}</Button>,
+              ]}>
+                <List.Item.Meta
+                  title={<Space wrap><Typography.Text strong>{capability.name}</Typography.Text><Tag>{capability.kind.toUpperCase()}</Tag>{enabled && <Tag color="green">已锁定 {projectCapability?.lockedVersion}</Tag>}</Space>}
+                  description={<Space direction="vertical" size={2}><Typography.Text type="secondary">{capability.description || '暂无说明'}</Typography.Text><Typography.Text className="mono-text" type="secondary">{capability.source.ref}</Typography.Text>{enabled && capability.lifecycleStatus !== 'installed' && <Typography.Text type="warning">来源已有变化；项目仍锁定旧版本，更新前不影响已确认任务。</Typography.Text>}</Space>}
+                />
+              </List.Item>;
+            }}
+          />
+          : <Empty description={<Space direction="vertical"><Typography.Text type="secondary">能力中心还没有已安装能力</Typography.Text><Button onClick={() => { void navigate('/capabilities'); }}>前往能力中心</Button></Space>} />}
+      </Space>,
+    },
     {
       key: 'knowledge', label: '项目知识', children: <>
         <Input.Search allowClear placeholder="按需检索项目认知、决策和经验" onSearch={setKnowledgeQuery} className="knowledge-search" />

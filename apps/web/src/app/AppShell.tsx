@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Layout, Menu, Tag, Typography } from 'antd';
 import {
-  ApartmentOutlined, DashboardOutlined, FolderOpenOutlined, MenuFoldOutlined, MenuUnfoldOutlined,
+  ApartmentOutlined, AppstoreOutlined, DashboardOutlined, FolderOpenOutlined, MenuFoldOutlined, MenuUnfoldOutlined,
   SettingOutlined, UnorderedListOutlined,
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
@@ -34,11 +34,16 @@ export function AppShell() {
         void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
         void queryClient.invalidateQueries({ queryKey: ['tasks'] });
         void queryClient.invalidateQueries({ queryKey: ['projects'] });
+        void queryClient.invalidateQueries({ queryKey: ['capabilities'] });
         if (event.aggregateType === 'task') {
           void queryClient.invalidateQueries({ queryKey: ['task', event.aggregateId] });
           void queryClient.invalidateQueries({ queryKey: ['task-plans', event.aggregateId] });
           void queryClient.invalidateQueries({ queryKey: ['task-events', event.aggregateId] });
           void queryClient.invalidateQueries({ queryKey: ['task-evidence', event.aggregateId] });
+          void queryClient.invalidateQueries({ queryKey: ['task-capabilities', event.aggregateId] });
+        }
+        if (event.aggregateType === 'project') {
+          void queryClient.invalidateQueries({ queryKey: ['project-capabilities', event.aggregateId] });
         }
       };
     });
@@ -53,6 +58,7 @@ export function AppShell() {
     { key: '/projects', icon: <FolderOpenOutlined />, label: '项目' },
     { key: '/tasks', icon: <UnorderedListOutlined />, label: '任务' },
     { key: '/team', icon: <ApartmentOutlined />, label: 'AI 团队' },
+    { key: '/capabilities', icon: <AppstoreOutlined />, label: '能力中心' },
     { key: '/settings', icon: <SettingOutlined />, label: '设置' },
   ];
 

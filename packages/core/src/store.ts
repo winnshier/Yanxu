@@ -1,15 +1,20 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { basename, join, relative } from 'node:path';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import { basename, dirname, join, relative, resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { builtinRoles, builtinSkills, defaultExecutionSkillIds } from '@yanxu/builtins';
+import { YANXU_VERSION } from '@yanxu/contracts';
 import type {
   AgentProfile,
   AnswerPlanInput,
   ArtifactVersion,
   BranchRoute,
   ChangeManifest,
+  Capability,
+  CapabilityDiscoveryReport,
+  CapabilityProjection,
+  CapabilitySource,
   ContextPackSource,
   CreateAgentInput,
   CreateProjectInput,
@@ -31,6 +36,8 @@ import type {
   PlanQuestionOption,
   PreApprovalArtifactVersion,
   Project,
+  ProjectCapability,
+  ProjectCapabilityUpdateInput,
   ProjectDirectory,
   ProjectSettings,
   ProjectSpaceOperation,
@@ -39,12 +46,15 @@ import type {
   QualityGate,
   ReviewFinding,
   RequestPlanRevisionInput,
+  RoleTemplate,
+  RoleTemplateChangePreview,
   SkillArtifactOutput,
   SystemSettings,
   SystemDiagnostics,
   Task,
   TaskAttachment,
   TaskContextPack,
+  TaskCapabilitySnapshot,
   TaskDiagnostics,
   TaskEvidence,
   TaskPlan,
@@ -57,7 +67,7 @@ import type {
   UpdateProjectSettingsInput,
   WorkflowEvent,
 } from '@yanxu/contracts';
-import type { SqliteDatabase } from './database.js';
+import { DATABASE_SCHEMA_VERSION, type SqliteDatabase } from './database.js';
 import { DomainError } from './errors.js';
 import { classifyExecutionFailure } from './execution-failure.js';
 import { scanProjectDirectory } from './directory-scanner.js';
@@ -73,6 +83,8 @@ import {
 import { transitionTask, type TaskCommand } from './transitions.js';
 import { workingTreeFingerprint, type MergeResult, type PreparedWorkspace } from './git-workspace.js';
 import type { GitChangeInspection } from './git-workspace.js';
+import { discoverLocalCapabilities, inspectSkillDirectory, type DiscoveredCapability } from './capabilities.js';
+import { discoverRoleTemplates, type DiscoveredRoleTemplate } from './roles.js';
 
 interface ProjectRow {
   id: string; name: string; description: string; project_space_path: string; created_at: string; updated_at: string;
@@ -84,7 +96,7 @@ interface DirectoryRow {
 }
 interface AgentRow {
   id: string; name: string; role_id: string; executor: AgentProfile['executor']; model: string; parameters_json: string;
-  permission_mode: AgentProfile['permissionMode']; status: AgentProfile['status']; created_at: string; updated_at: string;
+  default_capability_ids_json: string; permission_mode: AgentProfile['permissionMode']; status: AgentProfile['status']; created_at: string; updated_at: string;
 }
 interface TeamRow {
   id: string; name: string; description: string; is_default: number; created_at: string; updated_at: string;
@@ -92,7 +104,7 @@ interface TeamRow {
 interface TaskRow {
   id: string; project_id: string; team_id: string; project_name: string; team_name: string; title: string; description: string;
   expected_output: string; constraints_text: string; forbidden_paths_json: string; status: TaskStatus; state_version: number;
-  active_step_id: string | null; created_at: string; updated_at: string;
+  active_step_id: string | null; flow_version: 1 | 2; created_at: string; updated_at: string;
 }
 interface PlanRow {
   id: string; task_id: string; version: number; content_json: string; created_at: string; confirmed_at: string | null;
@@ -109,6 +121,41 @@ interface StepRow {
   id: string; task_id: string; position: number; skill_id: string; agent_id: string | null; title: string; description: string;
   inputs_json: string; expected_output: string; directory_ids_json: string; status: TaskStep['status']; attempt: number;
   started_at: string | null; completed_at: string | null; summary: string | null;
+  unit_kind: TaskStep['kind']; required_capabilities_json: string; verification_json: string;
+  capability_ids_json: string; execution_mode: TaskStep['mode']; requires_independent_session: number;
+}
+interface CapabilityRow {
+  id: string; origin_key: string; kind: Capability['kind']; name: string; description: string;
+  source_type: Capability['source']['type']; source_scope: Capability['source']['scope'];
+  source_executor: Capability['source']['executor']; source_ref: string; source_version: string | null;
+  version: string; content_hash: string; compatibility_json: string; lifecycle_status: Capability['lifecycleStatus'];
+  parse_status: Capability['parseStatus']; parse_error: string | null; command_status: Capability['commandStatus'];
+  runtime_health: Capability['runtimeHealth']; credential_refs_json: string; manifest_json: string; managed_path: string | null;
+  security_json: string; last_discovered_at: string; created_at: string; updated_at: string;
+}
+interface ProjectCapabilityRow {
+  project_id: string; capability_id: string; enabled: number; locked_version: string; locked_hash: string;
+  configuration_json: string; enabled_at: string | null; updated_at: string;
+}
+interface TaskCapabilityRow {
+  id: string; task_id: string; step_id: string; agent_id: string; capability_id: string;
+  kind: TaskCapabilitySnapshot['kind']; name: string; version: string; content_hash: string;
+  executor: TaskCapabilitySnapshot['executor']; configuration_json: string; projection_path: string | null;
+  status: TaskCapabilitySnapshot['status']; error: string | null; created_at: string;
+}
+interface RoleTemplateRow {
+  id: string; origin_key: string; name: string; description: string; instructions: string;
+  responsibilities_json: string; capability_ids_json: string; dependency_names_json: string;
+  default_permissions_json: string; compatibility_json: string;
+  source_type: RoleTemplate['source']['type']; source_scope: RoleTemplate['source']['scope'];
+  source_executor: RoleTemplate['source']['executor']; source_ref: string; source_version: string | null;
+  version: string; content_hash: string; lifecycle_status: 'draft' | 'installed';
+  parse_status: RoleTemplate['parseStatus']; parse_error: string | null; format: string;
+  managed_path: string | null; created_at: string; updated_at: string;
+}
+interface RoleTemplateVersionRow {
+  id: string; role_id: string; version: string; content_hash: string; content_json: string;
+  managed_path: string; created_at: string;
 }
 interface EventRow {
   seq: number; id: string; aggregate_type: string; aggregate_id: string; event_type: string; actor_type: WorkflowEvent['actorType'];
@@ -354,7 +401,7 @@ export class YanxuStore {
 
   constructor(private readonly database: SqliteDatabase, workbenchHome?: string) {
     this.workbenchHome = workbenchHome ?? process.env.YANXU_HOME ?? join(homedir(), '.yanxu');
-    for (const directory of ['system', 'projects', 'runtime/tasks', 'runtime/logs', 'runtime/tmp', 'cache/context']) {
+    for (const directory of ['system', 'projects', 'capabilities', 'runtime/tasks', 'runtime/logs', 'runtime/tmp', 'cache/context']) {
       mkdirSync(join(this.workbenchHome, directory), { recursive: true });
     }
     this.reconcilePreparedProjectSpaceOperations();
@@ -459,11 +506,61 @@ export class YanxuStore {
     }));
   }
 
+  recordExecutorRuntimeCheck(
+    taskId: string,
+    stepId: string,
+    installation: ExecutorInstallation,
+    expected?: NonNullable<TaskRunSnapshot['executors']>[number],
+  ): void {
+    const versionDrift = Boolean(expected?.version && installation.version && expected.version !== installation.version);
+    const executableDrift = Boolean(expected?.executableHash && installation.path
+      && expected.executableHash !== sha256(installation.path));
+    this.appendEvent(
+      'task',
+      taskId,
+      versionDrift || executableDrift ? 'executor.runtime_drift' : 'executor.runtime_checked',
+      'scheduler',
+      versionDrift || executableDrift
+        ? `${installation.name} 的本地运行环境与任务确认快照不同，已记录差异并继续按当前兼容契约执行。`
+        : `${installation.name} 运行环境与任务快照兼容。`,
+      {
+        stepId,
+        executor: installation.id,
+        expectedVersion: expected?.version ?? null,
+        currentVersion: installation.version,
+        versionDrift,
+        executableDrift,
+        capabilities: installation.capabilities,
+      },
+    );
+  }
+
   systemDiagnostics(): SystemDiagnostics {
     const quickCheck = this.database.pragma('quick_check') as Array<{ quick_check: string }>;
     const count = (sql: string) => (this.database.prepare(sql).get() as { count: number }).count;
     const runtimeTaskRoot = join(this.workbenchHome, 'runtime', 'tasks');
+    const daemonLogPath = join(this.workbenchHome, 'system', 'logs', 'daemon.log');
+    const databaseSchemaVersion = (this.database.prepare('SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations')
+      .get() as { version: number }).version;
+    const migrationRecoveryPoints = (this.database.prepare(`
+      SELECT id, from_version, to_version, backup_path, status, created_at, restored_at
+      FROM migration_recovery_points ORDER BY created_at DESC LIMIT 20
+    `).all() as Array<{
+      id: string; from_version: number; to_version: number; backup_path: string;
+      status: 'created' | 'restored'; created_at: string; restored_at: string | null;
+    }>).map((row) => ({
+      id: row.id,
+      fromVersion: row.from_version,
+      toVersion: row.to_version,
+      backupPath: row.backup_path,
+      status: row.status,
+      createdAt: row.created_at,
+      restoredAt: row.restored_at,
+    }));
     return {
+      appVersion: YANXU_VERSION,
+      databaseSchemaVersion,
+      latestDatabaseSchemaVersion: DATABASE_SCHEMA_VERSION,
       databaseCheck: quickCheck.every((row) => row.quick_check === 'ok') ? 'ok' : 'error',
       indexedProjectFiles: count('SELECT COUNT(*) AS count FROM project_file_index'),
       indexedKnowledgeEntries: count('SELECT COUNT(*) AS count FROM context_fts'),
@@ -474,7 +571,9 @@ export class YanxuStore {
       projectSpaceFailedOperations: count(`SELECT COUNT(*) AS count FROM project_space_operations WHERE status = 'failed'`),
       gitVersion: git(process.cwd(), ['--version']) || null,
       workbenchHome: this.workbenchHome,
-      daemonLogPath: join(this.workbenchHome, 'system', 'logs', 'daemon.log'),
+      daemonLogPath,
+      daemonLogBytes: existsSync(daemonLogPath) ? statSync(daemonLogPath).size : 0,
+      migrationRecoveryPoints,
     };
   }
 
@@ -487,6 +586,932 @@ export class YanxuStore {
     const row = this.database.prepare('SELECT * FROM projects WHERE id = ?').get(projectId) as ProjectRow | undefined;
     if (!row) throw new DomainError('PROJECT_NOT_FOUND', '项目不存在。', 404);
     return this.projectFromRow(row);
+  }
+
+  listCapabilities(): Capability[] {
+    return (this.database.prepare(`
+      SELECT * FROM capabilities ORDER BY kind, name COLLATE NOCASE, updated_at DESC
+    `).all() as CapabilityRow[]).map((row) => this.capabilityFromRow(row));
+  }
+
+  getCapability(capabilityId: string): Capability {
+    const row = this.database.prepare('SELECT * FROM capabilities WHERE id = ?').get(capabilityId) as CapabilityRow | undefined;
+    if (!row) throw new DomainError('CAPABILITY_NOT_FOUND', '能力不存在或已经移除。', 404);
+    return this.capabilityFromRow(row);
+  }
+
+  discoverCapabilities(projectId?: string): CapabilityDiscoveryReport {
+    const directories = projectId
+      ? this.getProject(projectId).directories
+      : this.listProjects().flatMap((project) => project.directories);
+    const scan = discoverLocalCapabilities(directories);
+    const scannedAt = now();
+    let discovered = 0;
+    let updated = 0;
+    this.database.transaction(() => {
+      for (const candidate of scan.capabilities) {
+        const existing = this.database.prepare('SELECT * FROM capabilities WHERE origin_key = ?')
+          .get(candidate.originKey) as CapabilityRow | undefined;
+        if (existing) {
+          const changed = existing.content_hash !== candidate.contentHash
+            || existing.parse_status !== candidate.parseStatus
+            || existing.command_status !== candidate.commandStatus;
+          this.updateDiscoveredCapability(existing.id, candidate, scannedAt);
+          if (changed) {
+            updated += 1;
+            this.appendEvent('capability', existing.id, 'capability.updated', 'system', `能力 ${candidate.name} 的来源内容已变化。`, {
+              source: candidate.source,
+              version: candidate.version,
+              contentHash: candidate.contentHash,
+              requiresReinstall: existing.content_hash !== candidate.contentHash,
+            });
+          }
+        } else {
+          const capabilityId = id('cap');
+          this.insertDiscoveredCapability(capabilityId, candidate, scannedAt);
+          this.appendEvent('capability', capabilityId, 'capability.discovered', 'system', `发现${candidate.kind === 'skill' ? ' Skill' : ' MCP'} 能力 ${candidate.name}。`, {
+            source: candidate.source,
+            parseStatus: candidate.parseStatus,
+            commandStatus: candidate.commandStatus,
+          });
+          discovered += 1;
+        }
+      }
+    })();
+    return {
+      scannedAt,
+      discovered,
+      updated,
+      invalid: scan.capabilities.filter((item) => item.parseStatus === 'invalid').length,
+      removed: 0,
+      sourceErrors: scan.sourceErrors,
+      capabilities: this.listCapabilities(),
+    };
+  }
+
+  importLocalSkill(directoryPath: string, sourceOverride?: CapabilitySource): Capability {
+    const inspected = inspectSkillDirectory(directoryPath);
+    const localSourceRoot = dirname(inspected.source.ref);
+    const candidate: DiscoveredCapability = sourceOverride
+      ? {
+        ...inspected,
+        source: sourceOverride,
+        version: sourceOverride.version ?? inspected.version,
+        originKey: sha256(JSON.stringify({
+          kind: inspected.kind,
+          name: inspected.name,
+          sourceType: sourceOverride.type,
+          sourceScope: sourceOverride.scope,
+          sourceExecutor: sourceOverride.executor,
+          sourceRef: sourceOverride.ref,
+        })),
+      }
+      : inspected;
+    if (candidate.parseStatus !== 'valid') {
+      throw new DomainError('CAPABILITY_IMPORT_INVALID', candidate.parseError ?? 'SKILL.md 无法解析。', 422, { candidate });
+    }
+    const timestamp = now();
+    const existing = this.database.prepare('SELECT * FROM capabilities WHERE origin_key = ?')
+      .get(candidate.originKey) as CapabilityRow | undefined;
+    const capabilityId = existing?.id ?? id('cap');
+    this.database.transaction(() => {
+      if (existing) {
+        this.updateDiscoveredCapability(existing.id, candidate, timestamp);
+      } else {
+        this.insertDiscoveredCapability(capabilityId, candidate, timestamp);
+      }
+    })();
+    const sourceRoot = localSourceRoot;
+    const target = join(this.workbenchHome, 'imports', capabilityId, candidate.contentHash);
+    const temporary = `${target}.tmp-${process.pid}`;
+    rmSync(temporary, { recursive: true, force: true });
+    mkdirSync(temporary, { recursive: true });
+    try {
+      for (const file of candidate.security.files) {
+        const sourcePath = resolve(sourceRoot, file);
+        const relativePath = relative(sourceRoot, sourcePath);
+        if (relativePath === '..' || relativePath.startsWith('../')) {
+          throw new DomainError('CAPABILITY_FILE_OUTSIDE_SOURCE', `能力文件不在来源目录内：${file}`, 422);
+        }
+        const targetPath = join(temporary, relativePath);
+        mkdirSync(dirname(targetPath), { recursive: true });
+        copyFileSync(sourcePath, targetPath);
+      }
+      rmSync(target, { recursive: true, force: true });
+      mkdirSync(dirname(target), { recursive: true });
+      renameSync(temporary, target);
+    } catch (error) {
+      rmSync(temporary, { recursive: true, force: true });
+      throw error;
+    }
+    this.database.prepare(`
+      UPDATE capabilities SET lifecycle_status = 'imported', managed_path = ?, updated_at = ? WHERE id = ?
+    `).run(target, timestamp, capabilityId);
+    this.appendEvent('capability', capabilityId, 'capability.imported', 'user', `已导入 Skill ${candidate.name}，等待安装。`, {
+      source: candidate.source,
+      version: candidate.version,
+      contentHash: candidate.contentHash,
+    });
+    return this.getCapability(capabilityId);
+  }
+
+  importGitHubSkills(address: string): Capability[] {
+    const parsed = parseGitHubSkillAddress(address);
+    const temporaryRoot = join(this.workbenchHome, 'tmp', `github-import-${randomUUID()}`);
+    const repositoryRoot = join(temporaryRoot, 'repository');
+    mkdirSync(temporaryRoot, { recursive: true });
+    try {
+      const clone = spawnSync('git', ['clone', '--depth=1', '--no-tags', '--', parsed.cloneUrl, repositoryRoot], {
+        encoding: 'utf8',
+        timeout: 120_000,
+        maxBuffer: 2 * 1024 * 1024,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
+      if (clone.status !== 0) {
+        throw new DomainError('CAPABILITY_GITHUB_CLONE_FAILED', 'GitHub 仓库读取失败。', 422, {
+          message: (clone.stderr || clone.stdout || '').trim().slice(-2_000),
+        });
+      }
+      let selectedRef: string | null = null;
+      let selectedSubpath = '';
+      if (parsed.treeSegments.length > 0) {
+        for (let boundary = 1; boundary <= parsed.treeSegments.length; boundary += 1) {
+          const candidateRef = parsed.treeSegments.slice(0, boundary).join('/');
+          const fetch = spawnSync('git', ['-C', repositoryRoot, 'fetch', '--depth=1', 'origin', candidateRef], {
+            encoding: 'utf8', timeout: 120_000, maxBuffer: 2 * 1024 * 1024,
+            env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+          });
+          if (fetch.status === 0) {
+            selectedRef = candidateRef;
+            selectedSubpath = parsed.treeSegments.slice(boundary).join('/');
+            break;
+          }
+        }
+        if (!selectedRef) throw new DomainError('CAPABILITY_GITHUB_REF_NOT_FOUND', 'GitHub 分支、标签或提交不存在或无法读取。', 422);
+        const checkout = spawnSync('git', ['-C', repositoryRoot, 'checkout', '--detach', 'FETCH_HEAD'], {
+          encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+        });
+        if (checkout.status !== 0) throw new DomainError('CAPABILITY_GITHUB_CHECKOUT_FAILED', 'GitHub 版本检出失败。', 422);
+      }
+      const targetRoot = resolve(repositoryRoot, selectedSubpath);
+      if (!pathWithin(repositoryRoot, targetRoot) || !existsSync(targetRoot) || !statSync(targetRoot).isDirectory()) {
+        throw new DomainError('CAPABILITY_GITHUB_PATH_INVALID', 'GitHub 子目录不存在或超出仓库范围。', 422);
+      }
+      validateImportedTree(targetRoot);
+      const skillDirectories = findSkillDirectories(targetRoot);
+      if (skillDirectories.length === 0) {
+        throw new DomainError('CAPABILITY_SKILL_NOT_FOUND', '所选 GitHub 地址中没有找到标准 SKILL.md。', 422);
+      }
+      const commit = git(repositoryRoot, ['rev-parse', 'HEAD']);
+      return skillDirectories.map((directory) => {
+        const subpath = relative(repositoryRoot, directory).replaceAll('\\', '/');
+        return this.importLocalSkill(directory, {
+          type: 'github',
+          scope: 'managed',
+          executor: null,
+          ref: `${parsed.canonicalUrl}${subpath ? `#${subpath}` : ''}`,
+          version: commit || selectedRef,
+        });
+      });
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }
+
+  importZipSkills(archivePath: string): Capability[] {
+    if (!archivePath.toLowerCase().endsWith('.zip')) {
+      throw new DomainError('CAPABILITY_ARCHIVE_TYPE_INVALID', '当前只支持 ZIP 格式扩展包。', 422);
+    }
+    const listing = spawnSync('/usr/bin/unzip', ['-Z1', archivePath], {
+      encoding: 'utf8', timeout: 30_000, maxBuffer: 4 * 1024 * 1024,
+    });
+    if (listing.status !== 0) throw new DomainError('CAPABILITY_ARCHIVE_INVALID', 'ZIP 文件无法读取或已经损坏。', 422);
+    const entries = listing.stdout.split(/\r?\n/).filter(Boolean);
+    if (entries.length > 2_000) throw new DomainError('CAPABILITY_ARCHIVE_TOO_MANY_FILES', 'ZIP 文件条目超过 2000 个。', 422);
+    for (const entry of entries) {
+      const normalized = entry.replaceAll('\\', '/');
+      if (normalized.startsWith('/') || normalized.split('/').includes('..')) {
+        throw new DomainError('CAPABILITY_ARCHIVE_PATH_INVALID', 'ZIP 包含越界路径，已拒绝导入。', 422, { entry });
+      }
+    }
+    const temporaryRoot = join(this.workbenchHome, 'tmp', `zip-import-${randomUUID()}`);
+    const extractedRoot = join(temporaryRoot, 'contents');
+    mkdirSync(extractedRoot, { recursive: true });
+    try {
+      const extraction = spawnSync('/usr/bin/ditto', ['-x', '-k', '--', archivePath, extractedRoot], {
+        encoding: 'utf8', timeout: 60_000, maxBuffer: 2 * 1024 * 1024,
+      });
+      if (extraction.status !== 0) throw new DomainError('CAPABILITY_ARCHIVE_EXTRACT_FAILED', 'ZIP 文件解压失败。', 422);
+      validateImportedTree(extractedRoot);
+      const skillDirectories = findSkillDirectories(extractedRoot);
+      if (skillDirectories.length === 0) throw new DomainError('CAPABILITY_SKILL_NOT_FOUND', 'ZIP 中没有找到标准 SKILL.md。', 422);
+      return skillDirectories.map((directory) => {
+        const subpath = relative(extractedRoot, directory).replaceAll('\\', '/');
+        return this.importLocalSkill(directory, {
+          type: 'zip',
+          scope: 'managed',
+          executor: null,
+          ref: `${archivePath}${subpath ? `#${subpath}` : ''}`,
+          version: null,
+        });
+      });
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }
+
+  installCapability(capabilityId: string): Capability {
+    const capability = this.getCapability(capabilityId);
+    if (capability.parseStatus !== 'valid') {
+      throw new DomainError('CAPABILITY_INSTALL_INVALID', '无效能力不能安装，请先处理解析错误。', 422, {
+        capabilityId,
+        parseError: capability.parseError,
+      });
+    }
+    if (capability.security.containsLiteralSecrets) {
+      throw new DomainError('CAPABILITY_LITERAL_SECRET_DETECTED', '能力来源中检测到疑似明文凭据，拒绝安装；请先改为本地环境变量引用。', 422, {
+        capabilityId,
+        source: capability.source.ref,
+      });
+    }
+    const target = join(this.workbenchHome, 'capabilities', capability.id, capability.contentHash);
+    const temporary = `${target}.tmp-${process.pid}`;
+    rmSync(temporary, { recursive: true, force: true });
+    mkdirSync(temporary, { recursive: true });
+    try {
+      if (capability.kind === 'skill') {
+        const sourceRoot = capability.lifecycleStatus === 'imported' && capability.managedPath
+          ? capability.managedPath
+          : dirname(capability.source.ref);
+        for (const file of capability.security.files) {
+          const sourcePath = resolve(sourceRoot, file);
+          const relativePath = relative(sourceRoot, sourcePath);
+          if (relativePath === '..' || relativePath.startsWith('../')) {
+            throw new DomainError('CAPABILITY_FILE_OUTSIDE_SOURCE', `能力文件不在来源目录内：${file}`, 422);
+          }
+          const targetPath = join(temporary, relativePath);
+          mkdirSync(dirname(targetPath), { recursive: true });
+          copyFileSync(sourcePath, targetPath);
+        }
+      }
+      writeFileSync(join(temporary, 'yanxu-capability.json'), `${JSON.stringify({
+        id: capability.id,
+        name: capability.name,
+        kind: capability.kind,
+        version: capability.version,
+        contentHash: capability.contentHash,
+        source: capability.source,
+        manifest: capability.manifest,
+        security: capability.security,
+      }, null, 2)}\n`, { mode: 0o600 });
+      rmSync(target, { recursive: true, force: true });
+      mkdirSync(dirname(target), { recursive: true });
+      renameSync(temporary, target);
+    } catch (error) {
+      rmSync(temporary, { recursive: true, force: true });
+      throw error;
+    }
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE capabilities SET lifecycle_status = 'installed', managed_path = ?, updated_at = ? WHERE id = ?
+    `).run(target, timestamp, capabilityId);
+    this.appendEvent('capability', capabilityId, 'capability.installed', 'user', `能力 ${capability.name} 已安装到研序托管目录。`, {
+      kind: capability.kind,
+      version: capability.version,
+      contentHash: capability.contentHash,
+    });
+    return this.getCapability(capabilityId);
+  }
+
+  listRoleTemplates(includeDrafts = true): RoleTemplate[] {
+    const external = (this.database.prepare(`
+      SELECT * FROM role_templates
+      ${includeDrafts ? '' : "WHERE lifecycle_status = 'installed'"}
+      ORDER BY name COLLATE NOCASE, updated_at DESC
+    `).all() as RoleTemplateRow[]).map((row) => this.roleTemplateFromRow(row));
+    return [...builtinRoles, ...external];
+  }
+
+  getRoleTemplate(roleId: string): RoleTemplate {
+    const builtin = builtinRoles.find((role) => role.id === roleId);
+    if (builtin) return builtin;
+    const row = this.database.prepare('SELECT * FROM role_templates WHERE id = ?').get(roleId) as RoleTemplateRow | undefined;
+    if (!row) throw new DomainError('ROLE_NOT_FOUND', 'RoleTemplate 不存在或已经移除。', 404);
+    return this.roleTemplateFromRow(row);
+  }
+
+  importGitHubRoleTemplates(address: string): RoleTemplate[] {
+    const parsed = parseGitHubSkillAddress(address);
+    const temporaryRoot = join(this.workbenchHome, 'tmp', `github-role-import-${randomUUID()}`);
+    const repositoryRoot = join(temporaryRoot, 'repository');
+    mkdirSync(temporaryRoot, { recursive: true });
+    try {
+      const clone = spawnSync('git', ['clone', '--depth=1', '--no-tags', '--', parsed.cloneUrl, repositoryRoot], {
+        encoding: 'utf8', timeout: 120_000, maxBuffer: 2 * 1024 * 1024,
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      });
+      if (clone.status !== 0) {
+        throw new DomainError('ROLE_GITHUB_CLONE_FAILED', 'GitHub 角色仓库读取失败。', 422, {
+          message: (clone.stderr || clone.stdout || '').trim().slice(-2_000),
+        });
+      }
+      let selectedRef: string | null = null;
+      let selectedSubpath = '';
+      if (parsed.treeSegments.length > 0) {
+        for (let boundary = 1; boundary <= parsed.treeSegments.length; boundary += 1) {
+          const candidateRef = parsed.treeSegments.slice(0, boundary).join('/');
+          const fetch = spawnSync('git', ['-C', repositoryRoot, 'fetch', '--depth=1', 'origin', candidateRef], {
+            encoding: 'utf8', timeout: 120_000, maxBuffer: 2 * 1024 * 1024,
+            env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+          });
+          if (fetch.status === 0) {
+            selectedRef = candidateRef;
+            selectedSubpath = parsed.treeSegments.slice(boundary).join('/');
+            break;
+          }
+        }
+        if (!selectedRef) throw new DomainError('ROLE_GITHUB_REF_NOT_FOUND', 'GitHub 分支、标签或提交不存在或无法读取。', 422);
+        const checkout = spawnSync('git', ['-C', repositoryRoot, 'checkout', '--detach', 'FETCH_HEAD'], {
+          encoding: 'utf8', timeout: 30_000, maxBuffer: 2 * 1024 * 1024,
+        });
+        if (checkout.status !== 0) throw new DomainError('ROLE_GITHUB_CHECKOUT_FAILED', 'GitHub 角色版本检出失败。', 422);
+      }
+      const targetRoot = resolve(repositoryRoot, selectedSubpath);
+      if (!pathWithin(repositoryRoot, targetRoot) || !existsSync(targetRoot) || !statSync(targetRoot).isDirectory()) {
+        throw new DomainError('ROLE_GITHUB_PATH_INVALID', 'GitHub 角色子目录不存在或超出仓库范围。', 422);
+      }
+      validateImportedTree(targetRoot);
+      const commit = git(repositoryRoot, ['rev-parse', 'HEAD']) || selectedRef;
+      const importedCapabilities = findSkillDirectories(targetRoot).map((directory) => {
+        const subpath = relative(repositoryRoot, directory).replaceAll('\\', '/');
+        return this.importLocalSkill(directory, {
+          type: 'github', scope: 'managed', executor: null,
+          ref: `${parsed.canonicalUrl}${subpath ? `#${subpath}` : ''}`,
+          version: commit,
+        });
+      });
+      const candidates = discoverRoleTemplates(targetRoot, {
+        type: 'github', scope: 'managed', executor: null,
+        ref: `${parsed.canonicalUrl}${selectedSubpath ? `#${selectedSubpath}` : ''}`,
+        version: commit,
+      });
+      if (candidates.length === 0) {
+        throw new DomainError('ROLE_TEMPLATE_NOT_FOUND', '所选 GitHub 地址中没有找到受支持的角色定义。', 422);
+      }
+      return candidates.map((candidate) => this.upsertRoleTemplateDraft(candidate, importedCapabilities));
+    } finally {
+      rmSync(temporaryRoot, { recursive: true, force: true });
+    }
+  }
+
+  importLocalRoleTemplates(directoryPath: string): RoleTemplate[] {
+    const root = resolve(directoryPath);
+    if (!existsSync(root) || !statSync(root).isDirectory()) {
+      throw new DomainError('ROLE_LOCAL_PATH_INVALID', '所选角色目录不存在。', 422);
+    }
+    validateImportedTree(root);
+    const capabilities = findSkillDirectories(root).map((directory) => this.importLocalSkill(directory));
+    const candidates = discoverRoleTemplates(root, {
+      type: 'local_directory', scope: 'managed', executor: null, ref: root, version: null,
+    });
+    if (candidates.length === 0) throw new DomainError('ROLE_TEMPLATE_NOT_FOUND', '所选目录中没有找到受支持的角色定义。', 422);
+    return candidates.map((candidate) => this.upsertRoleTemplateDraft(candidate, capabilities));
+  }
+
+  installRoleTemplate(roleId: string, capabilityIds?: string[]): RoleTemplate {
+    const role = this.getRoleTemplate(roleId);
+    if (role.origin === 'builtin') return role;
+    if (role.parseStatus !== 'valid') {
+      throw new DomainError('ROLE_TEMPLATE_NOT_INSTALLABLE', role.parseError ?? '该角色无法可靠转换，只能查看。', 422);
+    }
+    const selectedCapabilityIds = capabilityIds ?? role.capabilityIds;
+    for (const capabilityId of selectedCapabilityIds) this.getCapability(capabilityId);
+    const timestamp = now();
+    this.database.prepare(`
+      UPDATE role_templates SET lifecycle_status = 'installed', capability_ids_json = ?, updated_at = ? WHERE id = ?
+    `).run(JSON.stringify([...new Set(selectedCapabilityIds)]), timestamp, roleId);
+    this.appendEvent('role', roleId, 'role.installed', 'user', `RoleTemplate ${role.name} 已审查并安装。`, {
+      compatibility: role.compatibility,
+      capabilityIds: selectedCapabilityIds,
+      source: role.source,
+      version: role.version,
+    });
+    return this.getRoleTemplate(roleId);
+  }
+
+  getRoleTemplateChangePreview(roleId: string): RoleTemplateChangePreview {
+    const role = this.getRoleTemplate(roleId);
+    if (role.origin === 'builtin') {
+      return {
+        roleId, current: { version: role.version, contentHash: role.contentHash, createdAt: '' }, previous: null,
+        changedFields: [], instructionChanges: { added: [], removed: [] },
+      };
+    }
+    const versions = this.database.prepare(`
+      SELECT * FROM role_template_versions WHERE role_id = ? ORDER BY created_at DESC LIMIT 2
+    `).all(roleId) as RoleTemplateVersionRow[];
+    const current = versions[0];
+    if (!current) throw new DomainError('ROLE_VERSION_NOT_FOUND', '该角色没有可用版本记录。', 404);
+    const previous = versions[1];
+    const currentContent = parseJson<Record<string, unknown>>(current.content_json, {});
+    const previousContent = previous ? parseJson<Record<string, unknown>>(previous.content_json, {}) : {};
+    const changedFields = ['name', 'description', 'instructions', 'responsibilities', 'dependencyNames', 'defaultPermissions', 'compatibility']
+      .filter((field) => JSON.stringify(currentContent[field]) !== JSON.stringify(previousContent[field]));
+    const currentLines = new Set(String(currentContent.instructions ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+    const previousLines = new Set(String(previousContent.instructions ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean));
+    return {
+      roleId,
+      current: { version: current.version, contentHash: current.content_hash, createdAt: current.created_at },
+      previous: previous ? { version: previous.version, contentHash: previous.content_hash, createdAt: previous.created_at } : null,
+      changedFields,
+      instructionChanges: {
+        added: [...currentLines].filter((line) => !previousLines.has(line)).slice(0, 200),
+        removed: [...previousLines].filter((line) => !currentLines.has(line)).slice(0, 200),
+      },
+    };
+  }
+
+  private upsertRoleTemplateDraft(candidate: DiscoveredRoleTemplate, importedCapabilities: Capability[]): RoleTemplate {
+    const existing = this.database.prepare('SELECT * FROM role_templates WHERE origin_key = ?')
+      .get(candidate.originKey) as RoleTemplateRow | undefined;
+    const roleId = existing?.id ?? id('role');
+    const timestamp = now();
+    const dependencyNames = candidate.dependencyNames.map((item) => item.toLowerCase());
+    const capabilityIds = importedCapabilities
+      .filter((capability) => dependencyNames.includes(capability.name.toLowerCase()))
+      .map((capability) => capability.id);
+    const target = join(this.workbenchHome, 'imports', 'roles', roleId, candidate.contentHash);
+    mkdirSync(target, { recursive: true });
+    copyFileSync(candidate.entryPath, join(target, 'ROLE.md'));
+    this.database.prepare(`
+      INSERT INTO role_templates(
+        id, origin_key, name, description, instructions, responsibilities_json, capability_ids_json,
+        dependency_names_json, default_permissions_json, compatibility_json,
+        source_type, source_scope, source_executor, source_ref, source_version,
+        version, content_hash, lifecycle_status, parse_status, parse_error, format, managed_path, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(origin_key) DO UPDATE SET
+        name = excluded.name, description = excluded.description, instructions = excluded.instructions,
+        responsibilities_json = excluded.responsibilities_json, capability_ids_json = excluded.capability_ids_json,
+        dependency_names_json = excluded.dependency_names_json, default_permissions_json = excluded.default_permissions_json,
+        compatibility_json = excluded.compatibility_json, source_version = excluded.source_version,
+        version = excluded.version, content_hash = excluded.content_hash,
+        lifecycle_status = CASE WHEN role_templates.content_hash = excluded.content_hash THEN role_templates.lifecycle_status ELSE 'draft' END,
+        parse_status = excluded.parse_status, parse_error = excluded.parse_error, format = excluded.format,
+        managed_path = excluded.managed_path, updated_at = excluded.updated_at
+    `).run(
+      roleId, candidate.originKey, candidate.name, candidate.description, candidate.instructions,
+      JSON.stringify(candidate.responsibilities), JSON.stringify(capabilityIds), JSON.stringify(candidate.dependencyNames),
+      JSON.stringify(candidate.defaultPermissions), JSON.stringify(candidate.compatibility),
+      candidate.source.type, candidate.source.scope, candidate.source.executor, candidate.source.ref, candidate.source.version,
+      candidate.version, candidate.contentHash, candidate.parseStatus, candidate.parseError, candidate.format, target,
+      existing?.created_at ?? timestamp, timestamp,
+    );
+    this.database.prepare(`
+      INSERT OR IGNORE INTO role_template_versions(id, role_id, version, content_hash, content_json, managed_path, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(id('rolev'), roleId, candidate.version, candidate.contentHash, JSON.stringify({
+      name: candidate.name,
+      description: candidate.description,
+      instructions: candidate.instructions,
+      responsibilities: candidate.responsibilities,
+      dependencyNames: candidate.dependencyNames,
+      defaultPermissions: candidate.defaultPermissions,
+      compatibility: candidate.compatibility,
+      format: candidate.format,
+    }), target, timestamp);
+    this.appendEvent('role', roleId, 'role.imported', 'user', `已导入 RoleTemplate 草稿 ${candidate.name}，等待审查。`, {
+      format: candidate.format,
+      compatibility: candidate.compatibility,
+      parseStatus: candidate.parseStatus,
+      dependencyNames: candidate.dependencyNames,
+      capabilityIds,
+    });
+    return this.getRoleTemplate(roleId);
+  }
+
+  listProjectCapabilities(projectId: string): ProjectCapability[] {
+    this.getProject(projectId);
+    const rows = this.database.prepare(`
+      SELECT * FROM project_capabilities WHERE project_id = ? ORDER BY updated_at DESC
+    `).all(projectId) as ProjectCapabilityRow[];
+    return rows.map((row) => ({
+      projectId: row.project_id,
+      capabilityId: row.capability_id,
+      enabled: Boolean(row.enabled),
+      lockedVersion: row.locked_version,
+      lockedHash: row.locked_hash,
+      configuration: parseJson(row.configuration_json, {}),
+      enabledAt: row.enabled_at,
+      updatedAt: row.updated_at,
+      capability: this.getCapability(row.capability_id),
+    }));
+  }
+
+  updateProjectCapability(
+    projectId: string,
+    capabilityId: string,
+    input: ProjectCapabilityUpdateInput,
+  ): ProjectCapability {
+    const project = this.getProject(projectId);
+    const capability = this.getCapability(capabilityId);
+    if (input.enabled && capability.lifecycleStatus !== 'installed') {
+      throw new DomainError('CAPABILITY_INSTALL_REQUIRED', '能力必须先安装，才能启用到项目。', 409);
+    }
+    if (input.enabled && capability.parseStatus !== 'valid') {
+      throw new DomainError('CAPABILITY_INVALID', '无效能力不能启用到项目。', 422, { parseError: capability.parseError });
+    }
+    const baseConfiguration = isRecordValue(capability.manifest.configuration)
+      ? capability.manifest.configuration
+      : {};
+    const configuration = { ...baseConfiguration, ...(input.configuration ?? {}) };
+    assertNoLiteralCredential(configuration);
+    const timestamp = now();
+    this.database.prepare(`
+      INSERT INTO project_capabilities(
+        project_id, capability_id, enabled, locked_version, locked_hash, configuration_json, enabled_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(project_id, capability_id) DO UPDATE SET enabled = excluded.enabled,
+        locked_version = excluded.locked_version, locked_hash = excluded.locked_hash,
+        configuration_json = excluded.configuration_json,
+        enabled_at = excluded.enabled_at, updated_at = excluded.updated_at
+    `).run(projectId, capabilityId, Number(input.enabled), capability.version, capability.contentHash,
+      JSON.stringify(configuration), input.enabled ? timestamp : null, timestamp);
+    this.writeProjectCapabilityLock(projectId);
+    this.appendEvent('project', projectId, input.enabled ? 'capability.enabled' : 'capability.disabled', 'user',
+      `${input.enabled ? '启用' : '停用'}项目能力 ${capability.name}。`, {
+        capabilityId,
+        kind: capability.kind,
+        version: capability.version,
+        contentHash: capability.contentHash,
+      });
+    this.recordProjectSpaceCommit(project.projectSpacePath,
+      `${input.enabled ? 'feat' : 'chore'}: ${input.enabled ? 'enable' : 'disable'} capability ${capability.name}`);
+    return this.listProjectCapabilities(projectId).find((item) => item.capabilityId === capabilityId) as ProjectCapability;
+  }
+
+  listTaskCapabilitySnapshots(taskId: string): TaskCapabilitySnapshot[] {
+    this.getTask(taskId);
+    return (this.database.prepare(`
+      SELECT * FROM task_capability_snapshots WHERE task_id = ? ORDER BY created_at, step_id, name
+    `).all(taskId) as TaskCapabilityRow[]).map((row) => this.taskCapabilityFromRow(row));
+  }
+
+  prepareTaskCapabilityProjection(
+    taskId: string,
+    executor: TaskCapabilitySnapshot['executor'],
+    runtimeDirectory: string,
+  ): CapabilityProjection {
+    const task = this.getTask(taskId);
+    const snapshots = this.listTaskCapabilitySnapshots(taskId).filter((item) => item.executor === executor);
+    const configDirectory = join(runtimeDirectory, 'capability-config');
+    rmSync(configDirectory, { recursive: true, force: true });
+    mkdirSync(configDirectory, { recursive: true });
+    const skillNames: string[] = [];
+    const mcpNames: string[] = [];
+    const mcpDefinitions: Record<string, Record<string, unknown>> = {};
+    const projectionFiles: string[] = [];
+    try {
+      for (const snapshot of snapshots) {
+        const capability = this.getCapability(snapshot.capabilityId);
+        const managedVersionPath = join(this.workbenchHome, 'capabilities', capability.id, snapshot.contentHash);
+        if (!existsSync(managedVersionPath)) {
+          throw new DomainError('TASK_CAPABILITY_VERSION_MISSING', `任务锁定的能力 ${capability.name} 版本已不可用。`, 409, {
+            expectedHash: snapshot.contentHash,
+            currentHash: capability.contentHash,
+          });
+        }
+        if (snapshot.kind === 'skill') {
+          const frozenFiles = Array.isArray(snapshot.configuration.__yanxuFiles)
+            ? snapshot.configuration.__yanxuFiles.filter((item): item is string => typeof item === 'string')
+            : capability.security.files;
+          const skillRoot = executor === 'opencode'
+            ? join(configDirectory, 'skills', snapshot.name)
+            : join(configDirectory, '.claude', 'skills', snapshot.name);
+          for (const file of frozenFiles) {
+            const sourcePath = join(managedVersionPath, file);
+            const targetPath = join(skillRoot, file);
+            mkdirSync(dirname(targetPath), { recursive: true });
+            copyFileSync(sourcePath, targetPath);
+            projectionFiles.push(relative(configDirectory, targetPath).replaceAll('\\', '/'));
+          }
+          skillNames.push(snapshot.name);
+          this.markTaskCapabilityProjected(snapshot.id, skillRoot);
+          continue;
+        }
+        const normalized = isRecordValue(snapshot.configuration)
+          ? snapshot.configuration
+          : {};
+        mcpDefinitions[snapshot.name] = executor === 'opencode'
+          ? toOpenCodeMcpConfiguration(normalized)
+          : toClaudeMcpConfiguration(normalized);
+        mcpNames.push(snapshot.name);
+      }
+      const skillPermission = Object.fromEntries([
+        ['*', 'deny'],
+        ...skillNames.map((name) => [name, 'allow']),
+      ]);
+      const configPath = executor === 'opencode'
+        ? join(configDirectory, 'opencode.json')
+        : join(configDirectory, '.mcp.json');
+      const registeredMcpNames = [...new Set(this.listCapabilities()
+        .filter((item) => item.kind === 'mcp')
+        .map((item) => item.name))];
+      const config = executor === 'opencode'
+        ? {
+          $schema: 'https://opencode.ai/config.json',
+          mcp: {
+            ...Object.fromEntries(registeredMcpNames
+              .filter((name) => !mcpNames.includes(name))
+              .map((name) => [name, { enabled: false }])),
+            ...mcpDefinitions,
+          },
+          permission: { skill: skillPermission },
+          tools: Object.fromEntries(registeredMcpNames.map((name) => [`${name}_*`, mcpNames.includes(name)])),
+        }
+        : { mcpServers: mcpDefinitions };
+      writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+      projectionFiles.push(relative(configDirectory, configPath).replaceAll('\\', '/'));
+      for (const snapshot of snapshots.filter((item) => item.kind === 'mcp')) {
+        this.markTaskCapabilityProjected(snapshot.id, configPath);
+      }
+      const createdAt = now();
+      const contentHash = sha256(JSON.stringify({
+        taskId,
+        executor,
+        capabilities: snapshots.map((item) => ({ id: item.capabilityId, hash: item.contentHash })),
+        projectionFiles: projectionFiles.sort(),
+      }));
+      const projection: CapabilityProjection = {
+        taskId,
+        executor,
+        configDirectory,
+        configPath,
+        capabilityIds: snapshots.map((item) => item.capabilityId),
+        skillNames,
+        mcpNames,
+        contentHash,
+        createdAt,
+      };
+      writeFileSync(join(configDirectory, 'yanxu-projection.json'), `${JSON.stringify(projection, null, 2)}\n`, { mode: 0o600 });
+      this.appendEvent('task', task.id, 'capability.projected', 'system',
+        `已为 ${executor} 投影 ${snapshots.length} 项任务能力。`, {
+          capabilityIds: projection.capabilityIds,
+          skillNames,
+          mcpNames,
+          contentHash,
+        });
+      return projection;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      for (const snapshot of snapshots) {
+        this.database.prepare(`
+          UPDATE task_capability_snapshots SET status = 'failed', error = ? WHERE id = ?
+        `).run(message, snapshot.id);
+      }
+      throw error;
+    }
+  }
+
+  private insertDiscoveredCapability(capabilityId: string, candidate: DiscoveredCapability, timestamp: string): void {
+    this.database.prepare(`
+      INSERT INTO capabilities(
+        id, origin_key, kind, name, description, source_type, source_scope, source_executor, source_ref, source_version,
+        version, content_hash, compatibility_json, lifecycle_status, parse_status, parse_error, command_status,
+        runtime_health, credential_refs_json, manifest_json, managed_path, security_json,
+        last_discovered_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered', ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
+    `).run(capabilityId, candidate.originKey, candidate.kind, candidate.name, candidate.description,
+      candidate.source.type, candidate.source.scope, candidate.source.executor, candidate.source.ref, candidate.source.version,
+      candidate.version, candidate.contentHash, JSON.stringify(candidate.compatibility), candidate.parseStatus,
+      candidate.parseError, candidate.commandStatus, candidate.runtimeHealth, JSON.stringify(candidate.credentialRefs),
+      JSON.stringify(candidate.manifest), JSON.stringify(candidate.security), timestamp, timestamp, timestamp);
+  }
+
+  private updateDiscoveredCapability(capabilityId: string, candidate: DiscoveredCapability, timestamp: string): void {
+    const existing = this.getCapability(capabilityId);
+    const contentChanged = existing.contentHash !== candidate.contentHash;
+    this.database.prepare(`
+      UPDATE capabilities SET kind = ?, name = ?, description = ?, source_type = ?, source_scope = ?,
+        source_executor = ?, source_ref = ?, source_version = ?, version = ?, content_hash = ?, compatibility_json = ?,
+        lifecycle_status = ?, parse_status = ?, parse_error = ?, command_status = ?, runtime_health = ?,
+        credential_refs_json = ?, manifest_json = ?, managed_path = ?, security_json = ?, last_discovered_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(candidate.kind, candidate.name, candidate.description, candidate.source.type, candidate.source.scope,
+      candidate.source.executor, candidate.source.ref, candidate.source.version, candidate.version, candidate.contentHash,
+      JSON.stringify(candidate.compatibility), contentChanged ? 'discovered' : existing.lifecycleStatus,
+      candidate.parseStatus, candidate.parseError, candidate.commandStatus,
+      contentChanged ? candidate.runtimeHealth : existing.runtimeHealth,
+      JSON.stringify(candidate.credentialRefs), JSON.stringify(candidate.manifest),
+      contentChanged ? null : existing.managedPath, JSON.stringify(candidate.security), timestamp, timestamp, capabilityId);
+  }
+
+  private capabilityFromRow(row: CapabilityRow): Capability {
+    return {
+      id: row.id,
+      originKey: row.origin_key,
+      kind: row.kind,
+      name: row.name,
+      description: row.description,
+      source: {
+        type: row.source_type,
+        scope: row.source_scope,
+        executor: row.source_executor,
+        ref: row.source_ref,
+        version: row.source_version,
+      },
+      version: row.version,
+      contentHash: row.content_hash,
+      compatibility: parseJson(row.compatibility_json, []),
+      lifecycleStatus: row.lifecycle_status,
+      parseStatus: row.parse_status,
+      parseError: row.parse_error,
+      commandStatus: row.command_status,
+      runtimeHealth: row.runtime_health,
+      credentialRefs: parseJson(row.credential_refs_json, []),
+      manifest: parseJson(row.manifest_json, {}),
+      managedPath: row.managed_path,
+      security: parseJson(row.security_json, {
+        files: [], scripts: [], executableFiles: [], networkHosts: [], environmentKeys: [], headerKeys: [], containsLiteralSecrets: false,
+      }),
+      lastDiscoveredAt: row.last_discovered_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private roleTemplateFromRow(row: RoleTemplateRow): RoleTemplate {
+    return {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      responsibilities: parseJson(row.responsibilities_json, []),
+      skillIds: [],
+      defaultPermissions: parseJson(row.default_permissions_json, []),
+      version: row.version,
+      origin: 'external',
+      lifecycleStatus: row.lifecycle_status,
+      parseStatus: row.parse_status,
+      parseError: row.parse_error,
+      instructions: row.instructions,
+      capabilityIds: parseJson(row.capability_ids_json, []),
+      dependencyNames: parseJson(row.dependency_names_json, []),
+      compatibility: parseJson(row.compatibility_json, []),
+      source: {
+        type: row.source_type,
+        scope: row.source_scope,
+        executor: row.source_executor,
+        ref: row.source_ref,
+        version: row.source_version,
+      },
+      contentHash: row.content_hash,
+      format: row.format,
+      managedPath: row.managed_path,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private taskCapabilityFromRow(row: TaskCapabilityRow): TaskCapabilitySnapshot {
+    return {
+      id: row.id,
+      taskId: row.task_id,
+      stepId: row.step_id,
+      agentId: row.agent_id,
+      capabilityId: row.capability_id,
+      kind: row.kind,
+      name: row.name,
+      version: row.version,
+      contentHash: row.content_hash,
+      executor: row.executor,
+      configuration: parseJson(row.configuration_json, {}),
+      projectionPath: row.projection_path,
+      status: row.status,
+      error: row.error,
+      createdAt: row.created_at,
+    };
+  }
+
+  private markTaskCapabilityProjected(snapshotId: string, projectionPath: string): void {
+    this.database.prepare(`
+      UPDATE task_capability_snapshots SET status = 'projected', projection_path = ?, error = NULL WHERE id = ?
+    `).run(projectionPath, snapshotId);
+  }
+
+  private writeProjectCapabilityLock(projectId: string): void {
+    const project = this.getProject(projectId);
+    const capabilities = this.listProjectCapabilities(projectId).map((item) => ({
+      capabilityId: item.capabilityId,
+      name: item.capability.name,
+      kind: item.capability.kind,
+      enabled: item.enabled,
+      version: item.lockedVersion,
+      contentHash: item.lockedHash,
+      compatibility: item.capability.compatibility,
+      source: item.capability.source,
+      configuration: item.configuration,
+      credentialRefs: item.capability.credentialRefs,
+      updatedAt: item.updatedAt,
+    }));
+    const updatedAt = now();
+    const artifact = writeVersionedArtifact(project.projectSpacePath, 'capabilities/lock.json', `${JSON.stringify({
+      projectId,
+      updatedAt,
+      capabilities,
+    }, null, 2)}\n`);
+    this.database.prepare(`
+      INSERT INTO project_capability_locks(project_id, artifact_path, content_hash, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(project_id) DO UPDATE SET artifact_path = excluded.artifact_path,
+        content_hash = excluded.content_hash, updated_at = excluded.updated_at
+    `).run(projectId, artifact.path, artifact.hash, updatedAt);
+  }
+
+  private freezeTaskCapabilities(
+    task: Task,
+    plan: TaskPlan,
+    agents: AgentProfile[],
+    createdAt: string,
+  ): TaskCapabilitySnapshot[] {
+    const enabled = new Map(this.listProjectCapabilities(task.projectId)
+      .filter((item) => item.enabled)
+      .map((item) => [item.capabilityId, item]));
+    const agentsById = new Map(agents.map((agent) => [agent.id, agent]));
+    const snapshots: TaskCapabilitySnapshot[] = [];
+    for (const step of plan.steps) {
+      const agent = step.agentId ? agentsById.get(step.agentId) : null;
+      if (!agent) continue;
+      for (const capabilityId of [...new Set(step.capabilityIds ?? [])]) {
+        const projectCapability = enabled.get(capabilityId);
+        if (!projectCapability) {
+          throw new DomainError('TASK_CAPABILITY_NOT_ENABLED', `执行单元“${step.title}”使用了未在项目启用的能力。`, 422, {
+            stepId: step.id,
+            capabilityId,
+          });
+        }
+        const capability = projectCapability.capability;
+        if (!capability.compatibility.includes(agent.executor)) {
+          throw new DomainError('TASK_CAPABILITY_INCOMPATIBLE', `能力 ${capability.name} 与 ${agent.executor} 不兼容。`, 422, {
+            stepId: step.id,
+            capabilityId,
+            executor: agent.executor,
+          });
+        }
+        const missingCredentials = capability.credentialRefs.filter((name) => !process.env[name]);
+        if (missingCredentials.length > 0) {
+          throw new DomainError('TASK_CAPABILITY_CREDENTIALS_MISSING', `能力 ${capability.name} 缺少本地凭据引用。`, 422, {
+            capabilityId,
+            missingCredentials,
+          });
+        }
+        const managedVersionPath = join(this.workbenchHome, 'capabilities', capability.id, projectCapability.lockedHash);
+        if (!existsSync(managedVersionPath)) {
+          throw new DomainError('TASK_CAPABILITY_VERSION_MISSING', `项目锁定的能力 ${capability.name} 版本尚未安装或已丢失。`, 409, {
+            capabilityId,
+            lockedHash: projectCapability.lockedHash,
+          });
+        }
+        snapshots.push({
+          id: id('taskcap'),
+          taskId: task.id,
+          stepId: step.id,
+          agentId: agent.id,
+          capabilityId,
+          kind: capability.kind,
+          name: capability.name,
+          version: projectCapability.lockedVersion,
+          contentHash: projectCapability.lockedHash,
+          executor: agent.executor,
+          configuration: capability.kind === 'skill'
+            ? {
+              ...projectCapability.configuration,
+              __yanxuFiles: capability.security.files,
+              __yanxuManifest: capability.manifest,
+            }
+            : projectCapability.configuration,
+          projectionPath: null,
+          status: 'frozen',
+          error: null,
+          createdAt,
+        });
+      }
+    }
+    return snapshots;
+  }
+
+  private persistTaskCapabilitySnapshots(taskId: string, snapshots: TaskCapabilitySnapshot[]): void {
+    this.database.prepare('DELETE FROM task_capability_snapshots WHERE task_id = ?').run(taskId);
+    const insert = this.database.prepare(`
+      INSERT INTO task_capability_snapshots(
+        id, task_id, step_id, agent_id, capability_id, kind, name, version, content_hash,
+        executor, configuration_json, projection_path, status, error, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const snapshot of snapshots) {
+      insert.run(snapshot.id, snapshot.taskId, snapshot.stepId, snapshot.agentId, snapshot.capabilityId,
+        snapshot.kind, snapshot.name, snapshot.version, snapshot.contentHash, snapshot.executor,
+        JSON.stringify(snapshot.configuration), snapshot.projectionPath, snapshot.status, snapshot.error, snapshot.createdAt);
+    }
   }
 
   getProjectSettings(projectId: string): ProjectSettings {
@@ -592,7 +1617,10 @@ export class YanxuStore {
       UNION ALL
       SELECT 'project_settings', s.project_id, s.artifact_path, s.content_hash
       FROM project_settings s WHERE s.project_id = ?
-    `).all(projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId) as Array<{
+      UNION ALL
+      SELECT 'capability_lock', l.project_id, l.artifact_path, l.content_hash
+      FROM project_capability_locks l WHERE l.project_id = ?
+    `).all(projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId, projectId) as Array<{
       entity_type: ProjectSpaceIntegrityReport['issues'][number]['entityType'];
       entity_id: string;
       artifact_path: string;
@@ -867,41 +1895,62 @@ export class YanxuStore {
   }
 
   createAgent(input: CreateAgentInput, installation: ExecutorInstallation | undefined): AgentProfile {
-    if (!builtinRoles.some((role) => role.id === input.roleId)) throw new DomainError('ROLE_NOT_FOUND', '所选 Role 不存在。', 422);
+    const role = this.getRoleTemplate(input.roleId);
+    if (role.lifecycleStatus === 'draft') throw new DomainError('ROLE_NOT_INSTALLED', '外部 Role 必须先完成审查并安装。', 422);
+    if (!role.compatibility.includes(input.executor)) throw new DomainError('ROLE_EXECUTOR_INCOMPATIBLE', '所选 Role 与该 CLI 不兼容。', 422);
     if (!installation || installation.health !== 'available') throw new DomainError('EXECUTOR_UNAVAILABLE', '所选 CLI 当前不可用，请先在设置中检测。', 422);
-    if (installation.models.length > 0 && !installation.models.includes(input.model)) {
+    if (installation.id === 'opencode' && installation.models.length > 0 && !installation.models.includes(input.model)) {
       throw new DomainError('MODEL_UNAVAILABLE', '所选模型不在 CLI 当前可用模型中。', 422);
     }
+    const defaultCapabilityIds = this.validateAgentDefaultCapabilities(input.defaultCapabilityIds ?? [], input.executor);
     const timestamp = now();
     const agentId = id('agent');
     this.database.prepare(`
-      INSERT INTO agent_profiles(id, name, role_id, executor, model, parameters_json, permission_mode, status, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
-    `).run(agentId, input.name.trim(), input.roleId, input.executor, input.model, JSON.stringify(input.parameters ?? {}), input.permissionMode ?? 'standard', timestamp, timestamp);
+      INSERT INTO agent_profiles(id, name, role_id, executor, model, parameters_json, default_capability_ids_json, permission_mode, status, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    `).run(agentId, input.name.trim(), input.roleId, input.executor, input.model, JSON.stringify(input.parameters ?? {}),
+      JSON.stringify(defaultCapabilityIds), input.permissionMode ?? 'standard', timestamp, timestamp);
     this.appendEvent('agent', agentId, 'agent.created', 'user', `创建 AI 人员 ${input.name.trim()}。`, { roleId: input.roleId, executor: input.executor });
     return this.getAgent(agentId);
   }
 
   updateAgent(agentId: string, input: CreateAgentInput, installation: ExecutorInstallation | undefined): AgentProfile {
     this.getAgent(agentId);
-    if (!builtinRoles.some((role) => role.id === input.roleId)) throw new DomainError('ROLE_NOT_FOUND', '所选 Role 不存在。', 422);
+    const role = this.getRoleTemplate(input.roleId);
+    if (role.lifecycleStatus === 'draft') throw new DomainError('ROLE_NOT_INSTALLED', '外部 Role 必须先完成审查并安装。', 422);
+    if (!role.compatibility.includes(input.executor)) throw new DomainError('ROLE_EXECUTOR_INCOMPATIBLE', '所选 Role 与该 CLI 不兼容。', 422);
     if (!installation || installation.health !== 'available') throw new DomainError('EXECUTOR_UNAVAILABLE', '所选 CLI 当前不可用，请先在设置中检测。', 422);
-    if (installation.models.length > 0 && !installation.models.includes(input.model)) {
+    if (installation.id === 'opencode' && installation.models.length > 0 && !installation.models.includes(input.model)) {
       throw new DomainError('MODEL_UNAVAILABLE', '所选模型不在 CLI 当前可用模型中。', 422);
     }
+    const defaultCapabilityIds = this.validateAgentDefaultCapabilities(input.defaultCapabilityIds ?? [], input.executor);
     const timestamp = now();
     this.database.prepare(`
       UPDATE agent_profiles
-      SET name = ?, role_id = ?, executor = ?, model = ?, parameters_json = ?, permission_mode = ?, updated_at = ?
+      SET name = ?, role_id = ?, executor = ?, model = ?, parameters_json = ?, default_capability_ids_json = ?, permission_mode = ?, updated_at = ?
       WHERE id = ?
     `).run(input.name.trim(), input.roleId, input.executor, input.model, JSON.stringify(input.parameters ?? {}),
-      input.permissionMode ?? 'standard', timestamp, agentId);
+      JSON.stringify(defaultCapabilityIds), input.permissionMode ?? 'standard', timestamp, agentId);
     this.appendEvent('agent', agentId, 'agent.updated', 'user', `更新 AI 人员 ${input.name.trim()}。`, {
       roleId: input.roleId,
       executor: input.executor,
       model: input.model,
     });
     return this.getAgent(agentId);
+  }
+
+  private validateAgentDefaultCapabilities(capabilityIds: string[], executor: AgentProfile['executor']): string[] {
+    const uniqueIds = [...new Set(capabilityIds)];
+    for (const capabilityId of uniqueIds) {
+      const capability = this.getCapability(capabilityId);
+      if (capability.lifecycleStatus !== 'installed' || capability.parseStatus !== 'valid') {
+        throw new DomainError('AGENT_CAPABILITY_NOT_INSTALLED', `默认能力 ${capability.name} 尚未完成安装。`, 422, { capabilityId });
+      }
+      if (!capability.compatibility.includes(executor)) {
+        throw new DomainError('AGENT_CAPABILITY_INCOMPATIBLE', `默认能力 ${capability.name} 与 ${executor} 不兼容。`, 422, { capabilityId, executor });
+      }
+    }
+    return uniqueIds;
   }
 
   setAgentStatus(agentId: string, status: AgentProfile['status']): AgentProfile {
@@ -990,8 +2039,8 @@ export class YanxuStore {
     this.database.transaction(() => {
       this.database.prepare(`
         INSERT INTO tasks(id, project_id, team_id, title, description, expected_output, constraints_text, forbidden_paths_json,
-          status, state_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', 0, ?, ?)
+          status, state_version, flow_version, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', 0, 2, ?, ?)
       `).run(taskId, input.projectId, input.teamId, input.title.trim(), input.description.trim(), input.expectedOutput?.trim() ?? '',
         input.constraints?.trim() ?? '', JSON.stringify(input.forbiddenPaths ?? []), timestamp, timestamp);
       this.appendEvent('task', taskId, 'task.created', 'user', '保存任务草稿。', {
@@ -1170,6 +2219,7 @@ export class YanxuStore {
       }
       this.database.prepare(`INSERT INTO plans(id, task_id, version, content_json, artifact_path, content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`)
         .run(plan.id, taskId, plan.version, JSON.stringify(plan), artifact.path, artifact.hash, plan.createdAt);
+      this.database.prepare('UPDATE tasks SET flow_version = ? WHERE id = ?').run(plan.flowVersion ?? 1, taskId);
       const insertPreApprovalArtifact = this.database.prepare(`
         INSERT INTO preapproval_artifact_versions(
           id, task_id, plan_id, artifact_type, title, version, status, artifact_path,
@@ -1295,7 +2345,7 @@ export class YanxuStore {
     const snapshot = this.getRunSnapshot(taskId);
     if (!snapshot) throw new DomainError('RUN_SNAPSHOT_REQUIRED', '构建上下文前必须存在已确认运行快照。', 409);
     const currentStep = task.steps.find((step) => step.id === stepId);
-    if (!currentStep) throw new DomainError('STEP_NOT_FOUND', '当前 SkillStep 不存在。', 404);
+    if (!currentStep) throw new DomainError('STEP_NOT_FOUND', '当前执行单元不存在。', 404);
     const previousStepIds = new Set(task.steps.filter((step) => step.position < currentStep.position).map((step) => step.id));
     let remainingCharacters = 64_000;
     let truncated = false;
@@ -1310,9 +2360,53 @@ export class YanxuStore {
         return { ...artifact, content };
       })
       .filter((artifact) => artifact.content.length > 0);
+    const resultRows = this.database.prepare(`
+      SELECT s.step_id, s.agent_id, s.external_session_id, s.result_path, ts.title, ts.position
+      FROM agent_sessions s
+      JOIN task_steps ts ON ts.id = s.step_id
+      WHERE s.task_id = ? AND ts.position < ? AND ts.status = 'succeeded'
+        AND s.status = 'succeeded' AND s.result_path IS NOT NULL
+      ORDER BY ts.position, s.started_at DESC
+    `).all(taskId, currentStep.position) as Array<{
+      step_id: string;
+      agent_id: string | null;
+      external_session_id: string | null;
+      result_path: string;
+      title: string;
+      position: number;
+    }>;
+    const seenResultSteps = new Set<string>();
+    const upstreamResults = resultRows.filter((row) => {
+      if (seenResultSteps.has(row.step_id)) return false;
+      seenResultSteps.add(row.step_id);
+      return true;
+    }).map((row) => {
+      const raw = readArtifactContent(row.result_path);
+      const envelope = parseJson<Record<string, unknown>>(raw, {});
+      const result = envelope.result && typeof envelope.result === 'object'
+        ? envelope.result as Record<string, unknown>
+        : {};
+      const strings = (value: unknown): string[] => Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string')
+        : [];
+      return {
+        stepId: row.step_id,
+        title: row.title,
+        agentId: row.agent_id,
+        externalSessionId: row.external_session_id,
+        summary: typeof result.summary === 'string' ? result.summary : '',
+        issues: strings(result.issues),
+        assumptions: strings(result.assumptions),
+        reportedChecks: strings(result.reportedChecks),
+        findings: Array.isArray(result.findings) ? result.findings as ReviewFinding[] : [],
+        resultPath: row.result_path,
+        contentHash: sha256(raw),
+      };
+    });
     const queryText = [
       task.title, task.description, currentStep.title, currentStep.description,
       ...currentStep.inputs, ...upstreamArtifacts.map((artifact) => `${artifact.title} ${artifact.content.slice(0, 1_000)}`),
+      ...upstreamResults.map((result) => `${result.title} ${result.summary} ${result.issues.join(' ')}`),
     ].join(' ');
     const failedGateRows = this.database.prepare(`
       SELECT * FROM gate_attempts
@@ -1349,7 +2443,8 @@ export class YanxuStore {
       return { id: item.id, category: item.category, title: item.title, content, version: item.version };
     }).filter((item) => item.content.length > 0);
     const recentEvidence = this.listEvents(taskId).filter((event) =>
-      ['skill_step.succeeded', 'skill_step.failed', 'quality_gate.completed', 'job.retry_scheduled', 'task.retrying',
+      ['skill_step.succeeded', 'skill_step.failed', 'work_unit.succeeded', 'work_unit.changes_required', 'work_unit.blocked',
+        'quality_gate.completed', 'job.retry_scheduled', 'task.retrying',
         'skill_step.changes_required', 'skill_step.blocked', 'plan.recomposed', 'permission.responded',
         'scope.change_detected'].includes(event.type),
     ).slice(-12);
@@ -1366,6 +2461,13 @@ export class YanxuStore {
         title: artifact.title,
         hash: artifact.contentHash,
         characters: artifact.content.length,
+      })),
+      ...upstreamResults.map((result) => ({
+        type: 'result' as const,
+        id: result.stepId,
+        title: `${result.title} · 执行结果`,
+        hash: result.contentHash,
+        characters: JSON.stringify(result).length,
       })),
       ...projectKnowledge.map((item) => ({
         type: 'knowledge' as const,
@@ -1405,6 +2507,7 @@ export class YanxuStore {
       plan: snapshot.plan,
       currentStep,
       upstreamArtifacts,
+      upstreamResults,
       projectKnowledge,
       directories: snapshot.directories.filter((directory) => currentStep.directoryIds.includes(directory.id)),
       recentEvidence,
@@ -1657,9 +2760,17 @@ export class YanxuStore {
     }
     const project = this.getProject(task.projectId);
     const stepAssignments = new Map(input.stepAssignments?.map((item) => [item.stepId, item.agentId]) ?? []);
+    const stepCapabilities = new Map(input.stepCapabilities?.map((item) => [item.stepId, item.capabilityIds]) ?? []);
+    const planStepIds = new Set(task.plan.steps.map((step) => step.id));
+    for (const stepId of [...stepAssignments.keys(), ...stepCapabilities.keys()]) {
+      if (!planStepIds.has(stepId)) throw new DomainError('PLAN_STEP_UNKNOWN', '计划修订引用了不存在的执行单元。', 422, { stepId });
+    }
     const nextSteps = task.plan.steps.map((step) => ({
       ...step,
       agentId: stepAssignments.has(step.id) ? stepAssignments.get(step.id) ?? null : step.agentId,
+      capabilityIds: stepCapabilities.has(step.id)
+        ? [...new Set(stepCapabilities.get(step.id) ?? [])]
+        : (step.capabilityIds ?? []),
     }));
     this.validatePlanSteps(task, project, nextSteps);
     const nextRoutes = input.branchRoutes
@@ -1739,7 +2850,13 @@ export class YanxuStore {
     return this.getTask(taskId);
   }
 
-  commandTask(taskId: string, command: TaskCommand, stateVersion: number, reason?: string): Task {
+  commandTask(
+    taskId: string,
+    command: TaskCommand,
+    stateVersion: number,
+    reason?: string,
+    executorInstallations: ExecutorInstallation[] = [],
+  ): Task {
     const task = this.validateTaskCommand(taskId, command, stateVersion);
     if (command === 'resume') return this.resumeTask(task, reason);
     const correction = command === 'reopen' ? reason?.trim() : undefined;
@@ -1783,13 +2900,13 @@ export class YanxuStore {
     if (command === 'confirm') {
       const uncovered = task.steps.filter((step) => !step.agentId);
       if (uncovered.length > 0) {
-        throw new DomainError('TEAM_SKILL_GAP', '当前团队无法覆盖计划中的全部 Skill，请完善团队或请求修改计划。', 422, {
-          skills: uncovered.map((step) => step.skillId),
+        throw new DomainError('TEAM_ASSIGNMENT_GAP', '计划中仍有执行单元未分配人员，请调整团队或修改计划。', 422, {
+          steps: uncovered.map((step) => step.title),
         });
       }
     }
     const next = transitionTask(task.status, command);
-    const snapshot = command === 'confirm' ? this.buildRunSnapshot(task) : null;
+    const snapshot = command === 'confirm' ? this.buildRunSnapshot(task, executorInstallations) : null;
     const requirementRevision = correction ? this.prepareRequirementRevision(task, correction) : null;
     this.database.transaction(() => {
       if (command === 'confirm' && task.plan) {
@@ -1807,6 +2924,7 @@ export class YanxuStore {
         this.database.prepare('UPDATE tasks SET auto_replan_count = 0 WHERE id = ?').run(taskId);
       }
       if (snapshot) {
+        this.persistTaskCapabilitySnapshots(taskId, snapshot.capabilities ?? []);
         this.database.prepare(`
           INSERT INTO run_snapshots(
             id, task_id, plan_id, plan_version, content_json, content_hash, artifact_path, created_at
@@ -2562,7 +3680,7 @@ export class YanxuStore {
     }
     const nextPending = task.steps.find((step) => step.status === 'pending');
     if (!nextPending) {
-      throw new DomainError('NEXT_SKILL_STEP_NOT_FOUND', '工作区已准备，但任务没有可执行的 SkillStep。', 409);
+      throw new DomainError('NEXT_EXECUTION_UNIT_NOT_FOUND', '工作区已准备，但任务没有可执行的执行单元。', 409);
     }
     const planVersion = task.snapshot?.planVersion ?? task.plan?.version ?? 0;
     const runJobDedupeKey = `task:${taskId}:plan:${planVersion}:step:${nextPending.id}:attempt:${nextPending.attempt + 1}`;
@@ -2607,7 +3725,7 @@ export class YanxuStore {
 
   startOrResumeStep(taskId: string): TaskStep {
     const task = this.getTask(taskId);
-    if (!['RUNNING', 'RETRYING'].includes(task.status)) throw new DomainError('STEP_STATE_INVALID', '任务当前不能执行 SkillStep。', 409);
+    if (!['RUNNING', 'RETRYING'].includes(task.status)) throw new DomainError('STEP_STATE_INVALID', '任务当前状态不能执行工作单元。', 409);
     const running = task.steps.find((step) => step.status === 'running');
     if (running) {
       const activeSession = this.database.prepare(`
@@ -2627,13 +3745,13 @@ export class YanxuStore {
       return this.getTask(taskId).steps.find((item) => item.id === running.id) ?? running;
     }
     const step = task.steps.find((item) => item.status === 'pending');
-    if (!step) throw new DomainError('STEP_NOT_FOUND', '没有待执行的 SkillStep。', 409);
+    if (!step) throw new DomainError('STEP_NOT_FOUND', '没有待执行的执行单元。', 409);
     this.database.transaction(() => {
       this.database.prepare(`
         UPDATE task_steps SET status = 'running', attempt = attempt + 1, started_at = COALESCE(started_at, ?) WHERE id = ? AND status = 'pending'
       `).run(now(), step.id);
       this.database.prepare('UPDATE tasks SET active_step_id = ?, updated_at = ? WHERE id = ?').run(step.id, now(), taskId);
-      this.appendEvent('task', taskId, 'skill_step.started', 'scheduler', `开始执行 ${step.title}。`, { stepId: step.id, skillId: step.skillId, attempt: step.attempt + 1 });
+      this.appendEvent('task', taskId, step.kind === 'work_unit' ? 'work_unit.started' : 'skill_step.started', 'scheduler', `开始执行 ${step.title}。`, { stepId: step.id, skillId: step.skillId, attempt: step.attempt + 1 });
     })();
     return this.getTask(taskId).steps.find((item) => item.id === step.id) ?? step;
   }
@@ -2645,6 +3763,18 @@ export class YanxuStore {
       VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
     `).run(sessionId, taskId, step.id, agent.id, agent.executor, agent.model, now());
     return sessionId;
+  }
+
+  getResumableExternalSession(taskId: string, agentId: string): string | null {
+    const row = this.database.prepare(`
+      SELECT external_session_id
+      FROM agent_sessions
+      WHERE task_id = ? AND agent_id = ? AND external_session_id IS NOT NULL
+        AND status IN ('succeeded', 'failed', 'interrupted')
+      ORDER BY started_at DESC
+      LIMIT 1
+    `).get(taskId, agentId) as { external_session_id: string } | undefined;
+    return row?.external_session_id ?? null;
   }
 
   recordExternalSessionId(sessionRecordId: string, externalSessionId: string): void {
@@ -2682,9 +3812,9 @@ export class YanxuStore {
   ): Task {
     const task = this.getTask(taskId);
     const step = task.steps.find((item) => item.id === stepId);
-    if (!step || step.status !== 'running') throw new DomainError('STEP_STATE_INVALID', 'SkillStep 已不在运行状态。', 409);
+    if (!step || step.status !== 'running') throw new DomainError('STEP_STATE_INVALID', '执行单元已不在运行状态。', 409);
     const project = this.getProject(task.projectId);
-    if (result.artifacts.length === 0) {
+    if (step.kind !== 'work_unit' && result.artifacts.length === 0) {
       throw new DomainError('SKILL_ARTIFACT_REQUIRED', `${step.title} 没有返回可供后续步骤消费的结构化产物。`, 422);
     }
     const artifactVersions = result.artifacts.map((output) => this.prepareArtifactVersion(
@@ -2693,7 +3823,7 @@ export class YanxuStore {
       sessionRecordId,
       output,
     ));
-    const designedQualityGates = this.prepareDesignedQualityGates(task, step, result.artifacts);
+    const designedQualityGates = step.kind === 'work_unit' ? [] : this.prepareDesignedQualityGates(task, step, result.artifacts);
     const changeManifests = checkpoints.map((checkpoint) => this.prepareChangeManifest(task, step, checkpoint));
     const resultArtifact = writeVersionedArtifact(
       project.projectSpacePath,
@@ -2797,7 +3927,7 @@ export class YanxuStore {
         UPDATE agent_sessions SET external_session_id = ?, status = 'succeeded', result_path = ?, completed_at = ? WHERE id = ?
       `).run(externalSessionId, resultArtifact.path, now(), sessionRecordId);
       this.database.prepare('UPDATE tasks SET active_step_id = NULL WHERE id = ?').run(taskId);
-      this.appendEvent('task', taskId, 'skill_step.succeeded', 'executor', `${step.title} 已完成。`, {
+      this.appendEvent('task', taskId, step.kind === 'work_unit' ? 'work_unit.succeeded' : 'skill_step.succeeded', 'executor', `${step.title} 已完成。`, {
         stepId,
         skillId: step.skillId,
         artifactVersions: artifactVersions.map((artifact) => ({
@@ -2825,7 +3955,8 @@ export class YanxuStore {
       if (task.status === 'PAUSED') return;
       const nextPending = task.steps.find((item) => item.status === 'pending' && item.id !== stepId);
       const gatesRequiredBeforeNextStep = !this.requiredGatesSatisfied(task)
-        && (!nextPending || nextPending.skillId === 'delivery-review');
+        && (!nextPending || nextPending.skillId === 'delivery-review'
+          || (nextPending.kind === 'work_unit' && nextPending.requiresIndependentSession));
       if (gatesRequiredBeforeNextStep) {
         this.updateTaskState(taskId, task.stateVersion, 'VALIDATING', 'quality_gate.started', '开始运行独立质量门禁。');
         this.enqueueJobOrAssertRunnable(
@@ -2843,7 +3974,7 @@ export class YanxuStore {
           70,
         );
       } else {
-        this.updateTaskState(taskId, task.stateVersion, 'DELIVERED', 'task.delivered', '全部 SkillStep 与质量门禁已完成，等待交付确认。');
+        this.updateTaskState(taskId, task.stateVersion, 'DELIVERED', 'task.delivered', '全部执行单元与质量门禁已完成，等待交付确认。');
       }
     })();
     this.recordProjectSpaceCommit(project.projectSpacePath, `docs: record ${step.skillId} result for ${taskId}`, taskId);
@@ -2868,7 +3999,7 @@ export class YanxuStore {
   ): Task {
     const task = this.getTask(taskId);
     const step = task.steps.find((item) => item.id === stepId);
-    if (!step || step.status !== 'running') throw new DomainError('STEP_STATE_INVALID', 'SkillStep 已不在运行状态。', 409);
+    if (!step || step.status !== 'running') throw new DomainError('STEP_STATE_INVALID', '执行单元已不在运行状态。', 409);
     const project = this.getProject(task.projectId);
     const artifactVersions = result.artifacts.map((output) => this.prepareArtifactVersion(task, step, sessionRecordId, output));
     const resultArtifact = writeVersionedArtifact(
@@ -2876,7 +4007,10 @@ export class YanxuStore {
       `tasks/${taskId}/steps/${step.position + 1}-${step.skillId}/attempt-${step.attempt}-${result.status}.json`,
       `${JSON.stringify({ result, artifactVersions }, null, 2)}\n`,
     );
-    const implementationStep = task.steps.find((item) => item.skillId === 'implementation' && item.position < step.position);
+    const implementationStep = task.flowVersion === 2
+      ? task.steps.filter((item) => item.kind === 'work_unit' && item.mode === 'write' && item.position < step.position)
+        .sort((left, right) => right.position - left.position)[0]
+      : task.steps.find((item) => item.skillId === 'implementation' && item.position < step.position);
     const precedingProducerStep = task.steps
       .filter((item) => item.position < step.position && item.position < 1000 && item.skillId !== 'delivery-review')
       .sort((left, right) => right.position - left.position)[0];
@@ -2935,7 +4069,9 @@ export class YanxuStore {
       this.appendEvent(
         'task',
         taskId,
-        result.status === 'blocked' ? 'skill_step.blocked' : 'skill_step.changes_required',
+        result.status === 'blocked'
+          ? (step.kind === 'work_unit' ? 'work_unit.blocked' : 'skill_step.blocked')
+          : (step.kind === 'work_unit' ? 'work_unit.changes_required' : 'skill_step.changes_required'),
         'executor',
         result.status === 'blocked'
           ? `${step.title} 判定当前任务无法安全继续。`
@@ -2968,7 +4104,9 @@ export class YanxuStore {
           `${step.title} 要求整改，带着评审证据重新执行 ${correctionStep.title}。`, {
             stepId,
             correctionStepId: correctionStep.id,
-            implementationStepId: correctionStep.skillId === 'implementation' ? correctionStep.id : undefined,
+            implementationStepId: correctionStep.skillId === 'implementation' || correctionStep.kind === 'work_unit'
+              ? correctionStep.id
+              : undefined,
             issues: result.issues ?? [],
           });
         this.enqueueJobOrAssertRunnable(
@@ -3120,11 +4258,14 @@ export class YanxuStore {
 
   retryAfterGateFailure(taskId: string, retryLimit: number): Task {
     const task = this.getTask(taskId);
-    const implementationStep = task.steps.find((step) => step.skillId === 'implementation');
+    const implementationStep = task.flowVersion === 2
+      ? task.steps.filter((step) => step.kind === 'work_unit' && step.mode === 'write' && step.status === 'succeeded')
+        .sort((left, right) => right.position - left.position)[0]
+      : task.steps.find((step) => step.skillId === 'implementation');
     if (!implementationStep) {
       return this.requestAutomaticReplan(
         taskId,
-        '质量门禁失败，但当前计划没有可执行修复的实施步骤。请在原目标、成功标准、目录和权限边界内重新组合步骤。',
+        '质量门禁失败，但当前计划没有可执行修复的写入单元。请在原目标、成功标准、目录和权限边界内重新组合执行单元。',
         'gate_failure_without_implementation',
         true,
       );
@@ -3162,7 +4303,10 @@ export class YanxuStore {
       return this.getTask(taskId);
     }
     const activePosition = task.steps.find((step) => step.status === 'running')?.position
-      ?? task.steps.find((step) => step.skillId === 'implementation')?.position
+      ?? (task.flowVersion === 2
+        ? task.steps.filter((step) => step.kind === 'work_unit' && step.mode === 'write')
+          .sort((left, right) => right.position - left.position)[0]?.position
+        : task.steps.find((step) => step.skillId === 'implementation')?.position)
       ?? task.steps.find((step) => step.status === 'pending')?.position
       ?? 0;
     this.database.transaction(() => {
@@ -3311,6 +4455,7 @@ export class YanxuStore {
     const gates = this.database.prepare(`SELECT gate_id, command, status, exit_code, log_path FROM gate_results WHERE task_id = ?`).all(taskId);
     const evidence = this.getTaskEvidence(taskId);
     const diagnostics = this.getTaskDiagnostics(taskId);
+    const capabilities = this.listTaskCapabilitySnapshots(taskId);
     const report = {
       taskId, title: task.title, goal: task.plan?.goal ?? task.description, status: task.status,
       workspaces: workspaces.map((workspace) => ({ directoryId: workspace.directoryId, taskBranch: workspace.taskBranch, targetBranch: workspace.targetBranch, path: workspace.workspacePath })),
@@ -3318,6 +4463,7 @@ export class YanxuStore {
       gates,
       qualitySummary: evidence.qualitySummary,
       diagnostics,
+      capabilities,
       evidence: {
         requirementVersions: evidence.requirementVersions,
         preApprovalArtifacts: evidence.preApprovalArtifacts,
@@ -3352,6 +4498,13 @@ ${evidence.artifacts.length
     ? evidence.artifacts.map((artifact) =>
       `- ${artifact.title} · ${artifact.artifactType} v${artifact.version} · \`${artifact.contentHash.slice(0, 16)}\``).join('\n')
     : '- 无'}
+
+## 任务装载能力
+
+${capabilities.length
+    ? capabilities.map((capability) =>
+      `- ${capability.name} · ${capability.kind.toUpperCase()} · ${capability.executor} · ${capability.version} · \`${capability.contentHash.slice(0, 16)}\` · ${capability.status}`).join('\n')
+    : '- 本任务未装载外部 Skill/MCP'}
 
 ## 实际变更
 
@@ -3839,8 +4992,8 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     return recovered;
   }
 
-  getBuiltins(): { roles: typeof builtinRoles; skills: typeof builtinSkills } {
-    return { roles: builtinRoles, skills: builtinSkills };
+  getBuiltins(): { roles: RoleTemplate[]; skills: typeof builtinSkills } {
+    return { roles: this.listRoleTemplates(false), skills: builtinSkills };
   }
 
   private projectFromRow(row: ProjectRow): Project {
@@ -3932,7 +5085,8 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
 
   private agentFromRow = (row: AgentRow): AgentProfile => ({
     id: row.id, name: row.name, roleId: row.role_id, executor: row.executor, model: row.model, parameters: parseJson(row.parameters_json, {}),
-    permissionMode: row.permission_mode, status: row.status, createdAt: row.created_at, updatedAt: row.updated_at,
+    defaultCapabilityIds: parseJson(row.default_capability_ids_json, []), permissionMode: row.permission_mode,
+    status: row.status, createdAt: row.created_at, updatedAt: row.updated_at,
   });
 
   private artifactFromRow = (row: ArtifactRow): ArtifactVersion => ({
@@ -3981,7 +5135,11 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       WHERE task_id = ? AND position < 1000
       ORDER BY position
     `).all(row.id) as StepRow[]).map((step) => ({
-      id: step.id, taskId: step.task_id, position: step.position, skillId: step.skill_id, agentId: step.agent_id, title: step.title,
+      id: step.id, taskId: step.task_id, position: step.position, skillId: step.skill_id, kind: step.unit_kind ?? 'legacy_skill',
+      requiredCapabilities: parseJson(step.required_capabilities_json, []), capabilityIds: parseJson(step.capability_ids_json, []),
+      verification: parseJson(step.verification_json, []),
+      mode: step.execution_mode ?? 'read_only', requiresIndependentSession: Boolean(step.requires_independent_session),
+      agentId: step.agent_id, title: step.title,
       description: step.description, inputs: parseJson(step.inputs_json, []), expectedOutput: step.expected_output,
       directoryIds: parseJson(step.directory_ids_json, []), status: step.status, attempt: step.attempt,
       startedAt: step.started_at, completedAt: step.completed_at, summary: step.summary,
@@ -3992,6 +5150,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         ...storedPlan,
         taskVersionId: storedPlan.taskVersionId ?? currentTaskVersion.id,
         taskVersion: storedPlan.taskVersion ?? currentTaskVersion.version,
+        flowVersion: storedPlan.flowVersion ?? row.flow_version ?? 1,
         preApprovalSkillIds: storedPlan.preApprovalSkillIds ?? [],
         preApprovalArtifacts: storedPlan.preApprovalArtifacts ?? [],
         answersReviewedAt: storedPlan.answersReviewedAt ?? null,
@@ -4000,10 +5159,16 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           options: question.options ?? [],
         })),
         confirmedAt: planRow?.confirmed_at ?? storedPlan.confirmedAt,
-        steps: storedPlan.steps ?? steps.map((step) => ({
+        steps: (storedPlan.steps ?? steps).map((step) => ({
           id: step.id,
           position: step.position,
           skillId: step.skillId,
+          kind: step.kind ?? 'legacy_skill',
+          requiredCapabilities: step.requiredCapabilities ?? [],
+          capabilityIds: step.capabilityIds ?? [],
+          verification: step.verification ?? [],
+          mode: step.mode ?? (step.skillId === 'implementation' ? 'write' : 'read_only'),
+          requiresIndependentSession: step.requiresIndependentSession ?? false,
           agentId: step.agentId,
           title: step.title,
           description: step.description,
@@ -4070,6 +5235,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       id: row.id, projectId: row.project_id, projectName: row.project_name, teamId: row.team_id, teamName: row.team_name,
       title: row.title, description: row.description, expectedOutput: row.expected_output, constraints: row.constraints_text,
       forbiddenPaths: parseJson(row.forbidden_paths_json, []), status: row.status, stateVersion: row.state_version,
+      flowVersion: row.flow_version ?? 1,
       progress: steps.length > 0 ? Math.round((succeeded / steps.length) * 100) : 0, activeStepId: row.active_step_id,
       createdAt: row.created_at, updatedAt: row.updated_at, plan, steps, snapshot, activeExecution,
     };
@@ -4483,7 +5649,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     return { ...base, artifactPath: artifact.path, contentHash: artifact.hash };
   }
 
-  private buildRunSnapshot(task: Task): TaskRunSnapshot {
+  private buildRunSnapshot(task: Task, executorInstallations: ExecutorInstallation[] = []): TaskRunSnapshot {
     if (!task.plan) throw new DomainError('PLAN_REQUIRED', '确认任务前必须先生成计划。', 409);
     const project = this.getProject(task.projectId);
     const projectSettings = this.getProjectSettings(task.projectId);
@@ -4494,6 +5660,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const team = this.getTeam(task.teamId);
     const agents = this.listAgents().filter((agent) => team.memberIds.includes(agent.id));
     const roleIds = new Set(agents.map((agent) => agent.roleId));
+    const executorIds = new Set(agents.map((agent) => agent.executor));
     const skillIds = new Set(task.plan.steps.map((step) => step.skillId));
     const directoryIds = new Set(task.plan.branchRoutes.map((route) => route.directoryId));
     const snapshotId = id('snapshot');
@@ -4516,6 +5683,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       createdAt,
       project.directories,
     );
+    const capabilities = this.freezeTaskCapabilities(task, frozenPlan, agents, createdAt);
     const content = {
       id: snapshotId,
       taskId: task.id,
@@ -4533,10 +5701,23 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       plan: { ...frozenPlan, confirmedAt: createdAt },
       team,
       agents,
-      roles: builtinRoles.filter((role) => roleIds.has(role.id)),
+      executors: [...executorIds].map((executor) => {
+        const installation = executorInstallations.find((item) => item.id === executor);
+        return {
+          executor,
+          version: installation?.version ?? null,
+          executableHash: installation?.path ? sha256(installation.path) : null,
+          capabilities: installation?.capabilities ?? [],
+          selectedModels: [...new Set(agents.filter((agent) => agent.executor === executor).map((agent) => agent.model))],
+          health: installation?.health ?? 'unchecked' as const,
+          checkedAt: installation?.lastCheckedAt ?? null,
+        };
+      }),
+      roles: this.listRoleTemplates(false).filter((role) => roleIds.has(role.id)),
       skills: builtinSkills.filter((skill) => skillIds.has(skill.id)),
       directories: project.directories.filter((directory) => directoryIds.has(directory.id)),
       permissionManifests,
+      capabilities,
       createdAt,
     };
     const artifact = writeVersionedArtifact(
@@ -4552,12 +5733,17 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
   }
 
   private buildPlan(task: Task, project: Project, version: number, draft?: Partial<TaskPlan>): TaskPlan {
+    const draftUsesLegacySkills = Boolean(draft?.steps?.length)
+      && draft!.steps!.every((step) => step.kind !== 'work_unit'
+        && builtinSkills.some((skill) => skill.id === step.skillId));
+    const flowVersion = draftUsesLegacySkills ? 1 : (task.flowVersion ?? 1);
+    const planningTask: Task = flowVersion === task.flowVersion ? task : { ...task, flowVersion };
     const taskVersion = this.getCurrentTaskVersion(task.id);
     const agents = this.listAgents();
     const team = this.getTeam(task.teamId);
     const teamAgents = agents.filter((agent) => team.memberIds.includes(agent.id));
-    const executionSteps = this.normalizePlanSteps(task, project, teamAgents, draft?.steps);
-    let branchRoutes = this.resolveBranchRoutes(task, project, executionSteps, draft?.branchRoutes);
+    const executionSteps = this.normalizePlanSteps(planningTask, project, teamAgents, draft?.steps);
+    let branchRoutes = this.resolveBranchRoutes(planningTask, project, executionSteps, draft?.branchRoutes);
     if (task.status === 'COMPOSING_PLAN' && task.snapshot) {
       branchRoutes = branchRoutes.map((route) => ({
         ...route,
@@ -4616,7 +5802,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         !proposedGateKeys.has(`${gate.directoryId}:${(gate.commandArgv ?? [gate.command]).join('\u0000')}`)),
       ...proposedQualityGates,
     ];
-    const missingSkills = executionSteps.filter((step) => !step.agentId).map((step) => step.skillId);
+    const missingSkills = flowVersion === 1
+      ? executionSteps.filter((step) => !step.agentId).map((step) => step.skillId)
+      : [];
     const questions = (draft?.questions ?? []).map((question) => ({
       ...question,
       options: question.options ?? [],
@@ -4667,6 +5855,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       id: id('plan'), taskId: task.id, version,
       taskVersionId: draft?.taskVersionId ?? taskVersion.id,
       taskVersion: draft?.taskVersion ?? taskVersion.version,
+      flowVersion,
       preApprovalSkillIds: draft?.preApprovalSkillIds ?? [],
       goal: draft?.goal ?? task.description,
       scope: draft?.scope ?? project.directories.map((directory) => directory.displayName),
@@ -4689,6 +5878,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       taskId: task.id,
       position,
       skillId: step.skillId,
+      kind: step.kind ?? (plan.flowVersion === 2 ? 'work_unit' : 'legacy_skill'),
+      requiredCapabilities: step.requiredCapabilities ?? [],
+      capabilityIds: step.capabilityIds ?? [],
+      verification: step.verification ?? [],
+      mode: step.mode ?? (step.skillId === 'implementation' ? 'write' : 'read_only'),
+      requiresIndependentSession: step.requiresIndependentSession ?? false,
       agentId: step.agentId,
       title: step.title,
       description: step.description,
@@ -4705,8 +5900,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
 
   private renderPlan(task: Task, plan: TaskPlan): string {
     const section = (title: string, items: string[]) => `## ${title}\n\n${items.length > 0 ? items.map((item) => `- ${item}`).join('\n') : '- 无'}\n`;
-    const steps = plan.steps.map((step) =>
-      `### ${step.position + 1}. ${step.title}\n\n- Skill：${step.skillId}\n- Agent：${step.agentId ?? '待分配'}\n- 输入：${step.inputs.join('；') || '当前任务与上游产物'}\n- 目录：${step.directoryIds.join('、')}\n- 预期产出：${step.expectedOutput}`,
+    const steps = plan.steps.map((step) => step.kind === 'work_unit'
+      ? `### ${step.position + 1}. ${step.title}\n\n- 执行单元：WorkUnit\n- Agent：${step.agentId ?? '待分配'}\n- 模式：${step.mode === 'write' ? '可写' : '只读'}\n- 所需能力：${step.requiredCapabilities?.join('、') || '通用项目能力'}\n- 装载能力：${step.capabilityIds?.join('、') || '无'}\n- 输入：${step.inputs.join('；') || '当前任务与上游上下文'}\n- 目录：${step.directoryIds.join('、')}\n- 验证：${step.verification?.join('；') || '依据成功标准与独立质量门禁验证'}\n- 预期结果：${step.expectedOutput}`
+      : `### ${step.position + 1}. ${step.title}\n\n- Skill：${step.skillId}\n- Agent：${step.agentId ?? '待分配'}\n- 输入：${step.inputs.join('；') || '当前任务与上游产物'}\n- 目录：${step.directoryIds.join('、')}\n- 预期产出：${step.expectedOutput}`,
     ).join('\n\n');
     const preApprovalArtifacts = plan.preApprovalArtifacts.map((artifact) =>
       `- ${artifact.title}（${artifact.artifactType} v${artifact.version}，${artifact.status}）\n  - 路径：${artifact.artifactPath}\n  - 哈希：${artifact.contentHash}`,
@@ -4725,8 +5921,41 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     teamAgents: AgentProfile[],
     proposedSteps?: ExecutionPlanStep[],
   ): ExecutionPlanStep[] {
+    if (task.flowVersion === 2) {
+      const allDirectoryIds = project.directories.map((directory) => directory.id);
+      if (!proposedSteps?.length) {
+        throw new DomainError('PLAN_WORK_UNITS_REQUIRED', '新流程计划必须根据当前任务明确生成至少一个 WorkUnit。', 422);
+      }
+      const steps = proposedSteps.map((proposed, position) => {
+        const requestedAgent = proposed.agentId
+          ? teamAgents.find((agent) => agent.id === proposed.agentId)
+          : undefined;
+        if (proposed.agentId && !requestedAgent) {
+          throw new DomainError('PLAN_STEP_AGENT_INVALID', `人员 ${proposed.agentId} 不属于当前团队。`, 422);
+        }
+        return {
+          id: id('planstep'),
+          position,
+          skillId: 'work-unit',
+          kind: 'work_unit' as const,
+          agentId: requestedAgent?.id ?? proposed.agentId ?? teamAgents[0]?.id ?? null,
+          title: proposed.title?.trim() || `执行单元 ${position + 1}`,
+          description: proposed.description?.trim() || proposed.expectedOutput?.trim() || '完成当前执行单元目标。',
+          inputs: proposed.inputs?.map((item) => item.trim()).filter(Boolean) ?? [],
+          expectedOutput: proposed.expectedOutput?.trim() || '形成可验证的任务进展',
+          directoryIds: proposed.directoryIds?.length ? [...new Set(proposed.directoryIds)] : allDirectoryIds,
+          requiredCapabilities: proposed.requiredCapabilities?.map((item) => item.trim()).filter(Boolean) ?? [],
+          capabilityIds: [...new Set(proposed.capabilityIds ?? [])],
+          verification: proposed.verification?.map((item) => item.trim()).filter(Boolean) ?? [],
+          mode: proposed.mode === 'write' ? 'write' as const : 'read_only' as const,
+          requiresIndependentSession: proposed.requiresIndependentSession ?? false,
+        };
+      });
+      this.validatePlanSteps(task, project, steps);
+      return steps;
+    }
     const fallbackSkillIds = defaultExecutionSkillIds.filter((skillId) =>
-      teamAgents.some((agent) => builtinRoles.find((role) => role.id === agent.roleId)?.skillIds.includes(skillId)),
+      teamAgents.some((agent) => this.getRoleTemplate(agent.roleId).skillIds.includes(skillId)),
     );
     const source = proposedSteps?.length
       ? proposedSteps
@@ -4734,6 +5963,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         id: '',
         position,
         skillId,
+        kind: 'legacy_skill' as const,
+        requiredCapabilities: [],
+        capabilityIds: [],
+        verification: [],
+        mode: skillId === 'implementation' ? 'write' as const : 'read_only' as const,
+        requiresIndependentSession: false,
         agentId: null,
         title: '',
         description: '',
@@ -4745,7 +5980,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       const skill = builtinSkills.find((item) => item.id === proposed.skillId);
       if (!skill) throw new DomainError('PLAN_SKILL_UNKNOWN', `计划包含未知 Skill：${proposed.skillId}`, 422);
       const compatibleAgents = teamAgents.filter((agent) =>
-        builtinRoles.find((role) => role.id === agent.roleId)?.skillIds.includes(skill.id),
+        this.getRoleTemplate(agent.roleId).skillIds.includes(skill.id),
       );
       const requestedAgent = proposed.agentId ? compatibleAgents.find((agent) => agent.id === proposed.agentId) : null;
       if (proposed.agentId && !requestedAgent) {
@@ -4759,6 +5994,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         id: id('planstep'),
         position,
         skillId: skill.id,
+        kind: 'legacy_skill' as const,
+        requiredCapabilities: [],
+        capabilityIds: [],
+        verification: [],
+        mode: skill.id === 'implementation' ? 'write' as const : 'read_only' as const,
+        requiresIndependentSession: false,
         agentId: requestedAgent?.id ?? compatibleAgents[0]?.id ?? null,
         title: proposed.title?.trim() || skill.name,
         description: proposed.description?.trim() || skill.description,
@@ -4772,11 +6013,41 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
   }
 
   private validatePlanSteps(task: Task, project: Project, steps: ExecutionPlanStep[]): void {
-    if (steps.length === 0) throw new DomainError('PLAN_STEPS_REQUIRED', '执行计划至少需要一个 SkillStep。', 422);
+    if (steps.length === 0) throw new DomainError('PLAN_STEPS_REQUIRED', '执行计划至少需要一个执行单元。', 422);
     const team = this.getTeam(task.teamId);
     const teamAgents = this.listAgents().filter((agent) => team.memberIds.includes(agent.id));
     const projectDirectoryIds = new Set(project.directories.map((directory) => directory.id));
+    const enabledCapabilities = new Map(this.listProjectCapabilities(task.projectId)
+      .filter((item) => item.enabled)
+      .map((item) => [item.capabilityId, item.capability]));
     for (const [position, step] of steps.entries()) {
+      if (task.flowVersion === 2 || step.kind === 'work_unit') {
+        if (step.position !== position) step.position = position;
+        if (step.directoryIds.length === 0 || step.directoryIds.some((directoryId) => !projectDirectoryIds.has(directoryId))) {
+          throw new DomainError('PLAN_STEP_DIRECTORY_INVALID', `WorkUnit ${step.title} 的项目目录范围无效。`, 422);
+        }
+        const assignedAgent = step.agentId ? teamAgents.find((agent) => agent.id === step.agentId) : null;
+        if (step.agentId && !assignedAgent) {
+          throw new DomainError('PLAN_STEP_AGENT_INVALID', `人员 ${step.agentId} 不属于当前团队。`, 422);
+        }
+        for (const capabilityId of [...new Set(step.capabilityIds ?? [])]) {
+          const capability = enabledCapabilities.get(capabilityId);
+          if (!capability) {
+            throw new DomainError('PLAN_CAPABILITY_NOT_ENABLED', `WorkUnit ${step.title} 使用了未在项目启用的能力。`, 422, {
+              stepId: step.id,
+              capabilityId,
+            });
+          }
+          if (assignedAgent && !capability.compatibility.includes(assignedAgent.executor)) {
+            throw new DomainError('PLAN_CAPABILITY_INCOMPATIBLE', `能力 ${capability.name} 与人员执行器 ${assignedAgent.executor} 不兼容。`, 422, {
+              stepId: step.id,
+              capabilityId,
+              executor: assignedAgent.executor,
+            });
+          }
+        }
+        continue;
+      }
       const skill = builtinSkills.find((item) => item.id === step.skillId);
       if (!skill) throw new DomainError('PLAN_SKILL_UNKNOWN', `计划包含未知 Skill：${step.skillId}`, 422);
       if (step.position !== position) step.position = position;
@@ -4785,7 +6056,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       }
       if (!step.agentId) continue;
       const agent = teamAgents.find((item) => item.id === step.agentId);
-      const role = agent ? builtinRoles.find((item) => item.id === agent.roleId) : null;
+      const role = agent ? this.getRoleTemplate(agent.roleId) : null;
       if (!agent || !role?.skillIds.includes(step.skillId)) {
         throw new DomainError('PLAN_STEP_AGENT_INVALID', `人员 ${step.agentId} 不属于当前团队或不具备 Skill ${step.skillId}。`, 422);
       }
@@ -4835,7 +6106,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
 
   private replacePendingSteps(task: Task, plan: TaskPlan): void {
     if (task.steps.some((step) => step.status !== 'pending')) {
-      throw new DomainError('PLAN_STEPS_ALREADY_STARTED', '执行已经开始，不能直接修改当前 SkillStep；请请求重新规划。', 409);
+      throw new DomainError('PLAN_STEPS_ALREADY_STARTED', '执行已经开始，不能直接修改当前执行单元；请请求重新规划。', 409);
     }
     this.database.prepare(`
       DELETE FROM task_steps
@@ -4843,12 +6114,15 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     `).run(task.id);
     const insert = this.database.prepare(`
       INSERT INTO task_steps(
-        id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json,
+        unit_kind, required_capabilities_json, capability_ids_json, verification_json, execution_mode, requires_independent_session, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     `);
     for (const step of this.buildSteps(task, plan)) {
       insert.run(step.id, step.taskId, step.position, step.skillId, step.agentId, step.title, step.description,
-        JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds));
+        JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds), step.kind,
+        JSON.stringify(step.requiredCapabilities), JSON.stringify(step.capabilityIds), JSON.stringify(step.verification),
+        step.mode, Number(step.requiresIndependentSession));
     }
   }
 
@@ -4857,11 +6131,14 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const completed = task.steps.filter((step) => step.status === 'succeeded').sort((a, b) => a.position - b.position);
     const aligned: ExecutionPlanStep[] = [];
     for (const existing of completed) {
-      const proposed = plan.steps.find((step) => step.skillId === existing.skillId && !used.has(step.id));
+      const proposed = plan.steps.find((step) =>
+        !used.has(step.id) && (existing.kind === 'work_unit'
+          ? step.kind === 'work_unit' && step.position === existing.position
+          : step.skillId === existing.skillId));
       if (!proposed) {
         throw new DomainError(
           'REPLAN_DROPPED_COMPLETED_STEP',
-          `重新规划不能删除已经完成的 SkillStep：${existing.title}`,
+          `重新规划不能删除已经完成的执行单元：${existing.title}`,
           422,
           { stepId: existing.id, skillId: existing.skillId },
         );
@@ -4882,7 +6159,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const remainingExisting = task.steps.filter((step) => step.status !== 'succeeded');
     for (const proposed of plan.steps.filter((step) => !used.has(step.id))) {
       const reusable = remainingExisting.find((step) =>
-        !aligned.some((item) => item.id === step.id) && step.skillId === proposed.skillId,
+        !aligned.some((item) => item.id === step.id) && (proposed.kind === 'work_unit'
+          ? step.kind === 'work_unit' && step.position === proposed.position
+          : step.skillId === proposed.skillId),
       );
       aligned.push({
         ...proposed,
@@ -4899,7 +6178,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const used = new Set<string>();
     const steps = previousSteps.map((previous, position) => {
       const proposed = plan.steps.find((step) =>
-        step.skillId === previous.skillId && !used.has(step.id));
+        !used.has(step.id) && (previous.kind === 'work_unit'
+          ? step.kind === 'work_unit' && step.position === previous.position
+          : step.skillId === previous.skillId));
       if (proposed) {
         used.add(proposed.id);
         return { ...proposed, position };
@@ -4922,15 +6203,18 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const agentsById = new Set(this.listAgents().map((agent) => agent.id));
     const insertStep = this.database.prepare(`
       INSERT INTO task_steps(
-        id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json, status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        id, task_id, position, skill_id, agent_id, title, description, inputs_json, expected_output, directory_ids_json,
+        unit_kind, required_capabilities_json, capability_ids_json, verification_json, execution_mode, requires_independent_session, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
     `);
     if (!preserveCompleted && task.steps.every((step) => step.status === 'pending')) {
       this.database.prepare('DELETE FROM task_steps WHERE task_id = ?').run(task.id);
       for (const step of this.buildSteps(task, plan)) {
         insertStep.run(step.id, step.taskId, step.position, step.skillId,
           step.agentId && agentsById.has(step.agentId) ? step.agentId : null,
-          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds));
+          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds),
+          step.kind, JSON.stringify(step.requiredCapabilities), JSON.stringify(step.capabilityIds), JSON.stringify(step.verification),
+          step.mode, Number(step.requiresIndependentSession));
       }
       return;
     }
@@ -4947,7 +6231,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       for (const step of this.buildSteps(task, plan)) {
         insertStep.run(step.id, step.taskId, step.position, step.skillId,
           step.agentId && agentsById.has(step.agentId) ? step.agentId : null,
-          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds));
+          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds),
+          step.kind, JSON.stringify(step.requiredCapabilities), JSON.stringify(step.capabilityIds), JSON.stringify(step.verification),
+          step.mode, Number(step.requiresIndependentSession));
       }
       return;
     }
@@ -4959,7 +6245,8 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     `).run(historyOffset, task.id);
     const updateStep = this.database.prepare(`
       UPDATE task_steps SET position = ?, skill_id = ?, agent_id = ?, title = ?, description = ?,
-        inputs_json = ?, expected_output = ?, directory_ids_json = ?,
+        inputs_json = ?, expected_output = ?, directory_ids_json = ?, unit_kind = ?,
+        required_capabilities_json = ?, capability_ids_json = ?, verification_json = ?, execution_mode = ?, requires_independent_session = ?,
         status = CASE WHEN status = 'succeeded' THEN status ELSE 'pending' END,
         completed_at = CASE WHEN status = 'succeeded' THEN completed_at ELSE NULL END
       WHERE id = ? AND task_id = ?
@@ -4969,11 +6256,15 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       if (existing) {
         updateStep.run(step.position, step.skillId, step.agentId && agentsById.has(step.agentId) ? step.agentId : null,
           step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds),
+          step.kind, JSON.stringify(step.requiredCapabilities), JSON.stringify(step.capabilityIds), JSON.stringify(step.verification),
+          step.mode, Number(step.requiresIndependentSession),
           step.id, task.id);
       } else {
         insertStep.run(step.id, step.taskId, step.position, step.skillId,
           step.agentId && agentsById.has(step.agentId) ? step.agentId : null,
-          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds));
+          step.title, step.description, JSON.stringify(step.inputs), step.expectedOutput, JSON.stringify(step.directoryIds),
+          step.kind, JSON.stringify(step.requiredCapabilities), JSON.stringify(step.capabilityIds), JSON.stringify(step.verification),
+          step.mode, Number(step.requiresIndependentSession));
       }
     }
   }
@@ -4997,6 +6288,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         WHERE plan_id = ? AND status = 'generated'
       `).run(plan.id);
       this.database.prepare('DELETE FROM gate_results WHERE task_id = ?').run(taskId);
+      this.persistTaskCapabilitySnapshots(taskId, snapshot.capabilities ?? []);
       this.database.prepare(`
         INSERT INTO run_snapshots(
           id, task_id, plan_id, plan_version, content_json, content_hash, artifact_path, created_at
@@ -5026,6 +6318,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     const createdAt = now();
     const usedSkillIds = new Set(task.plan.steps.map((step) => step.skillId));
     const usedDirectoryIds = new Set(task.plan.branchRoutes.map((route) => route.directoryId));
+    const capabilities = this.freezeAutomaticReplanCapabilities(task, previous, createdAt);
     const content = {
       id: snapshotId,
       taskId: task.id,
@@ -5050,6 +6343,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         createdAt,
         previous.directories,
       ),
+      capabilities,
       createdAt,
     };
     const project = this.getProject(task.projectId);
@@ -5059,6 +6353,42 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       `${JSON.stringify(content, null, 2)}\n`,
     );
     return { ...content, contentHash: artifact.hash, artifactPath: artifact.path };
+  }
+
+  private freezeAutomaticReplanCapabilities(
+    task: Task,
+    previous: TaskRunSnapshot,
+    createdAt: string,
+  ): TaskCapabilitySnapshot[] {
+    if (!task.plan) return [];
+    const previousCapabilities = previous.capabilities ?? [];
+    const agents = new Map(previous.agents.map((agent) => [agent.id, agent]));
+    return task.plan.steps.flatMap((step) => {
+      const agent = step.agentId ? agents.get(step.agentId) : null;
+      if (!agent) return [];
+      return [...new Set(step.capabilityIds ?? [])].map((capabilityId) => {
+        const approved = previousCapabilities.find((item) =>
+          item.capabilityId === capabilityId && item.executor === agent.executor);
+        if (!approved) {
+          throw new DomainError('REPLAN_CAPABILITY_OUT_OF_BOUNDARY', '重新规划引入了未批准的能力或执行器。', 422, {
+            stepId: step.id,
+            capabilityId,
+            executor: agent.executor,
+          });
+        }
+        return {
+          ...approved,
+          id: id('taskcap'),
+          taskId: task.id,
+          stepId: step.id,
+          agentId: agent.id,
+          projectionPath: null,
+          status: 'frozen' as const,
+          error: null,
+          createdAt,
+        };
+      });
+    });
   }
 
   private buildPermissionManifests(
@@ -5082,7 +6412,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           agentId: step.agentId,
         });
       }
-      const canRunProjectCommands = ['implementation', 'test-execution'].includes(step.skillId);
+      const canRunProjectCommands = step.kind === 'work_unit'
+        ? step.mode === 'write'
+        : ['implementation', 'test-execution'].includes(step.skillId);
       const commands = new Set(['pwd', 'ls', 'ls -la', 'git status*', 'git diff*']);
       if (canRunProjectCommands) {
         for (const gate of plan.qualityGates) {
@@ -5111,7 +6443,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         permissionMode: projectSettings.permissionMode === 'inherit'
           ? agent.permissionMode
           : projectSettings.permissionMode,
-        readOnly: step.skillId !== 'implementation',
+        readOnly: step.kind === 'work_unit' ? step.mode !== 'write' : step.skillId !== 'implementation',
         directoryIds: [...step.directoryIds],
         allowedCommandPatterns: [...commands],
         forbiddenPaths: [...new Set([...projectSettings.forbiddenPaths, ...task.forbiddenPaths])],
@@ -5149,10 +6481,12 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         || currentGate.command !== gate.command) return false;
     }
     const approvedDirectories = new Set(previous.steps.flatMap((step) => step.directoryIds));
+    const approvedCapabilityIds = new Set((previousSnapshot.capabilities ?? []).map((item) => item.capabilityId));
     const agents = new Map(previousSnapshot.agents.map((agent) => [agent.id, agent]));
     const roles = new Map(previousSnapshot.roles.map((role) => [role.id, role]));
     return current.steps.every((step) => {
       if (!step.agentId || !step.directoryIds.every((directoryId) => approvedDirectories.has(directoryId))) return false;
+      if ((step.capabilityIds ?? []).some((capabilityId) => !approvedCapabilityIds.has(capabilityId))) return false;
       const agent = agents.get(step.agentId);
       return Boolean(agent && roles.get(agent.roleId)?.skillIds.includes(step.skillId));
     }) && previousGates.size <= current.qualityGates.length;
@@ -5249,6 +6583,7 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       `SELECT r.artifact_path AS path FROM delivery_reports r JOIN tasks t ON t.id = r.task_id WHERE t.project_id = ?`,
       `SELECT s.result_path AS path FROM agent_sessions s JOIN tasks t ON t.id = s.task_id WHERE t.project_id = ? AND s.result_path IS NOT NULL`,
       `SELECT ps.artifact_path AS path FROM project_settings ps WHERE ps.project_id = ?`,
+      `SELECT l.artifact_path AS path FROM project_capability_locks l WHERE l.project_id = ?`,
     ];
     for (const sql of artifactQueries) {
       const rows = this.database.prepare(sql).all(projectId) as Array<{ path: string | null }>;
@@ -5284,6 +6619,172 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
+}
+
+function parseGitHubSkillAddress(address: string): {
+  cloneUrl: string;
+  canonicalUrl: string;
+  treeSegments: string[];
+} {
+  let url: URL;
+  try {
+    url = new URL(address.trim());
+  } catch {
+    throw new DomainError('CAPABILITY_GITHUB_URL_INVALID', '请输入有效的 GitHub HTTPS 地址。', 422);
+  }
+  if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com' || url.username || url.password) {
+    throw new DomainError('CAPABILITY_GITHUB_URL_INVALID', '当前只允许公开的 github.com HTTPS 地址。', 422);
+  }
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.length < 2 || !/^[A-Za-z0-9_.-]+$/.test(parts[0] ?? '') || !/^[A-Za-z0-9_.-]+(?:\.git)?$/.test(parts[1] ?? '')) {
+    throw new DomainError('CAPABILITY_GITHUB_URL_INVALID', 'GitHub 地址必须包含仓库所有者和仓库名。', 422);
+  }
+  const owner = parts[0] as string;
+  const repository = (parts[1] as string).replace(/\.git$/, '');
+  let treeSegments: string[] = [];
+  if (parts[2]) {
+    if (parts[2] !== 'tree' || !parts[3]) {
+      throw new DomainError('CAPABILITY_GITHUB_URL_INVALID', '子目录地址必须使用 GitHub 的 /tree/<ref>/<path> 格式。', 422);
+    }
+    treeSegments = parts.slice(3).map(decodeURIComponent);
+  }
+  if (treeSegments.includes('..') || treeSegments.length > 32) throw new DomainError('CAPABILITY_GITHUB_PATH_INVALID', 'GitHub 引用或子目录无效。', 422);
+  const canonicalUrl = `https://github.com/${owner}/${repository}`;
+  return { cloneUrl: `${canonicalUrl}.git`, canonicalUrl, treeSegments };
+}
+
+function findSkillDirectories(root: string): string[] {
+  const result: string[] = [];
+  const visit = (directory: string, depth: number) => {
+    if (depth > 12 || result.length >= 100) return;
+    const entries = readdirSync(directory, { withFileTypes: true });
+    if (entries.some((entry) => entry.isFile() && entry.name === 'SKILL.md')) result.push(directory);
+    for (const entry of entries) {
+      if (!entry.isDirectory() || ['.git', 'node_modules', '.next', 'dist', 'build'].includes(entry.name)) continue;
+      visit(join(directory, entry.name), depth + 1);
+    }
+  };
+  visit(root, 0);
+  return result;
+}
+
+function validateImportedTree(root: string): void {
+  let files = 0;
+  let totalBytes = 0;
+  const visit = (directory: string, depth: number) => {
+    if (depth > 16) throw new DomainError('CAPABILITY_ARCHIVE_TOO_DEEP', 'ZIP 解压目录层级超过 16 层。', 422);
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      if (entry.isSymbolicLink()) throw new DomainError('CAPABILITY_ARCHIVE_SYMLINK_REJECTED', '扩展来源包含符号链接，已拒绝导入。', 422);
+      const path = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(path, depth + 1);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      files += 1;
+      totalBytes += statSync(path).size;
+      if (files > 2_000 || totalBytes > 40 * 1024 * 1024) {
+        throw new DomainError('CAPABILITY_ARCHIVE_TOO_LARGE', 'ZIP 解压后超过 2000 个文件或 40MB。', 422);
+      }
+    }
+  };
+  visit(root, 0);
+}
+
+function pathWithin(root: string, candidate: string): boolean {
+  const path = relative(root, candidate);
+  return path !== '..' && !path.startsWith('../') && !path.startsWith('..\\');
+}
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function assertNoLiteralCredential(value: unknown, parentKey = ''): void {
+  if (Array.isArray(value)) {
+    value.forEach((item) => assertNoLiteralCredential(item, parentKey));
+    return;
+  }
+  if (!isRecordValue(value)) return;
+  for (const [key, item] of Object.entries(value)) {
+    const fieldPath = `${parentKey}.${key}`;
+    const usesEnvironmentReference = typeof item === 'string'
+      && /(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\})/.test(item);
+    if (typeof item === 'string'
+      && (/\.headers?\./i.test(fieldPath)
+        || /(token|secret|password|passwd|api[-_]?key|authorization|credential|private[-_]?key)/i.test(fieldPath))
+      && !usesEnvironmentReference) {
+      throw new DomainError('CAPABILITY_LITERAL_CREDENTIAL_REJECTED',
+        `能力配置 ${key} 不能保存明文凭据，请改用本地环境变量引用。`, 422);
+    }
+    if (typeof item === 'string' && /\.url$/i.test(fieldPath)) {
+      try {
+        const url = new URL(item);
+        const hasLiteralUrlCredential = Boolean(url.username || url.password)
+          || [...url.searchParams.entries()].some(([name, content]) =>
+            /(token|secret|password|api[-_]?key|credential)/i.test(name)
+            && !/(?:\{env:[A-Za-z_][A-Za-z0-9_]*\}|\$\{[A-Za-z_][A-Za-z0-9_]*(?::-?[^}]*)?\})/.test(content));
+        if (hasLiteralUrlCredential) throw new DomainError('CAPABILITY_LITERAL_CREDENTIAL_REJECTED',
+          'MCP URL 不能包含明文凭据，请改用本地环境变量引用。', 422);
+      } catch (error) {
+        if (error instanceof DomainError) throw error;
+      }
+    }
+    assertNoLiteralCredential(item, fieldPath);
+  }
+}
+
+function toOpenCodeMcpConfiguration(configuration: Record<string, unknown>): Record<string, unknown> {
+  const convert = (value: unknown): unknown => convertCredentialReferences(value, 'opencode');
+  const type = configuration.type;
+  if (type === 'local') {
+    return {
+      type: 'local',
+      command: Array.isArray(configuration.command) ? convert(configuration.command) : [],
+      ...(isRecordValue(configuration.environment) ? { environment: convert(configuration.environment) } : {}),
+      enabled: configuration.disabled !== true,
+    };
+  }
+  return {
+    type: 'remote',
+    url: convert(configuration.url),
+    ...(isRecordValue(configuration.headers) ? { headers: convert(configuration.headers) } : {}),
+    enabled: configuration.disabled !== true,
+  };
+}
+
+function toClaudeMcpConfiguration(configuration: Record<string, unknown>): Record<string, unknown> {
+  const convert = (value: unknown): unknown => convertCredentialReferences(value, 'claude');
+  const type = configuration.type;
+  if (type === 'local') {
+    const command = Array.isArray(configuration.command)
+      ? configuration.command.filter((item): item is string => typeof item === 'string')
+      : [];
+    return {
+      type: 'stdio',
+      command: convert(command[0] ?? ''),
+      args: convert(command.slice(1)),
+      ...(isRecordValue(configuration.environment) ? { env: convert(configuration.environment) } : {}),
+    };
+  }
+  return {
+    type: 'http',
+    url: convert(configuration.url),
+    ...(isRecordValue(configuration.headers) ? { headers: convert(configuration.headers) } : {}),
+  };
+}
+
+function convertCredentialReferences(value: unknown, target: 'opencode' | 'claude'): unknown {
+  if (typeof value === 'string') {
+    return target === 'opencode'
+      ? value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-?[^}]*)?\}/g, '{env:$1}')
+      : value.replace(/\{env:([A-Za-z_][A-Za-z0-9_]*)\}/g, '${$1}');
+  }
+  if (Array.isArray(value)) return value.map((item) => convertCredentialReferences(item, target));
+  if (isRecordValue(value)) return Object.fromEntries(Object.entries(value)
+    .map(([key, item]) => [key, convertCredentialReferences(item, target)]));
+  return value;
 }
 
 function readArtifactContent(path: string): string {

@@ -1,6 +1,6 @@
 import { createOpencodeClient, type PermissionRequest, type PermissionRuleset } from '@opencode-ai/sdk/v2';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createWriteStream, mkdirSync } from 'node:fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, type WriteStream } from 'node:fs';
 import { createServer } from 'node:net';
 import { join } from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -14,10 +14,12 @@ import type {
   StructuredExecutionResult,
 } from './types.js';
 import { createStructuredOutputValidator, isStructuredOutputCompatibilityError } from './structured-output.js';
+import { rotateLogFile } from './log-rotation.js';
 
 interface ManagedRuntime extends RuntimeHandle {
   password: string;
   process: ChildProcessWithoutNullStreams;
+  log: WriteStream;
 }
 
 type SdkClient = ReturnType<typeof createOpencodeClient>;
@@ -68,6 +70,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly runtimes = new Map<string, ManagedRuntime>();
   private readonly structuredOutputModes = new Map<string, StructuredOutputMode>();
   private readonly disabledToolsByRuntime = new Map<string, Record<string, boolean>>();
+  private readonly activeSessionAborts = new Map<string, AbortController>();
 
   constructor(private readonly knownInstallation?: ExecutorInstallation) {}
 
@@ -85,6 +88,16 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     mkdirSync(runtimeDirectory, { recursive: true });
     const port = await findFreePort();
     const password = randomBytes(24).toString('base64url');
+    const capabilityConfigDirectory = join(runtimeDirectory, 'capability-config');
+    const capabilityConfigPath = join(capabilityConfigDirectory, 'opencode.json');
+    const capabilityEnvironment = existsSync(capabilityConfigPath)
+      ? {
+        OPENCODE_CONFIG_DIR: capabilityConfigDirectory,
+        OPENCODE_CONFIG: capabilityConfigPath,
+        OPENCODE_CONFIG_CONTENT: readFileSync(capabilityConfigPath, 'utf8'),
+        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: 'true',
+      }
+      : {};
     const child = spawn(installation.path, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
       cwd: workspacePath,
       env: {
@@ -93,16 +106,21 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         OPENCODE_SERVER_PASSWORD: password,
         OPENCODE_DISABLE_AUTOUPDATE: 'true',
         OPENCODE_DISABLE_SHARE: 'true',
+        ...capabilityEnvironment,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
-    const log = createWriteStream(join(runtimeDirectory, 'opencode.log'), { flags: 'a', mode: 0o600 });
+    const logPath = join(runtimeDirectory, 'runtime.log');
+    rotateLogFile(logPath);
+    const log = createWriteStream(logPath, { flags: 'a', mode: 0o600 });
+    log.write(`\n[yanxu] ${new Date().toISOString()} executor=opencode runtime=started\n`);
     child.stdout.pipe(log, { end: false });
     child.stderr.pipe(log, { end: false });
     const handle: ManagedRuntime = {
       id: `runtime_${randomUUID().replaceAll('-', '')}`,
-      executor: 'opencode', workspacePath, endpoint: `http://127.0.0.1:${port}`, sessionIds: [], password, process: child,
+      executor: 'opencode', workspacePath, endpoint: `http://127.0.0.1:${port}`, sessionIds: [], password, process: child, log,
     };
+    child.once('close', () => log.end());
     this.runtimes.set(handle.id, handle);
     try {
       await this.waitForHealth(handle);
@@ -117,14 +135,42 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   async executeStructured<T>(input: StructuredExecutionInput): Promise<StructuredExecutionResult<T>> {
     const runtime = this.getRuntime(input.runtime.id);
     const client = this.client(runtime);
-    const sessionResponse = await client.session.create({
-      title: input.title,
-      directory: runtime.workspacePath,
-      permission: permissionRules(input.permissionMode ?? 'standard', input.readOnly ?? false, input.policy),
-    });
-    const session = unwrap<{ id: string }>(sessionResponse);
-    runtime.sessionIds.push(session.id);
+    const rules = permissionRules(input.permissionMode ?? 'standard', input.readOnly ?? false, input.policy);
+    let session: { id: string } | null = null;
+    if (input.resumeSessionId) {
+      try {
+        const existing = unwrap<{ id: string } | undefined>(await client.session.get({
+          sessionID: input.resumeSessionId,
+          directory: runtime.workspacePath,
+        }));
+        if (existing?.id === input.resumeSessionId) {
+          const updated = unwrap<{ id: string } | undefined>(await client.session.update({
+            sessionID: existing.id,
+            directory: runtime.workspacePath,
+            permission: rules,
+          }));
+          if (updated?.id === existing.id) session = updated;
+        }
+      } catch {
+        // A session can disappear when OpenCode storage is reset or a runtime
+        // is upgraded. Continue safely in a fresh session instead of retrying
+        // the same stale identifier forever.
+      }
+    }
+    session ??= unwrap<{ id: string }>(await client.session.create({
+        title: input.title,
+        directory: runtime.workspacePath,
+        permission: rules,
+      }));
+    if (!runtime.sessionIds.includes(session.id)) runtime.sessionIds.push(session.id);
     await input.onSessionStarted?.(session.id);
+    const executionAbort = new AbortController();
+    const forwardInputAbort = () => executionAbort.abort();
+    if (input.abortSignal?.aborted) executionAbort.abort();
+    else input.abortSignal?.addEventListener('abort', forwardInputAbort, { once: true });
+    const executionInput: StructuredExecutionInput = { ...input, abortSignal: executionAbort.signal };
+    const activeAbortKey = `${runtime.id}:${session.id}`;
+    this.activeSessionAborts.set(activeAbortKey, executionAbort);
     const [providerID, ...modelParts] = input.model.split('/');
     const modelID = modelParts.join('/');
     if (!providerID || !modelID) throw new Error('OpenCode model must use provider/model format.');
@@ -134,9 +180,9 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       // terminate the daemon.
       void client.session.abort({ sessionID: session.id, directory: runtime.workspacePath }).catch(() => undefined);
     };
-    input.abortSignal?.addEventListener('abort', abort, { once: true });
+    executionAbort.signal.addEventListener('abort', abort, { once: true });
     let promptSettled = false;
-    const permissionWorker = this.processPermissions(client, runtime, session.id, input, () => promptSettled);
+    const permissionWorker = this.processPermissions(client, runtime, session.id, executionInput, () => promptSettled);
     const promptWorker = (async (): Promise<StructuredExecutionResult<T>> => {
       // OpenCode 1.17.x cannot reliably list messages created by
       // prompt_async when the request uses json_schema: the stored format is
@@ -147,7 +193,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       let continuingAfterSchemaFailure = false;
       if (preferredMode === 'opencode-schema') {
         try {
-          const output = await this.promptWithOpenCodeSchema<T>(client, runtime, session.id, providerID, modelID, input);
+          const output = await this.promptWithOpenCodeSchema<T>(client, runtime, session.id, providerID, modelID, executionInput);
           this.structuredOutputModes.set(input.model, 'opencode-schema');
           return { sessionId: session.id, output };
         } catch (error) {
@@ -165,7 +211,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         session.id,
         providerID,
         modelID,
-        input,
+        executionInput,
         continuingAfterSchemaFailure,
       );
       return { sessionId: session.id, output };
@@ -183,7 +229,9 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       promptSettled = true;
       if (!completed) abort();
       await Promise.allSettled([permissionWorker]);
-      input.abortSignal?.removeEventListener('abort', abort);
+      this.activeSessionAborts.delete(activeAbortKey);
+      input.abortSignal?.removeEventListener('abort', forwardInputAbort);
+      executionAbort.signal.removeEventListener('abort', abort);
     }
   }
 
@@ -325,6 +373,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
 
   async abortSession(runtime: RuntimeHandle, sessionId: string): Promise<void> {
     const managed = this.getRuntime(runtime.id);
+    this.activeSessionAborts.get(`${managed.id}:${sessionId}`)?.abort();
     await this.client(managed).session.abort({ sessionID: sessionId, directory: managed.workspacePath });
   }
 
@@ -333,6 +382,11 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     if (!managed) return;
     this.runtimes.delete(runtime.id);
     this.disabledToolsByRuntime.delete(runtime.id);
+    for (const [key, controller] of this.activeSessionAborts) {
+      if (!key.startsWith(`${runtime.id}:`)) continue;
+      controller.abort();
+      this.activeSessionAborts.delete(key);
+    }
     const client = this.client(managed);
     await Promise.allSettled(managed.sessionIds.map((sessionId) =>
       client.session.abort({ sessionID: sessionId, directory: managed.workspacePath })));
@@ -622,6 +676,18 @@ export function permissionRules(
     // Only commands frozen in the confirmed quality/step policy arrive here.
     // Commands outside this allowlist still match the leading ask rule.
     rules.push({ permission: 'bash', pattern, action: 'allow' });
+  }
+  if (policy?.denyUnlistedSkills) {
+    rules.push({ permission: 'skill', pattern: '*', action: 'deny' });
+  }
+  for (const pattern of policy?.allowedSkillPatterns ?? []) {
+    rules.push({ permission: 'skill', pattern, action: 'allow' });
+  }
+  for (const pattern of policy?.deniedMcpToolPatterns ?? []) {
+    rules.push({ permission: pattern, pattern: '*', action: 'deny' });
+  }
+  for (const pattern of policy?.allowedMcpToolPatterns ?? []) {
+    rules.push({ permission: pattern, pattern: '*', action: 'allow' });
   }
   for (const grant of policy?.taskGrants ?? []) {
     if (readOnly && (grant.permission === 'edit' || grant.permission === 'bash')) continue;

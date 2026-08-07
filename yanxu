@@ -130,8 +130,19 @@ case "${1:-start}" in
     echo "[yanxu] Starting at $YANXU_URL ..."
     exec pnpm start
     ;;
+  db-backups)
+    exec node scripts/database-recovery.mjs list "$YANXU_HOME_PATH"
+    ;;
+  restore-db)
+    if [ -z "${2:-}" ]; then
+      echo "Usage: ./yanxu restore-db <backup-file-from-db-backups>"
+      exit 1
+    fi
+    stop_previous_yanxu
+    exec node scripts/database-recovery.mjs restore "$YANXU_HOME_PATH" "$2"
+    ;;
   *)
-    echo "Usage: ./yanxu [start|dev]"
+    echo "Usage: ./yanxu [start|dev|db-backups|restore-db <backup-file>]"
     exit 1
     ;;
 esac

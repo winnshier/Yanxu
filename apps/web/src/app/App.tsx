@@ -9,6 +9,7 @@ const ProjectDetailPage = lazy(() => import('../pages/ProjectDetailPage.js').the
 const TasksPage = lazy(() => import('../pages/TasksPage.js').then((module) => ({ default: module.TasksPage })));
 const TaskDetailPage = lazy(() => import('../pages/TaskDetailPage.js').then((module) => ({ default: module.TaskDetailPage })));
 const TeamPage = lazy(() => import('../pages/TeamPage.js').then((module) => ({ default: module.TeamPage })));
+const CapabilityCenterPage = lazy(() => import('../pages/CapabilityCenterPage.js').then((module) => ({ default: module.CapabilityCenterPage })));
 const SettingsPage = lazy(() => import('../pages/SettingsPage.js').then((module) => ({ default: module.SettingsPage })));
 
 export function App() {
@@ -22,6 +23,7 @@ export function App() {
           <Route path="tasks" element={<TasksPage />} />
           <Route path="tasks/:taskId" element={<TaskDetailPage />} />
           <Route path="team" element={<TeamPage />} />
+          <Route path="capabilities" element={<CapabilityCenterPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

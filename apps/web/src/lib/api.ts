@@ -1,7 +1,7 @@
 import type {
   AgentProfile, AnswerPlanInput, CreateAgentInput, CreateProjectRequest, CreateTaskRequest, CreateTeamInput, DirectoryProfileVersion,
-  DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SkillDefinition, SystemSettings,
-  RequestPlanRevisionInput, SystemDiagnostics, SystemHealth, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent,
+  Capability, CapabilityDiscoveryReport, DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectCapability, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SkillDefinition, SystemSettings,
+  ProjectCapabilityUpdateInput, RequestPlanRevisionInput, RoleTemplateChangePreview, SystemDiagnostics, SystemHealth, Task, TaskCapabilitySnapshot, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent,
 } from '@yanxu/contracts';
 
 export class ApiError extends Error {
@@ -91,6 +91,31 @@ const json = (method: string, body?: unknown): RequestInit => body === undefined
 export const api = {
   health: () => request<SystemHealth>('/health'),
   dashboard: () => request<DashboardData>('/api/dashboard'),
+  capabilities: () => request<Capability[]>('/api/capabilities'),
+  roleTemplates: () => request<RoleTemplate[]>('/api/role-templates'),
+  roleTemplateChangePreview: (id: string) => request<RoleTemplateChangePreview>(`/api/role-templates/${id}/change-preview`),
+  importGitHubRoles: (address: string) => request<RoleTemplate[]>(
+    '/api/role-templates/import/github', json('POST', { address }),
+  ),
+  importLocalRoles: (selectionToken: string) => request<RoleTemplate[]>(
+    '/api/role-templates/import/local', json('POST', { selectionToken }),
+  ),
+  installRoleTemplate: (id: string, capabilityIds?: string[]) => request<RoleTemplate>(
+    `/api/role-templates/${id}/install`, json('POST', capabilityIds ? { capabilityIds } : {}),
+  ),
+  discoverCapabilities: (projectId?: string) => request<CapabilityDiscoveryReport>(
+    '/api/capabilities/discover', json('POST', projectId ? { projectId } : {}),
+  ),
+  installCapability: (id: string) => request<Capability>(`/api/capabilities/${id}/install`, json('POST')),
+  importLocalSkill: (selectionToken: string) => request<Capability>(
+    '/api/capabilities/import/local', json('POST', { selectionToken }),
+  ),
+  importGitHubSkills: (address: string) => request<Capability[]>(
+    '/api/capabilities/import/github', json('POST', { address }),
+  ),
+  importZipSkills: (selectionToken: string) => request<Capability[]>(
+    '/api/capabilities/import/zip', json('POST', { selectionToken }),
+  ),
   projects: () => request<Project[]>('/api/projects'),
   previewProjectSpaceRestore: (selectionToken: string) =>
     request<ProjectSpaceRestorePreview>('/api/project-space/restore/preview', json('POST', { selectionToken })),
@@ -98,6 +123,9 @@ export const api = {
     request<{ projectId: string; restoredTasks: number; stoppedTaskIds: string[] }>('/api/project-space/restore', json('POST', { selectionToken })),
   project: (id: string) => request<Project>(`/api/projects/${id}`),
   projectSettings: (id: string) => request<ProjectSettings>(`/api/projects/${id}/settings`),
+  projectCapabilities: (id: string) => request<ProjectCapability[]>(`/api/projects/${id}/capabilities`),
+  updateProjectCapability: (projectId: string, capabilityId: string, input: ProjectCapabilityUpdateInput) =>
+    request<ProjectCapability>(`/api/projects/${projectId}/capabilities/${capabilityId}`, json('PUT', input)),
   updateProjectSettings: (id: string, input: UpdateProjectSettingsInput) => request<ProjectSettings>(`/api/projects/${id}/settings`, json('PUT', input)),
   projectSpaceOperations: (id: string) => request<ProjectSpaceOperation[]>(`/api/projects/${id}/project-space-operations`),
   projectSpaceIntegrity: (id: string) => request<ProjectSpaceIntegrityReport>(`/api/projects/${id}/project-space-integrity`),
@@ -115,6 +143,7 @@ export const api = {
     request<KnowledgeItem>(`/api/knowledge/${id}/review`, json('POST', input)),
   tasks: (archived = false) => request<Task[]>(`/api/tasks?archived=${archived}`),
   task: (id: string) => request<Task>(`/api/tasks/${id}`),
+  taskCapabilities: (id: string) => request<TaskCapabilitySnapshot[]>(`/api/tasks/${id}/capabilities`),
   taskPlans: (id: string) => request<TaskPlan[]>(`/api/tasks/${id}/plans`),
   taskEvidence: (id: string) => request<Partial<TaskEvidence>>(`/api/tasks/${id}/evidence`).then(normalizeTaskEvidence),
   taskDiagnostics: (id: string) => request<TaskDiagnostics>(`/api/tasks/${id}/diagnostics`),

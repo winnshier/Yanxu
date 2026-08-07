@@ -5,6 +5,8 @@ export * from './execution-failure.js';
 export * from './git-workspace.js';
 export * from './plan-permissions.js';
 export * from './planning-context.js';
+export * from './capabilities.js';
+export * from './roles.js';
 export * from './project-space.js';
 export * from './project-state.js';
 export * from './store.js';

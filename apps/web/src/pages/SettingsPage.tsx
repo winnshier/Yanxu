@@ -14,6 +14,7 @@ export function SettingsPage() {
   const validations = useQuery({ queryKey: ['executor-validations'], queryFn: api.executorValidations });
   const diagnostics = useQuery({ queryKey: ['system-diagnostics'], queryFn: api.systemDiagnostics, refetchInterval: 15_000 });
   const health = useQuery({ queryKey: ['health'], queryFn: api.health, refetchInterval: 15_000, retry: 1 });
+  const coordinatorExecutor = Form.useWatch('coordinatorExecutor', form);
   useEffect(() => { if (settings.data) form.setFieldsValue(settings.data); }, [form, settings.data]);
   const probe = useMutation({
     mutationFn: api.probeExecutors,
@@ -33,7 +34,10 @@ export function SettingsPage() {
     },
     onError: (error: Error) => message.error(error.message),
   });
-  const openCode = executors.data?.find((item) => item.id === 'opencode');
+  const coordinatorInstallation = executors.data?.find((item) => item.id === coordinatorExecutor);
+  const coordinatorOptions = (executors.data ?? [])
+    .filter((item) => item.id !== 'codex' && item.capabilities.includes('structured-output'))
+    .map((item) => ({ label: item.name, value: item.id, disabled: item.health !== 'available' }));
 
   return (
     <div className="page-container settings-page">
@@ -62,7 +66,7 @@ export function SettingsPage() {
                     ];
                   })()}
                 />}
-                {executor.id === 'opencode' && <Button
+                {executor.id !== 'codex' && executor.capabilities.includes('structured-output') && <Button
                   className="settings-card"
                   disabled={executor.health !== 'available'}
                   loading={validate.isPending}
@@ -75,8 +79,8 @@ export function SettingsPage() {
         <Card title="协调与执行" className="settings-card settings-panel">
           <Form form={form} layout="vertical" onFinish={(values) => save.mutate(values)}>
             <Row gutter={20}>
-              <Col xs={24} md={12}><Form.Item name="coordinatorExecutor" label="全局协调 CLI"><Select options={[{ label: 'OpenCode', value: 'opencode' }]} /></Form.Item></Col>
-              <Col xs={24} md={12}><Form.Item name="coordinatorModel" label="全局协调模型" rules={[{ required: true, message: '请选择或输入 provider/model' }]}><AutoComplete options={(openCode?.models ?? []).map((model) => ({ label: model, value: model }))} placeholder="选择已检测模型，或输入 provider/model" /></Form.Item></Col>
+              <Col xs={24} md={12}><Form.Item name="coordinatorExecutor" label="全局协调 CLI"><Select options={coordinatorOptions} /></Form.Item></Col>
+              <Col xs={24} md={12}><Form.Item name="coordinatorModel" label="全局协调模型" rules={[{ required: true, message: '请选择或输入模型' }]}><AutoComplete options={(coordinatorInstallation?.models ?? []).map((model) => ({ label: model, value: model }))} placeholder={coordinatorExecutor === 'claude' ? '选择别名，或输入完整 Claude 模型 ID' : '选择已检测模型，或输入 provider/model'} /></Form.Item></Col>
               <Col xs={24} md={8}><Form.Item name="maxParallelTasks" label="最大并行任务数"><InputNumber min={1} max={8} className="full-width" /></Form.Item></Col>
               <Col xs={24} md={8}><Form.Item name="retryLimit" label="自动修复重试次数"><InputNumber min={0} max={5} className="full-width" /></Form.Item></Col>
               <Col xs={24} md={8}><Form.Item name="permissionMode" label="默认全托管模式" valuePropName="checked" getValueProps={(value) => ({ checked: value === 'managed' })} normalize={(checked) => checked ? 'managed' : 'standard'}><Switch /></Form.Item></Col>
@@ -96,8 +100,10 @@ export function SettingsPage() {
         </Card>
         <Card title="系统与存储" className="settings-card settings-panel">
           <Descriptions column={{ xs: 1, md: 2 }} items={[
+            { key: 'version', label: '应用版本', children: diagnostics.data?.appVersion ?? health.data?.version ?? '检查中' },
             { key: 'daemon', label: '本地服务', children: <Badge status={health.data?.status === 'ready' ? 'success' : 'warning'} text={health.data?.status ?? '连接中'} /> },
             { key: 'database', label: 'SQLite', children: <Badge status={health.data?.database === 'ready' ? 'success' : 'warning'} text={health.data?.database ?? '检查中'} /> },
+            { key: 'schema', label: '数据库 Schema', children: `${diagnostics.data?.databaseSchemaVersion ?? '—'} / ${diagnostics.data?.latestDatabaseSchemaVersion ?? '—'}` },
             { key: 'scheduler', label: 'Scheduler', children: health.data?.scheduler.running ? `运行中 · ${health.data.scheduler.activeJobs} 个任务` : '尚未启动' },
             { key: 'workbench', label: 'Workbench', children: <Typography.Text className="mono-text description-path" copyable>{settings.data?.workbenchHome ?? '—'}</Typography.Text> },
             { key: 'db-check', label: 'SQLite quick_check', children: diagnostics.data?.databaseCheck ?? '检查中' },
@@ -108,6 +114,10 @@ export function SettingsPage() {
             { key: 'space-failures', label: 'ProjectSpace 失败操作', children: diagnostics.data?.projectSpaceFailedOperations ?? 0 },
             { key: 'git', label: 'Git', children: diagnostics.data?.gitVersion ?? '未检测' },
             { key: 'daemon-log', label: '服务日志', children: <Typography.Text className="mono-text description-path" copyable>{diagnostics.data?.daemonLogPath ?? '加载中'}</Typography.Text> },
+            { key: 'daemon-log-size', label: '服务日志大小', children: `${Math.round((diagnostics.data?.daemonLogBytes ?? 0) / 1024)} KB` },
+            { key: 'migration-backup', label: '最近升级恢复点', children: diagnostics.data?.migrationRecoveryPoints[0]
+              ? <Typography.Text className="mono-text description-path" copyable>{diagnostics.data.migrationRecoveryPoints[0].backupPath}</Typography.Text>
+              : '尚未产生' },
           ]} />
         </Card>
       </Spin>

@@ -1,3 +1,5 @@
+export const YANXU_VERSION = '1.0.0';
+
 export const taskStatuses = [
   'DRAFT', 'COMPOSING_PLAN', 'WAITING_PLAN_APPROVAL', 'PREPARING', 'QUEUED',
   'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING', 'WAITING_APPROVAL',
@@ -8,7 +10,15 @@ export type TaskStatus = (typeof taskStatuses)[number];
 export type ExecutorType = 'opencode' | 'claude' | 'codex';
 export type ExecutorHealth = 'available' | 'unavailable' | 'unchecked';
 export type TaskStepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
+export type TaskFlowVersion = 1 | 2;
+export type TaskStepKind = 'legacy_skill' | 'work_unit';
+export type WorkUnitMode = 'read_only' | 'write';
 export type KnowledgeCategory = 'profile' | 'decision' | 'experience' | 'candidate';
+export type CapabilityKind = 'skill' | 'mcp';
+export type CapabilityLifecycleStatus = 'discovered' | 'imported' | 'installed';
+export type CapabilityParseStatus = 'valid' | 'invalid';
+export type CapabilityCommandStatus = 'not_applicable' | 'available' | 'missing' | 'unchecked';
+export type CapabilityRuntimeHealth = 'not_applicable' | 'unchecked' | 'healthy' | 'unhealthy' | 'needs_auth';
 
 export type ExecutionFailureCategory =
   | 'transient'
@@ -116,7 +126,7 @@ export interface ProjectSpaceOperation {
 }
 
 export interface ProjectSpaceIntegrityIssue {
-  entityType: 'task' | 'plan' | 'preapproval' | 'artifact' | 'attachment' | 'snapshot' | 'directory_profile' | 'delivery_report' | 'knowledge' | 'project_settings' | 'state_manifest';
+  entityType: 'task' | 'plan' | 'preapproval' | 'artifact' | 'attachment' | 'snapshot' | 'directory_profile' | 'delivery_report' | 'knowledge' | 'project_settings' | 'capability_lock' | 'state_manifest';
   entityId: string;
   artifactPath: string;
   expectedHash: string;
@@ -157,6 +167,7 @@ export interface ProjectSpaceRestorePreview {
 }
 
 export interface SystemHealth {
+  version: string;
   status: 'ready' | 'starting';
   service: 'yanxu-daemon';
   database: 'ready';
@@ -175,6 +186,28 @@ export interface RoleTemplate {
   skillIds: string[];
   defaultPermissions: string[];
   version: string;
+  origin: 'builtin' | 'external';
+  lifecycleStatus: 'builtin' | 'draft' | 'installed';
+  parseStatus: 'valid' | 'incompatible' | 'view_only';
+  parseError: string | null;
+  instructions: string;
+  capabilityIds: string[];
+  dependencyNames: string[];
+  compatibility: ExecutorType[];
+  source: CapabilitySource;
+  contentHash: string;
+  format: string;
+  managedPath: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+export interface RoleTemplateChangePreview {
+  roleId: string;
+  current: { version: string; contentHash: string; createdAt: string };
+  previous: { version: string; contentHash: string; createdAt: string } | null;
+  changedFields: string[];
+  instructionChanges: { added: string[]; removed: string[] };
 }
 
 export interface SkillDefinition {
@@ -191,6 +224,100 @@ export interface SkillDefinition {
   version: string;
 }
 
+export interface CapabilitySource {
+  type: 'opencode' | 'claude' | 'local_directory' | 'zip' | 'github' | 'builtin';
+  scope: 'global' | 'project' | 'plugin' | 'managed';
+  executor: ExecutorType | null;
+  ref: string;
+  version: string | null;
+}
+
+export interface CapabilitySecuritySummary {
+  files: string[];
+  scripts: string[];
+  executableFiles: string[];
+  networkHosts: string[];
+  environmentKeys: string[];
+  headerKeys: string[];
+  containsLiteralSecrets: boolean;
+}
+
+export interface Capability {
+  id: string;
+  originKey: string;
+  kind: CapabilityKind;
+  name: string;
+  description: string;
+  source: CapabilitySource;
+  version: string;
+  contentHash: string;
+  compatibility: ExecutorType[];
+  lifecycleStatus: CapabilityLifecycleStatus;
+  parseStatus: CapabilityParseStatus;
+  parseError: string | null;
+  commandStatus: CapabilityCommandStatus;
+  runtimeHealth: CapabilityRuntimeHealth;
+  credentialRefs: string[];
+  manifest: Record<string, unknown>;
+  managedPath: string | null;
+  security: CapabilitySecuritySummary;
+  lastDiscoveredAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ProjectCapability {
+  projectId: string;
+  capabilityId: string;
+  enabled: boolean;
+  lockedVersion: string;
+  lockedHash: string;
+  configuration: Record<string, unknown>;
+  enabledAt: string | null;
+  updatedAt: string;
+  capability: Capability;
+}
+
+export interface TaskCapabilitySnapshot {
+  id: string;
+  taskId: string;
+  stepId: string;
+  agentId: string;
+  capabilityId: string;
+  kind: CapabilityKind;
+  name: string;
+  version: string;
+  contentHash: string;
+  executor: ExecutorType;
+  configuration: Record<string, unknown>;
+  projectionPath: string | null;
+  status: 'frozen' | 'projected' | 'failed';
+  error: string | null;
+  createdAt: string;
+}
+
+export interface CapabilityDiscoveryReport {
+  scannedAt: string;
+  discovered: number;
+  updated: number;
+  invalid: number;
+  removed: number;
+  sourceErrors: Array<{ source: string; message: string }>;
+  capabilities: Capability[];
+}
+
+export interface CapabilityProjection {
+  taskId: string;
+  executor: ExecutorType;
+  configDirectory: string;
+  configPath: string;
+  capabilityIds: string[];
+  skillNames: string[];
+  mcpNames: string[];
+  contentHash: string;
+  createdAt: string;
+}
+
 export interface AgentProfile {
   id: string;
   name: string;
@@ -198,6 +325,7 @@ export interface AgentProfile {
   executor: ExecutorType;
   model: string;
   parameters: Record<string, unknown>;
+  defaultCapabilityIds: string[];
   permissionMode: 'standard' | 'managed';
   status: 'active' | 'inactive';
   createdAt: string;
@@ -219,6 +347,12 @@ export interface TaskStep {
   taskId: string;
   position: number;
   skillId: string;
+  kind?: TaskStepKind;
+  requiredCapabilities?: string[];
+  capabilityIds?: string[];
+  verification?: string[];
+  mode?: WorkUnitMode;
+  requiresIndependentSession?: boolean;
   agentId: string | null;
   title: string;
   description: string;
@@ -236,6 +370,12 @@ export interface ExecutionPlanStep {
   id: string;
   position: number;
   skillId: string;
+  kind?: TaskStepKind;
+  requiredCapabilities?: string[];
+  capabilityIds?: string[];
+  verification?: string[];
+  mode?: WorkUnitMode;
+  requiresIndependentSession?: boolean;
   agentId: string | null;
   title: string;
   description: string;
@@ -314,6 +454,7 @@ export interface TaskPlan {
   version: number;
   taskVersionId: string;
   taskVersion: number;
+  flowVersion?: TaskFlowVersion;
   preApprovalSkillIds: string[];
   goal: string;
   scope: string[];
@@ -362,8 +503,18 @@ export interface TaskRunSnapshot {
   plan: TaskPlan;
   team: Team;
   agents: AgentProfile[];
+  executors?: Array<{
+    executor: ExecutorType;
+    version: string | null;
+    executableHash: string | null;
+    capabilities: string[];
+    selectedModels: string[];
+    health: ExecutorHealth;
+    checkedAt: string | null;
+  }>;
   roles: RoleTemplate[];
   skills: SkillDefinition[];
+  capabilities?: TaskCapabilitySnapshot[];
   directories: ProjectDirectory[];
   permissionManifests: PermissionManifest[];
   contentHash: string;
@@ -406,7 +557,7 @@ export interface ArtifactVersion {
 }
 
 export interface ContextPackSource {
-  type: 'snapshot' | 'artifact' | 'knowledge' | 'directory' | 'event' | 'gate';
+  type: 'snapshot' | 'artifact' | 'result' | 'knowledge' | 'directory' | 'event' | 'gate';
   id: string;
   title: string;
   hash: string;
@@ -422,6 +573,19 @@ export interface TaskContextPack {
   plan: TaskPlan;
   currentStep: TaskStep;
   upstreamArtifacts: Array<ArtifactVersion & { content: string }>;
+  upstreamResults: Array<{
+    stepId: string;
+    title: string;
+    agentId: string | null;
+    externalSessionId: string | null;
+    summary: string;
+    issues: string[];
+    assumptions: string[];
+    reportedChecks: string[];
+    findings: ReviewFinding[];
+    resultPath: string;
+    contentHash: string;
+  }>;
   projectKnowledge: Array<Pick<KnowledgeItem, 'id' | 'category' | 'title' | 'content' | 'version'>>;
   directories: ProjectDirectory[];
   recentEvidence: WorkflowEvent[];
@@ -605,7 +769,7 @@ export interface TaskEvidence {
 
 export interface TaskLogChunk {
   taskId: string;
-  source: 'opencode-runtime';
+  source: 'unified-runtime' | 'opencode-runtime' | 'claude-runtime';
   cursor: number;
   nextCursor: number;
   totalBytes: number;
@@ -664,6 +828,7 @@ export interface Task {
   forbiddenPaths: string[];
   status: TaskStatus;
   stateVersion: number;
+  flowVersion?: TaskFlowVersion;
   progress: number;
   queuePosition?: number | null;
   activeStepId: string | null;
@@ -734,6 +899,9 @@ export interface ExecutorRuntimeValidation {
 }
 
 export interface SystemDiagnostics {
+  appVersion: string;
+  databaseSchemaVersion: number;
+  latestDatabaseSchemaVersion: number;
   databaseCheck: 'ok' | 'error';
   indexedProjectFiles: number;
   indexedKnowledgeEntries: number;
@@ -743,6 +911,16 @@ export interface SystemDiagnostics {
   gitVersion: string | null;
   workbenchHome: string;
   daemonLogPath: string;
+  daemonLogBytes: number;
+  migrationRecoveryPoints: Array<{
+    id: string;
+    fromVersion: number;
+    toVersion: number;
+    backupPath: string;
+    status: 'created' | 'restored';
+    createdAt: string;
+    restoredAt: string | null;
+  }>;
 }
 
 export interface TaskDiagnostics {

@@ -26,6 +26,7 @@ export const createAgentSchema = Type.Object({
   executor: Type.Union([Type.Literal('opencode'), Type.Literal('claude'), Type.Literal('codex')]),
   model: Type.String({ minLength: 1 }),
   parameters: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+  defaultCapabilityIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true })),
   permissionMode: Type.Optional(Type.Union([Type.Literal('standard'), Type.Literal('managed')])),
 });
 export type CreateAgentInput = Static<typeof createAgentSchema>;
@@ -73,6 +74,10 @@ export const answerPlanSchema = Type.Object({
     stepId: Type.String({ minLength: 1 }),
     agentId: Type.Union([Type.String({ minLength: 1 }), Type.Null()]),
   }))),
+  stepCapabilities: Type.Optional(Type.Array(Type.Object({
+    stepId: Type.String({ minLength: 1 }),
+    capabilityIds: Type.Array(Type.String({ minLength: 1 })),
+  }))),
   branchRoutes: Type.Optional(Type.Array(Type.Object({
     directoryId: Type.String({ minLength: 1 }),
     sourceBranch: Type.String({ minLength: 1 }),
@@ -82,6 +87,12 @@ export const answerPlanSchema = Type.Object({
   waivedGateIds: Type.Optional(Type.Array(Type.String({ minLength: 1 }))),
 });
 export type AnswerPlanInput = Static<typeof answerPlanSchema>;
+
+export const projectCapabilityUpdateSchema = Type.Object({
+  enabled: Type.Boolean(),
+  configuration: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
+});
+export type ProjectCapabilityUpdateInput = Static<typeof projectCapabilityUpdateSchema>;
 
 export const requestPlanRevisionSchema = Type.Object({
   stateVersion: Type.Number({ minimum: 0 }),

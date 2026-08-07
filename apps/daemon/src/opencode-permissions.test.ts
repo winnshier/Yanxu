@@ -53,4 +53,18 @@ describe('OpenCode workspace permissions', () => {
     expect(failure?.name).toBe('OpenCodePermissionPollingError');
     expect(failure?.message).toContain('metadata.timeout');
   });
+
+  it('allows only the skills and MCP tools frozen for the current WorkUnit', () => {
+    const rules = permissionRules('managed', true, {
+      allowedReadPatterns: [], allowedEditPatterns: [], allowedBashPatterns: [], taskGrants: [], forbiddenReadPatterns: [],
+      allowedSkillPatterns: ['react-review'],
+      allowedMcpToolPatterns: ['context7_*'],
+      deniedMcpToolPatterns: ['figma_*'],
+      denyUnlistedSkills: true,
+    });
+    expect(rules).toContainEqual({ permission: 'skill', pattern: '*', action: 'deny' });
+    expect(rules).toContainEqual({ permission: 'skill', pattern: 'react-review', action: 'allow' });
+    expect(rules).toContainEqual({ permission: 'context7_*', pattern: '*', action: 'allow' });
+    expect(rules).toContainEqual({ permission: 'figma_*', pattern: '*', action: 'deny' });
+  });
 });

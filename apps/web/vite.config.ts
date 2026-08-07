@@ -12,5 +12,9 @@ export default defineConfig({
   build: {
     target: 'es2023',
     sourcemap: true,
+    // Route pages are lazy chunks. The remaining shared React/Ant runtime is
+    // cached once by the local daemon and is currently about 708 kB minified
+    // (232 kB gzip), so keep the warning boundary tied to that measured budget.
+    chunkSizeWarningLimit: 750,
   },
 });

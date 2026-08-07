@@ -83,11 +83,10 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   }
 
   async executeStructured<T>(input: StructuredExecutionInput): Promise<StructuredExecutionResult<T>> {
-    this.sessionSequence += 1;
     this.prompts.push({ title: input.title, prompt: input.prompt });
     this.executions.push(input);
-    const sessionId = `fake-session-${this.sessionSequence}`;
-    input.runtime.sessionIds.push(sessionId);
+    const sessionId = input.resumeSessionId ?? `fake-session-${++this.sessionSequence}`;
+    if (!input.runtime.sessionIds.includes(sessionId)) input.runtime.sessionIds.push(sessionId);
     await input.onSessionStarted?.(sessionId);
 
     if (input.title.startsWith('确认前技能选择')) {
@@ -253,6 +252,7 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   }
 
   private step(skillId: string, agentId: string, title: string, expectedOutput: string, position: number) {
+    const mode = skillId === 'implementation' ? 'write' as const : 'read_only' as const;
     return {
       skillId,
       agentId,
@@ -261,6 +261,10 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
       inputs: position === 0 ? ['RequirementSpec'] : ['上游产物'],
       expectedOutput,
       directoryIds: [this.configuration.directoryId],
+      requiredCapabilities: [`${title}能力`],
+      verification: [`核对${title}结果`],
+      mode,
+      requiresIndependentSession: skillId === 'delivery-review',
     };
   }
 }
@@ -357,12 +361,15 @@ describe('scheduler end-to-end', () => {
       const deliveredEvidence = fixture.store.getTaskEvidence(task.id);
       expect(deliveredEvidence).toMatchObject({
         preApprovalArtifacts: [expect.objectContaining({ status: 'approved' })],
-        designedQualityGates: [expect.objectContaining({ name: 'critical acceptance' })],
-        gateAttempts: [
-          expect.objectContaining({ status: 'passed' }),
-          expect.objectContaining({ status: 'passed' }),
-        ],
+        designedQualityGates: [],
+        gateAttempts: [expect.objectContaining({ status: 'passed' })],
       });
+      const technicalExecution = fixture.adapter.executions.find((execution) => execution.title.includes('技术方案'));
+      const implementationExecution = fixture.adapter.executions.find((execution) => execution.title.includes('内容实施'));
+      const resumedSessionId = implementationExecution?.resumeSessionId;
+      expect(resumedSessionId).toBeDefined();
+      expect(resumedSessionId).toBe(technicalExecution?.runtime.sessionIds.find((id) => id === resumedSessionId));
+      expect(implementationExecution?.prompt).toContain('technical-plan completed');
       expect(deliveredEvidence.deliveryReport?.markdown).toContain('## 实际变更');
       const implementationArtifact = deliveredEvidence.artifacts.find((artifact) => artifact.artifactType === 'implementation-report');
       const reviewExecution = fixture.adapter.executions.find((execution) => execution.title.includes('交付评审'));
@@ -526,7 +533,7 @@ describe('scheduler end-to-end', () => {
       expect(preserved.stdout).toContain('feature.txt');
       expect(task.steps[0]).toMatchObject({ status: 'failed', attempt: 1 });
       expect(fixture.store.listEvents(task.id)).toEqual(expect.arrayContaining([
-        expect.objectContaining({ type: 'skill_step.blocked' }),
+        expect.objectContaining({ type: 'work_unit.blocked' }),
         expect.objectContaining({ type: 'task.blocked' }),
       ]));
 
@@ -557,17 +564,17 @@ describe('scheduler end-to-end', () => {
       task = await waitFor(
         () => fixture.store.getTask(fixture.taskId),
         (current) => current.status === 'RUNNING'
-          && current.steps.find((step) => step.skillId === 'implementation')?.status === 'running',
+          && current.steps.find((step) => step.title === '内容实施')?.status === 'running',
       );
 
       task = fixture.store.commandTask(task.id, 'pause', task.stateVersion);
       expect(task.status).toBe('PAUSED');
       task = await waitFor(
         () => fixture.store.getTask(fixture.taskId),
-        (current) => current.steps.find((step) => step.skillId === 'implementation')?.status === 'succeeded',
+        (current) => current.steps.find((step) => step.title === '内容实施')?.status === 'succeeded',
       );
       expect(task.status).toBe('PAUSED');
-      expect(task.steps.find((step) => step.skillId === 'test-design')?.status).toBe('pending');
+      expect(task.steps.find((step) => step.title === '测试设计')?.status).toBe('pending');
       expect(fixture.store.getTaskEvidence(task.id).sessions.at(-1)?.status).toBe('succeeded');
 
       task = fixture.store.commandTask(task.id, 'resume', task.stateVersion);

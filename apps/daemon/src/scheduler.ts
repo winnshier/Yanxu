@@ -7,12 +7,12 @@ import type {
   SkillArtifactOutput,
   SkillDefinition,
   TaskContextPack,
+  ExecutorType,
   TaskFileDiff,
   TaskPlan,
 } from '@yanxu/contracts';
 import { commandPatternsForPlanPermissions, DomainError, GitWorkspaceManager } from '@yanxu/core';
 import type { ClaimedJob, YanxuStore } from '@yanxu/core';
-import { OpenCodeAdapter } from '@yanxu/executors';
 import type { ExecutorAdapter, RuntimeHandle } from '@yanxu/executors';
 import type { ExecutorRegistry } from './executor-registry.js';
 import { runQualityGates } from './quality-gates.js';
@@ -60,13 +60,18 @@ interface ComposedPlanOutput {
     options: ComposedPlanQuestionOption[];
   }>;
   steps: Array<{
-    skillId: string;
+    skillId?: string;
     agentId: string | null;
     title: string;
     description: string;
     inputs: string[];
     expectedOutput: string;
     directoryIds: string[];
+    requiredCapabilities?: string[];
+    capabilityIds?: string[];
+    verification?: string[];
+    mode?: 'read_only' | 'write';
+    requiresIndependentSession?: boolean;
   }>;
   permissions: string[];
   qualityGates: Array<{
@@ -178,6 +183,38 @@ const composedPlanSchema: Record<string, unknown> = {
   required: ['goal', 'scope', 'nonScope', 'successCriteria', 'assumptions', 'risks', 'questions', 'steps', 'permissions', 'qualityGates'],
 };
 
+const workUnitComposedPlanSchema: Record<string, unknown> = {
+  ...composedPlanSchema,
+  properties: {
+    ...(composedPlanSchema.properties as Record<string, unknown>),
+    steps: {
+      type: 'array',
+      minItems: 1,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          agentId: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          title: { type: 'string' },
+          description: { type: 'string' },
+          inputs: { type: 'array', items: { type: 'string' } },
+          expectedOutput: { type: 'string' },
+          directoryIds: { type: 'array', minItems: 1, items: { type: 'string' } },
+          requiredCapabilities: { type: 'array', items: { type: 'string' } },
+          capabilityIds: { type: 'array', uniqueItems: true, items: { type: 'string' } },
+          verification: { type: 'array', items: { type: 'string' } },
+          mode: { type: 'string', enum: ['read_only', 'write'] },
+          requiresIndependentSession: { type: 'boolean' },
+        },
+        required: [
+          'agentId', 'title', 'description', 'inputs', 'expectedOutput', 'directoryIds',
+          'requiredCapabilities', 'capabilityIds', 'verification', 'mode', 'requiresIndependentSession',
+        ],
+      },
+    },
+  },
+};
+
 function normalizePlanQuestionOptions(options: ComposedPlanQuestionOption[]): PlanQuestionOption[] {
   const normalized = options
     .map((option) => ({
@@ -221,6 +258,59 @@ export interface SkillResult {
     evidence: string;
   }>;
 }
+
+export interface WorkUnitResult {
+  status: 'succeeded' | 'changes_required' | 'blocked';
+  summary: string;
+  artifacts?: SkillArtifactOutput[];
+  issues: string[];
+  findings?: ReviewFinding[];
+  assumptions: string[];
+  requestedScopeChanges: string[];
+  reportedChecks: string[];
+}
+
+export const workUnitResultSchema: Record<string, unknown> = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    status: { type: 'string', enum: ['succeeded', 'changes_required', 'blocked'] },
+    summary: { type: 'string' },
+    artifacts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          type: { type: 'string' },
+          title: { type: 'string' },
+          content: { type: 'string' },
+          path: { type: 'string' },
+          metadata: { type: 'object', additionalProperties: true },
+        },
+        required: ['type', 'content'],
+      },
+    },
+    issues: { type: 'array', items: { type: 'string' } },
+    findings: {
+      type: 'array',
+      items: {
+        type: 'object', additionalProperties: false,
+        properties: {
+          severity: { type: 'string', enum: ['critical', 'major', 'minor', 'suggestion'] },
+          category: { type: 'string', enum: ['correctness', 'security', 'testing', 'maintainability', 'scope', 'documentation', 'other'] },
+          title: { type: 'string' }, description: { type: 'string' }, evidence: { type: 'string' },
+          location: { type: 'string' }, recommendation: { type: 'string' }, blocking: { type: 'boolean' },
+        },
+        required: ['severity', 'category', 'title', 'description', 'evidence', 'recommendation', 'blocking'],
+      },
+    },
+    assumptions: { type: 'array', items: { type: 'string' } },
+    requestedScopeChanges: { type: 'array', items: { type: 'string' } },
+    reportedChecks: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['status', 'summary', 'issues', 'assumptions', 'requestedScopeChanges', 'reportedChecks'],
+};
 
 export function skillResultSchema(skill: SkillDefinition): Record<string, unknown> {
   const allowedStatuses = skill.canBlockDelivery
@@ -417,9 +507,9 @@ export function normalizeSkillResultOutcome(skill: SkillDefinition, result: Skil
 
 export class Scheduler {
   private readonly instanceId = `daemon_${randomUUID().replaceAll('-', '')}`;
-  private readonly adapter: ExecutorAdapter;
+  private readonly adapterOverride: ExecutorAdapter | undefined;
   private readonly git: GitWorkspaceManager;
-  private readonly runtimes = new Map<string, RuntimeHandle>();
+  private readonly runtimes = new Map<string, { runtime: RuntimeHandle; adapter: ExecutorAdapter }>();
   private readonly taskAbortControllers = new Map<string, Set<AbortController>>();
   private timer: NodeJS.Timeout | null = null;
   private readonly activeJobs = new Set<string>();
@@ -427,10 +517,10 @@ export class Scheduler {
   constructor(
     private readonly store: YanxuStore,
     private readonly executors: ExecutorRegistry,
-    adapter: ExecutorAdapter = new OpenCodeAdapter(),
+    adapter?: ExecutorAdapter,
     private readonly pollIntervalMs = 750,
   ) {
-    this.adapter = adapter;
+    this.adapterOverride = adapter;
     this.git = new GitWorkspaceManager(store.workbenchHome);
   }
 
@@ -452,17 +542,22 @@ export class Scheduler {
       for (const controller of controllers) controller.abort();
     }
     this.taskAbortControllers.clear();
-    for (const runtime of this.runtimes.values()) void this.adapter.stopRuntime(runtime);
+    for (const binding of this.runtimes.values()) void binding.adapter.stopRuntime(binding.runtime);
     this.runtimes.clear();
   }
 
   async abortTask(taskId: string): Promise<void> {
     for (const controller of this.taskAbortControllers.get(taskId) ?? []) controller.abort();
-    const runtime = this.runtimes.get(taskId);
-    if (runtime) {
-      await this.adapter.stopRuntime(runtime);
+    const binding = this.runtimes.get(taskId);
+    if (binding) {
+      await binding.adapter.stopRuntime(binding.runtime);
       this.runtimes.delete(taskId);
     }
+  }
+
+  private async adapterFor(executor: ExecutorType): Promise<ExecutorAdapter> {
+    if (this.adapterOverride && executor === 'opencode') return this.adapterOverride;
+    return this.executors.adapter(executor);
   }
 
   async mergeTask(taskId: string) {
@@ -643,15 +738,29 @@ export class Scheduler {
     const taskId = job.aggregateId;
     const step = this.store.startOrResumeStep(taskId);
     this.store.assertJobExecutionCurrent(job, 'before_result', step);
-    if (!step.agentId) throw new Error(`No agent is assigned to skill ${step.skillId}.`);
+    if (!step.agentId) throw new Error(`No agent is assigned to execution unit ${step.title}.`);
     const snapshot = this.store.getRunSnapshot(taskId);
     if (!snapshot) throw new Error('Confirmed task run snapshot is missing.');
     const agent = snapshot.agents.find((item) => item.id === step.agentId);
     if (!agent) throw new Error(`Agent ${step.agentId} is missing from the confirmed task run snapshot.`);
     const skill = snapshot.skills.find((item) => item.id === step.skillId);
-    if (!skill) throw new Error(`Skill ${step.skillId} is missing from the confirmed task run snapshot.`);
-    if (agent.executor !== 'opencode') throw new Error(`Executor ${agent.executor} is not supported yet.`);
-    await this.executors.ensureAvailable(agent.executor);
+    if (step.kind !== 'work_unit' && !skill) {
+      throw new Error(`Skill ${step.skillId} is missing from the confirmed task run snapshot.`);
+    }
+    const installation = await this.executors.ensureAvailable(agent.executor);
+    if (!installation.capabilities.includes('structured-output') || !installation.capabilities.includes('sessions')) {
+      throw new DomainError('EXECUTOR_CAPABILITY_MISSING', `${installation.name} 缺少统一执行所需的 Session 或结构化输出能力。`, 422, {
+        executor: agent.executor,
+        capabilities: installation.capabilities,
+      });
+    }
+    this.store.recordExecutorRuntimeCheck(
+      taskId,
+      step.id,
+      installation,
+      snapshot.executors?.find((item) => item.executor === agent.executor),
+    );
+    const adapter = await this.adapterFor(agent.executor);
     const permissionManifest = snapshot.permissionManifests?.find((item) => item.stepId === step.id);
     if (permissionManifest && permissionManifest.agentId !== agent.id) {
       throw new Error(`Permission manifest for step ${step.id} does not match its confirmed agent.`);
@@ -662,35 +771,100 @@ export class Scheduler {
     const contextPack = this.store.buildContextPack(taskId, step.id);
     const contextReadPatterns = contextPackReadPathPatterns(contextPack);
     const sessionRecordId = this.store.createAgentSession(taskId, step, agent);
-    const readOnly = permissionManifest?.readOnly ?? step.skillId !== 'implementation';
+    const readOnly = permissionManifest?.readOnly
+      ?? (step.kind === 'work_unit' ? step.mode !== 'write' : step.skillId !== 'implementation');
     const commandPatterns = [...new Set([
       'pwd',
       'ls',
       'ls -la',
       ...commandPatternsForPlanPermissions(snapshot.plan),
       ...(permissionManifest?.allowedCommandPatterns
-        ?? (step.skillId === 'implementation' || step.skillId === 'test-execution'
+        ?? (step.kind === 'work_unit' && step.mode === 'write'
+          || step.skillId === 'implementation' || step.skillId === 'test-execution'
           ? this.allowedStepCommands(permissionDirectoryIds, snapshot)
           : ['git status*', 'git diff*'])),
     ])];
     const executionSettings = this.store.getSettings(this.executors.list());
+    const taskCapabilities = snapshot.capabilities ?? [];
+    const stepCapabilities = taskCapabilities.filter((item) => item.stepId === step.id && item.agentId === agent.id);
+    const allowedSkillPatterns = stepCapabilities.filter((item) => item.kind === 'skill').map((item) => item.name);
+    const allowedMcpToolPatterns = stepCapabilities.filter((item) => item.kind === 'mcp').map((item) => `${item.name}_*`);
+    const deniedMcpToolPatterns = taskCapabilities
+      .filter((item) => item.kind === 'mcp' && !stepCapabilities.some((selected) => selected.id === item.id))
+      .map((item) => `${item.name}_*`);
     const abortController = this.registerTaskAbortController(taskId);
     const sessionTimeout = setTimeout(() => abortController.abort(), executionSettings.sessionTimeoutMs);
-    let runtime = this.runtimes.get(taskId);
+    let binding = this.runtimes.get(taskId);
     try {
-      if (!runtime) {
-        const workspaceRoot = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'workspace');
-        runtime = await this.adapter.startRuntime(workspaceRoot, join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'executor'));
-        this.runtimes.set(taskId, runtime);
+      if (binding && binding.runtime.executor !== agent.executor) {
+        await binding.adapter.stopRuntime(binding.runtime);
+        this.runtimes.delete(taskId);
+        binding = undefined;
       }
-      const result = await this.adapter.executeStructured<SkillResult>({
+      if (!binding) {
+        const workspaceRoot = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'workspace');
+        const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'executor');
+        this.store.prepareTaskCapabilityProjection(taskId, agent.executor, runtimeDirectory);
+        const runtime = await adapter.startRuntime(workspaceRoot, runtimeDirectory);
+        binding = { runtime, adapter };
+        this.runtimes.set(taskId, binding);
+      }
+      const runtime = binding.runtime;
+      const resumeSessionId = step.requiresIndependentSession
+        ? null
+        : this.store.getResumableExternalSession(taskId, agent.id);
+      const result = step.kind === 'work_unit'
+        ? await adapter.executeStructured<WorkUnitResult>({
+          runtime,
+          title: `${step.position + 1}. ${step.title}`,
+          model: agent.model,
+          schema: workUnitResultSchema,
+          abortSignal: abortController.signal,
+          permissionMode: permissionManifest?.permissionMode ?? agent.permissionMode,
+          readOnly,
+          ...(resumeSessionId ? { resumeSessionId } : {}),
+          policy: {
+            allowedReadPatterns: [
+              ...this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
+              ...contextReadPatterns,
+            ],
+            allowedExternalDirectoryPatterns: contextReadPatterns,
+            allowedEditPatterns: this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
+            allowedBashPatterns: commandPatterns,
+            allowedSkillPatterns,
+            allowedMcpToolPatterns,
+            deniedMcpToolPatterns,
+            denyUnlistedSkills: true,
+            taskGrants: this.store.listTaskPermissionGrants(taskId),
+            forbiddenReadPatterns: this.forbiddenReadPatterns(permissionDirectoryIds, snapshot),
+            networkPolicy: executionSettings.networkPolicy,
+            dependencyInstallPolicy: executionSettings.dependencyInstallPolicy,
+          },
+          onSessionStarted: (externalSessionId) => {
+            this.store.recordExternalSessionId(sessionRecordId, externalSessionId);
+          },
+          onPermission: async (request) => {
+            const permission = this.store.createPermissionRequest(taskId, request.sessionId, request);
+            while (true) {
+              const current = this.store.getPermissionRequest(permission.id);
+              if (current.status === 'resolved' && current.decision) return current.decision;
+              if (this.store.getTask(taskId).status === 'STOPPED') {
+                return this.store.respondPermission(permission.id, 'reject', '任务已停止。').decision ?? 'reject';
+              }
+              await new Promise((resolve) => setTimeout(resolve, 500));
+            }
+          },
+          prompt: this.workUnitPrompt(this.store.getTask(taskId), step.id, snapshot, contextPack),
+        })
+        : await adapter.executeStructured<SkillResult>({
         runtime,
         title: `${step.position + 1}. ${step.title}`,
         model: agent.model,
-        schema: skillResultSchema(skill),
+        schema: skillResultSchema(skill!),
         abortSignal: abortController.signal,
         permissionMode: permissionManifest?.permissionMode ?? agent.permissionMode,
         readOnly,
+        ...(resumeSessionId ? { resumeSessionId } : {}),
         policy: {
           allowedReadPatterns: [
             ...this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
@@ -699,6 +873,10 @@ export class Scheduler {
           allowedExternalDirectoryPatterns: contextReadPatterns,
           allowedEditPatterns: this.workspacePermissionPatterns(permissionDirectoryIds, snapshot, workspaces),
           allowedBashPatterns: commandPatterns,
+          allowedSkillPatterns,
+          allowedMcpToolPatterns,
+          deniedMcpToolPatterns,
+          denyUnlistedSkills: true,
           taskGrants: this.store.listTaskPermissionGrants(taskId),
           forbiddenReadPatterns: this.forbiddenReadPatterns(permissionDirectoryIds, snapshot),
           networkPolicy: executionSettings.networkPolicy,
@@ -720,8 +898,13 @@ export class Scheduler {
         },
         prompt: this.skillPrompt(this.store.getTask(taskId), step.id, snapshot, contextPack),
       });
-      result.output = normalizeSkillResultOutcome(skill, result.output);
-      validateSkillResult(skill, result.output);
+      if (step.kind !== 'work_unit') {
+        const legacyOutput = normalizeSkillResultOutcome(skill!, result.output as SkillResult);
+        validateSkillResult(skill!, legacyOutput);
+        result.output = legacyOutput;
+      } else if (result.output.status === 'blocked' && result.output.issues.length === 0) {
+        throw new DomainError('WORK_UNIT_BLOCK_REASON_REQUIRED', '执行单元返回 blocked 时必须说明可操作的阻塞原因。', 422);
+      }
       this.store.assertJobExecutionCurrent(job, 'before_result', step);
       const taskAfterExecution = this.store.getTask(taskId);
       if (!['RUNNING', 'RETRYING', 'PAUSED'].includes(taskAfterExecution.status)) {
@@ -758,7 +941,7 @@ export class Scheduler {
             baseCommits.get(workspace.directoryId) ?? workspace.baselineCommit,
           );
         }
-        await this.adapter.stopRuntime(runtime);
+        await adapter.stopRuntime(runtime);
         this.runtimes.delete(taskId);
         return;
       }
@@ -770,7 +953,7 @@ export class Scheduler {
         })))
         : [];
       if (readOnlyChanges.length > 0) {
-        this.store.recordSessionFailure(sessionRecordId, step.id, '只读 SkillStep 产生了工作区文件改动，结果未入库。');
+        this.store.recordSessionFailure(sessionRecordId, step.id, `只读${step.kind === 'work_unit' ? ' WorkUnit' : ' SkillStep'} 产生了工作区文件改动，结果未入库。`);
         this.store.handleScopeViolation(taskId, step.id, {
           reason: 'read_only_change',
           files: readOnlyChanges,
@@ -781,7 +964,7 @@ export class Scheduler {
             baseCommits.get(workspace.directoryId) ?? workspace.baselineCommit,
           );
         }
-        await this.adapter.stopRuntime(runtime);
+        await adapter.stopRuntime(runtime);
         this.runtimes.delete(taskId);
         return;
       }
@@ -802,7 +985,7 @@ export class Scheduler {
             baseCommits.get(workspace.directoryId) ?? workspace.baselineCommit,
           );
         }
-        await this.adapter.stopRuntime(runtime);
+        await adapter.stopRuntime(runtime);
         this.runtimes.delete(taskId);
         return;
       }
@@ -821,22 +1004,23 @@ export class Scheduler {
           step.id,
           sessionRecordId,
           result.sessionId,
-          { ...result.output, status },
+          { ...result.output, artifacts: result.output.artifacts ?? [], status },
           this.store.getSettings(this.executors.list()).retryLimit,
         );
         if (['BLOCKED', 'STOPPED', 'CANCELLED', 'ARCHIVED'].includes(outcomeTask.status)) {
-          await this.adapter.stopRuntime(runtime);
+          await adapter.stopRuntime(runtime);
           this.runtimes.delete(taskId);
         }
         return;
       }
-      if (step.skillId === 'implementation') {
+      if ((step.kind === 'work_unit' && step.mode === 'write')
+        || (step.kind !== 'work_unit' && step.skillId === 'implementation')) {
         const changedFiles = inspections.flatMap((inspection) =>
           inspection.files.map((file) => `${inspection.directoryId}:${file.path}`));
         if (changedFiles.length === 0) {
           throw new DomainError(
-            'IMPLEMENTATION_CHANGE_REQUIRED',
-            '内容实施返回成功，但隔离工作区没有任何可由 Git 重建的文件变更。Artifact 内容不能代替实际文件落盘。',
+            'WORK_UNIT_CHANGE_REQUIRED',
+            '可写执行单元返回成功，但隔离工作区没有任何可由 Git 重建的文件变更。报告内容不能代替实际文件落盘。',
             422,
             {
               taskId,
@@ -858,17 +1042,20 @@ export class Scheduler {
           inspection,
         };
       });
-      this.store.completeStep(taskId, step.id, sessionRecordId, result.sessionId, result.output, checkpoints);
+      this.store.completeStep(taskId, step.id, sessionRecordId, result.sessionId, {
+        ...result.output,
+        artifacts: result.output.artifacts ?? [],
+      }, checkpoints);
       const current = this.store.getTask(taskId);
       if (['DELIVERED', 'BLOCKED', 'STOPPED', 'CANCELLED', 'ARCHIVED'].includes(current.status)) {
-        await this.adapter.stopRuntime(runtime);
+        await adapter.stopRuntime(runtime);
         this.runtimes.delete(taskId);
       }
     } catch (error) {
       this.store.recordSessionFailure(sessionRecordId, step.id, error instanceof Error ? error.message : String(error));
-      const failedRuntime = this.runtimes.get(taskId);
-      if (failedRuntime) {
-        await this.adapter.stopRuntime(failedRuntime);
+      const failedBinding = this.runtimes.get(taskId);
+      if (failedBinding) {
+        await failedBinding.adapter.stopRuntime(failedBinding.runtime);
         this.runtimes.delete(taskId);
       }
       throw error;
@@ -940,12 +1127,66 @@ export class Scheduler {
       ? '\n测试设计的 test-plan artifact.metadata.qualityGates 必须列出专项可执行门禁；每条 commandArgv 只能在冻结计划已有同目录命令后追加更窄的测试范围或参数，不能更换可执行程序或子命令。没有安全专项门禁时返回空数组并在正文说明原因。'
       : '';
     const workspaceRule = step.skillId === 'implementation'
-      ? '当前步骤必须使用 OpenCode 的 Write/Edit 文件工具把批准的代码或文档真实写入授权隔离工作区。创建新文件时直接把授权工作区内的绝对文件路径交给 Write；Write 会递归创建缺失的父目录，不要先调用 mkdir，也不要用 echo、cat 或重定向代替文件工具。Artifact 只是实现报告，不能代替工作区文件；返回 succeeded 前必须通过 Git status/diff 确认至少一个批准范围内的文件发生变更，否则研序会拒绝本次结果。'
+      ? '当前步骤必须使用当前 CLI 的原生文件编辑工具把批准的代码或文档真实写入授权隔离工作区。创建新文件时直接使用授权工作区内的绝对文件路径；不要用报告代替真实修改。Artifact 只是实现报告；返回 succeeded 前必须通过 Git status/diff 确认至少一个批准范围内的文件发生变更，否则研序会拒绝本次结果。'
       : '当前步骤工作区只读；不要在代码仓库或临时目录创建产物，完整内容必须通过 artifacts 返回，研序会将其版本化写入 ProjectSpace。';
     const reviewRule = step.skillId === 'delivery-review'
       ? ' 评审必须先核对 ChangeManifest 和 Git 实际文件：实施步骤 files=0、checkpoint 等于 baseline，或计划要求的目标文件不存在时，必须判定 changes_required。上下文中的 Artifact 摘要被截断时，应从授权只读工作区读取 ChangeManifest 对应文件，不得把截断误判为文件缺失。每个问题必须写入 findings，包含 severity、category、证据、定位、建议和 blocking；critical/major 一律阻塞交付并返回 changes_required，minor/suggestion 可以随 succeeded 交付但必须保留在报告。issues 仅用于兼容旧输出；一旦填写会按阻塞问题保守处理。'
       : '';
     return `你正在研序中以“${role?.name ?? '执行人员'}”身份执行 Skill“${skill?.name ?? step.skillId}”。\n\n责任边界：\n${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成当前步骤'}\n\n当前 Skill 目标：${step.description || skill?.description}\n本步骤输入：${step.inputs.join('；') || '当前任务和上游结构化产物'}\n预期结构化产出：${step.expectedOutput}\n必需 Artifact 类型：${skill?.artifactTypes.join('、') ?? '按 Schema 返回'}\n必须逐项验证的完成条件：\n${skill?.completionChecks.map((item) => `- ${item}`).join('\n') ?? '- 按批准计划完成'}\n\n本步骤最小上下文包（包含冻结计划、上游 ArtifactVersion、相关项目知识和失败证据；其中项目目录只提供元数据，不是可直接访问的物理路径）：\n${JSON.stringify(executionContextPack, null, 2)}\n\n本步骤授权的隔离工作区（只能在这些路径内工作）：\n${JSON.stringify(workspaces, null, 2)}\n\n规则：${workspaceRule}${reviewRule} 严格遵守已批准范围；不要访问上下文提到的原始仓库位置，只能使用上方授权的隔离工作区；不要 push、创建远程 PR 或部署；不要读取密钥与环境变量文件；需要扩大范围时不要擅自实施，在 requestedScopeChanges 中说明。artifacts 必须返回 Schema 指定的必需类型，content 应是可供下一步骤直接消费的完整结构化 Markdown，而不是只返回工作区路径。completionChecks 必须逐项给出 passed/failed 和可追溯证据。测试执行或交付评审发现必须整改的问题时返回 changes_required；任何 Skill 因工具权限、运行环境或缺少必要输入而无法安全继续时返回 blocked，并在 issues 中写明可操作原因；其他情况不得用非成功状态代替范围变更。reportedChecks 只是你的报告，研序会独立运行质量门禁。${testDesignRule}`;
+  }
+
+  private workUnitPrompt(
+    task: ReturnType<YanxuStore['getTask']>,
+    stepId: string,
+    snapshot: NonNullable<ReturnType<YanxuStore['getRunSnapshot']>>,
+    contextPack: TaskContextPack,
+  ): string {
+    const step = task.steps.find((item) => item.id === stepId);
+    if (!step) throw new Error(`Step ${stepId} is missing.`);
+    const agent = step.agentId ? snapshot.agents.find((item) => item.id === step.agentId) : null;
+    const role = snapshot.roles.find((item) => item.id === agent?.roleId);
+    const workspaces = this.store.getPreparedWorkspaces(task.id)
+      .filter((workspace) => step.directoryIds.includes(workspace.directoryId));
+    const modeRule = step.mode === 'write'
+      ? '这是可写执行单元。使用当前 CLI 的原生 Write/Edit 文件工具在授权隔离工作区内完成真实修改；Write 会递归创建缺失的父目录，不要先调用 mkdir，也不要用 echo、cat 或重定向代替文件工具。用 Git diff/status 核对结果，不要用报告代替文件落盘。'
+      : '这是只读执行单元。只检查、分析和给出结论，不得修改隔离工作区文件。';
+    const independentRule = step.requiresIndependentSession
+      ? '这是独立复核会话，不要默认信任前序人员的自述；以工作区、Git 变更和实际门禁证据为准。'
+      : '这是同一任务的连续执行；优先利用会话中已经建立的项目理解，并用当前上下文包校准可能变化的事实。';
+    const loadedCapabilities = (snapshot.capabilities ?? [])
+      .filter((item) => item.stepId === step.id && item.agentId === agent?.id)
+      .map((item) => ({ id: item.capabilityId, name: item.name, kind: item.kind, version: item.version }));
+    return `你正在研序中以“${role?.name ?? '执行人员'}”身份，通过 ${agent?.executor ?? '本地 CLI'} 完成一个 WorkUnit。研序只负责边界、状态、证据和重试；请使用当前 CLI 自身的项目理解、工具和工作方式完成目标，不要把工作机械套入固定 Skill 模板。
+
+角色责任：
+${role?.responsibilities.map((item) => `- ${item}`).join('\n') ?? '- 对当前执行单元的结果负责'}
+
+角色基础指令：
+${role?.instructions || '遵守已批准计划和当前责任边界。'}
+
+执行单元：${step.title}
+目标：${step.description}
+输入：${step.inputs.join('；') || '已确认计划与当前任务上下文'}
+预期结果：${step.expectedOutput}
+所需能力：${step.requiredCapabilities?.join('、') || '通用项目执行能力'}
+本单元已装载能力：${loadedCapabilities.length ? JSON.stringify(loadedCapabilities) : '无'}
+验证关注点：
+${step.verification?.map((item) => `- ${item}`).join('\n') || '- 对照任务成功标准验证'}
+
+最小上下文包（包含冻结计划、项目知识、前序结果、真实质量门禁与失败日志）：
+${JSON.stringify(contextPack, null, 2)}
+
+授权隔离工作区：
+${JSON.stringify(workspaces, null, 2)}
+
+规则：
+- ${modeRule}
+- ${independentRule}
+- 只能访问授权工作区和上下文包显式列出的只读证据；不得访问原始仓库、密钥或环境变量文件。
+- 不要 push、创建远程 PR 或部署。需要扩大目录、文件或命令范围时，停止实施并填写 requestedScopeChanges。
+- artifacts 是可选的补充说明，不要求固定类型，也不能代替真实文件和实际检查。
+- reportedChecks 只记录你实际做过的检查；研序以真实命令退出码和 Git 证据作为最终质量事实。
+- 完成目标返回 succeeded；发现必须由前序写入单元整改的问题返回 changes_required 并给出具体证据；因权限、环境或必要输入缺失无法继续时返回 blocked，并在 issues 中说明可操作原因。`;
   }
 
   private async composePlan(
@@ -957,31 +1198,34 @@ export class Scheduler {
     const task = this.store.getTask(taskId);
     const project = this.store.getProject(task.projectId);
     const settings = this.store.getSettings(this.executors.list());
-    if (settings.coordinatorExecutor !== 'opencode') throw new Error('Only OpenCode coordinator is supported in the first release.');
     if (!settings.coordinatorModel) throw new Error('Coordinator model is not configured.');
-    await this.executors.ensureAvailable('opencode');
+    await this.executors.ensureAvailable(settings.coordinatorExecutor);
+    const adapter = await this.adapterFor(settings.coordinatorExecutor);
 
     const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'coordinator', task.id);
     const abortController = this.registerTaskAbortController(taskId);
     const sessionTimeout = setTimeout(() => abortController.abort(), settings.sessionTimeoutMs);
     let runtime: RuntimeHandle | null = null;
     try {
-      runtime = await this.adapter.startRuntime(project.projectSpacePath, runtimeDirectory);
-      this.runtimes.set(taskId, runtime);
+      runtime = await adapter.startRuntime(project.projectSpacePath, runtimeDirectory);
+      this.runtimes.set(taskId, { runtime, adapter });
       if (abortController.signal.aborted) {
-        const error = new Error('OpenCode coordinator session was aborted.');
+        const error = new Error(`${settings.coordinatorExecutor} coordinator session was aborted.`);
         error.name = 'AbortError';
         throw error;
       }
       const requirementSkill = this.store.getBuiltins().skills.find((skill) => skill.id === 'requirement-specification');
       if (!requirementSkill) throw new Error('Built-in requirement specification skill is missing.');
       const team = this.store.getTeam(task.teamId);
-      const productAgent = this.store.listAgents().find((agent) => {
-        if (!team.memberIds.includes(agent.id) || agent.executor !== 'opencode') return false;
-        const role = this.store.getBuiltins().roles.find((item) => item.id === agent.roleId);
-        return role?.skillIds.includes(requirementSkill.id);
-      });
-      const decision = await this.adapter.executeStructured<PreApprovalDecision>({
+      const teamCoordinatorAgents = this.store.listAgents().filter((agent) =>
+        team.memberIds.includes(agent.id) && agent.executor === settings.coordinatorExecutor);
+      const productAgent = task.flowVersion === 2
+        ? teamCoordinatorAgents.find((agent) => agent.roleId === 'product') ?? teamCoordinatorAgents[0]
+        : teamCoordinatorAgents.find((agent) => {
+          const role = this.store.getBuiltins().roles.find((item) => item.id === agent.roleId);
+          return role?.skillIds.includes(requirementSkill.id);
+        });
+      const decision = await adapter.executeStructured<PreApprovalDecision>({
         runtime,
         title: `确认前技能选择 · ${task.title}`,
         model: settings.coordinatorModel,
@@ -1016,7 +1260,7 @@ export class Scheduler {
       let requirementSessionId: string | null = null;
       if (preApprovalSkillIds.includes(requirementSkill.id) && productAgent) {
         requirementModel = productAgent.model;
-        const requirementResult = await this.adapter.executeStructured<SkillResult>({
+        const requirementResult = await adapter.executeStructured<SkillResult>({
           runtime,
           title: `需求规格 · ${task.title}`,
           model: requirementModel,
@@ -1043,11 +1287,11 @@ export class Scheduler {
         requirementSessionId = requirementResult.sessionId;
       }
 
-      const result = await this.adapter.executeStructured<ComposedPlanOutput>({
+      const result = await adapter.executeStructured<ComposedPlanOutput>({
         runtime,
         title: `研序计划 · ${task.title}`,
         model: settings.coordinatorModel,
-        schema: composedPlanSchema,
+        schema: task.flowVersion === 2 ? workUnitComposedPlanSchema : composedPlanSchema,
         abortSignal: abortController.signal,
         permissionMode: 'managed',
         toolMode: 'disabled',
@@ -1108,6 +1352,13 @@ export class Scheduler {
           ...step,
           id: `planstep_${randomUUID().replaceAll('-', '')}`,
           position,
+          skillId: task.flowVersion === 2 ? 'work-unit' : (step.skillId ?? 'implementation'),
+          kind: task.flowVersion === 2 ? 'work_unit' as const : 'legacy_skill' as const,
+          requiredCapabilities: step.requiredCapabilities ?? [],
+          capabilityIds: step.capabilityIds ?? [],
+          verification: step.verification ?? [],
+          mode: step.mode ?? (step.skillId === 'implementation' ? 'write' as const : 'read_only' as const),
+          requiresIndependentSession: step.requiresIndependentSession ?? false,
         })),
         qualityGates: result.output.qualityGates.map((gate) => {
           const previous = task.plan?.qualityGates.find((item) =>
@@ -1133,7 +1384,7 @@ export class Scheduler {
           artifactType: requirementArtifact.type,
           title: requirementArtifact.title?.trim() || `${task.title} · 需求规格`,
           content: requirementArtifact.content,
-          sourceExecutor: 'opencode',
+          sourceExecutor: settings.coordinatorExecutor,
           sourceModel: requirementModel,
           sourceSessionId: requirementSessionId,
         }]
@@ -1143,8 +1394,8 @@ export class Scheduler {
       clearTimeout(sessionTimeout);
       this.unregisterTaskAbortController(taskId, abortController);
       if (runtime) {
-        await this.adapter.stopRuntime(runtime);
-        if (this.runtimes.get(taskId) === runtime) this.runtimes.delete(taskId);
+        await adapter.stopRuntime(runtime);
+        if (this.runtimes.get(taskId)?.runtime === runtime) this.runtimes.delete(taskId);
       }
     }
   }
@@ -1282,9 +1533,32 @@ ${JSON.stringify({
         roleId: agent.roleId,
         executor: agent.executor,
         model: agent.model,
+        roleName: role?.name ?? agent.roleId,
+        responsibilities: role?.responsibilities ?? [],
         skillIds: role?.skillIds ?? [],
+        roleInstructions: role?.instructions ?? '',
+        recommendedCapabilityIds: role?.capabilityIds ?? [],
+        agentDefaultCapabilityIds: agent.defaultCapabilityIds,
+        roleCompatibility: role?.compatibility ?? [],
       };
     });
+    const projectCapabilities = this.store.listProjectCapabilities(project.id)
+      .filter((item) => item.enabled)
+      .map((item) => ({
+        id: item.capabilityId,
+        name: item.capability.name,
+        kind: item.capability.kind,
+        description: item.capability.description,
+        version: item.lockedVersion,
+        compatibility: item.capability.compatibility,
+        credentialReady: item.capability.credentialRefs.every((name) => Boolean(process.env[name])),
+        security: {
+          fileCount: item.capability.security.files.length,
+          executableFiles: item.capability.security.executableFiles,
+          networkHosts: item.capability.security.networkHosts,
+          containsLiteralSecrets: item.capability.security.containsLiteralSecrets,
+        },
+      }));
     const input = {
       task: {
         title: task.title,
@@ -1309,6 +1583,7 @@ ${JSON.stringify({
         [task.title, task.description, task.expectedOutput, task.constraints, revisionFeedback ?? ''].join('\n'),
       ),
       team: { id: team.id, name: team.name, agents: teamAgents },
+      projectCapabilities,
       requirementSpec,
       preApprovalSkillIds,
       availableExecutionSkills: builtins.skills.filter((skill) => skill.id !== 'requirement-specification').map((skill) => ({
@@ -1356,6 +1631,29 @@ ${JSON.stringify({
     const requirementInstruction = requirementSpec
       ? '确认前的 RequirementSpec 已由需求规格 Skill 生成；必须以它为需求基线。'
       : '本任务未选择确认前 RequirementSpec；直接依据用户需求和项目事实规划。如果缺少产品人员导致无法可靠澄清范围，必须提出明确的歧义问题或能力缺口，不能自行补全。';
+    if (task.flowVersion === 2) {
+      return `你是研序的全局计划协调器。${requirementInstruction}你只生成可确认的任务计划，不修改文件、不执行项目命令、不联网，也不要把 Skill 当作固定流程阶段。
+
+把任务拆成最小且足够的串行 WorkUnit。每个 WorkUnit 描述一个真实工作目标，而不是“调用某个 Skill”：
+- team.agents 是候选人员池。结合人员的角色责任、执行器与模型能力选择 agentId；角色只影响分工建议，不构成硬性准入条件。没有合适人员时返回 null，由用户在确认计划时处理。
+- requiredCapabilities 用自然语言描述完成工作所需的能力，不得填写角色名或内置 Skill ID；capabilityIds 只能从 projectCapabilities 中选择实际需要装载的能力 ID，也可以为空。人员的 agentDefaultCapabilityIds 和角色的 recommendedCapabilityIds 只是偏好，只有它们同时出现在 projectCapabilities 且确实有助于当前单元时才选择，不得偷偷补装或强行使用。
+- 只能把与已选 agentId 的 executor 兼容且 credentialReady=true 的能力写入 capabilityIds；能力不决定角色，也不要求团队必须补充某类人员。
+- mode 只有确需修改真实文件时才为 write；分析、评审和只读验证必须为 read_only。
+- 只有需要避免上下文偏见的独立评审才设置 requiresIndependentSession=true；同一人员、同一 CLI 的连续相关工作默认复用会话。
+- verification 写清该单元应如何核对，但真实项目命令必须同时进入 qualityGates，最终以实际退出码为准。
+- 不固定要求产品、研发、测试、评审四段，也不固定产物格式；根据任务规模合并或省略不必要单元。
+- directoryIds 只能使用 project.directories 中的 ID。qualityGates 优先复用项目已有命令，并使用结构化 commandArgv；禁止管道、重定向、命令替换、push、PR、部署。
+- 歧义问题只问会改变范围、验收或技术路线的问题。每题给出 2–3 个互斥方案，推荐项第一且仅一个 recommended=true；界面另有自定义输入，不要生成“其他”。
+- previousPlan 已回答的问题必须被吸收到计划，不要重复追问。${revisionFeedback ? '\n- 这是计划修改：逐条吸收 revisionFeedback，保留未被要求改变的有效内容。' : ''}${preservePreviousSteps ? '\n- 本次只吸收歧义答案：保持 previousPlan.steps 的数量、顺序和工作目标，只完善说明、人员、目录、能力和验证。' : ''}
+
+规划硬性校验：
+- 新建子项目时，qualityGates 的命令自身必须显式定位子目录，例如 npm --prefix <子目录> run test。
+- commandArgv 每个 token 独立成项，不能合并 shell 表达式。
+- 可自动验证的业务逻辑必须有真实 test 门禁；typecheck、lint、build 不能代替业务测试。
+- 金额、价格、余额或预算必须采用整数最小货币单位或明确的十进制定点方案；禁止把 JavaScript number + toFixed 当作精度保证。
+
+${JSON.stringify({ ...input, availableExecutionSkills: undefined }, null, 2)}`;
+    }
     return `你是研序的全局计划协调器。${requirementInstruction}你负责组合可确认的执行计划，不修改任何文件，不执行项目命令，不得调用任何工具、联网搜索或网页抓取，也不要把 requirement-specification 再列入执行步骤。
 
 基于下面的确认前产物、项目事实、已确认知识、可用执行 Skill 和指定团队，组合最小且足够的串行 ExecutionPlan。不要固定输出全部步骤：只选择完成当前任务真正需要的 Skill，可以省略不相关的研发、测试或评审步骤。每个步骤只能分配给 team.agents 中拥有该 Skill 的人员；没有可用人员时 agentId 返回 null。directoryIds 只能使用 project.directories 中的 ID。歧义问题只问会实质改变范围、验收或技术路线的问题。提出问题前必须先分析并给出 2–3 个互斥、可直接执行的方案：推荐方案放在第一项且只能有一个 recommended=true；label 要简短；description 说明选择后的影响或取舍；value 是可直接吸收到计划里的完整答案。不要把“自行填写”作为方案，界面会统一提供自定义方案。权限只列完成任务实际需要的能力。qualityGates 应优先复用 project.directories.commands；命令必须拆成 commandArgv，禁止 shell 管道、重定向、命令替换或远程发布。用户确认计划后这些门禁才可执行。previousPlan 中已经回答的歧义必须真正反映到目标、范围、成功标准、步骤、目录、权限或门禁中；不要原样重复已经解决的问题，只有答案仍引出新的关键歧义时才能继续提问。${revisionFeedback ? '\n\n这是一次计划修改。必须逐条处理 revisionFeedback，并以 previousPlan 为基线保留未被要求改变的有效内容；不要把修改请求忽略或只写进风险。' : ''}${preservePreviousSteps ? '\n\n本次修改只用于吸收用户对歧义问题的回答：不得增删、替换或重排 previousPlan.steps 的 Skill 序列；可以在同一 Skill 内完善标题、说明、输入、产出、人员与目录。' : ''}

@@ -18,6 +18,7 @@ export interface StructuredExecutionInput {
   permissionMode?: 'standard' | 'managed';
   toolMode?: 'enabled' | 'disabled';
   readOnly?: boolean;
+  resumeSessionId?: string;
   policy?: RuntimePermissionPolicy;
   onSessionStarted?: (sessionId: string) => void | Promise<void>;
   onPermission?: (request: ExecutorPermissionRequest) => Promise<'once' | 'always' | 'reject'>;
@@ -28,6 +29,10 @@ export interface RuntimePermissionPolicy {
   allowedExternalDirectoryPatterns?: string[];
   allowedEditPatterns: string[];
   allowedBashPatterns: string[];
+  allowedSkillPatterns?: string[];
+  allowedMcpToolPatterns?: string[];
+  denyUnlistedSkills?: boolean;
+  deniedMcpToolPatterns?: string[];
   taskGrants: Array<{ permission: string; patterns: string[] }>;
   forbiddenReadPatterns: string[];
   networkPolicy?: 'ask' | 'deny';

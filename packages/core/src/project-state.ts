@@ -5,7 +5,7 @@ import type { ProjectSpaceRestorePreview } from '@yanxu/contracts';
 import type { SqliteDatabase } from './database.js';
 import { writeVersionedArtifact } from './project-space.js';
 
-const schemaVersion = 3;
+const schemaVersion = 4;
 const manifestRelativePath = 'state/current.json';
 
 type RawRow = Record<string, unknown>;
@@ -13,6 +13,9 @@ type RawRow = Record<string, unknown>;
 interface ProjectStatePayload {
   project: RawRow;
   projectSettings: RawRow[];
+  capabilities?: RawRow[];
+  projectCapabilities?: RawRow[];
+  projectCapabilityLocks?: RawRow[];
   directories: RawRow[];
   directoryProfiles: RawRow[];
   agents: RawRow[];
@@ -23,6 +26,7 @@ interface ProjectStatePayload {
   taskAttachments?: RawRow[];
   plans: RawRow[];
   taskSteps: RawRow[];
+  taskCapabilitySnapshots?: RawRow[];
   agentSessions: RawRow[];
   permissionRequests: RawRow[];
   permissionGrants: RawRow[];
@@ -65,6 +69,17 @@ export function writeProjectStateManifest(
   const payload: ProjectStatePayload = {
     project,
     projectSettings: rows(database, 'SELECT * FROM project_settings WHERE project_id = ?', projectId),
+    capabilities: rows(database, `
+      SELECT DISTINCT c.* FROM capabilities c
+      WHERE c.id IN (SELECT capability_id FROM project_capabilities WHERE project_id = ?)
+        OR c.id IN (
+          SELECT s.capability_id FROM task_capability_snapshots s
+          JOIN tasks t ON t.id = s.task_id WHERE t.project_id = ?
+        )
+      ORDER BY c.created_at
+    `, projectId, projectId),
+    projectCapabilities: rows(database, 'SELECT * FROM project_capabilities WHERE project_id = ? ORDER BY updated_at', projectId),
+    projectCapabilityLocks: rows(database, 'SELECT * FROM project_capability_locks WHERE project_id = ?', projectId),
     directories: rows(database, 'SELECT * FROM project_directories WHERE project_id = ? ORDER BY scanned_at', projectId),
     directoryProfiles: rows(database, `
       SELECT dp.* FROM directory_profiles dp
@@ -103,6 +118,10 @@ export function writeProjectStateManifest(
     taskSteps: rows(database, `
       SELECT s.* FROM task_steps s JOIN tasks t ON t.id = s.task_id
       WHERE t.project_id = ? ORDER BY s.task_id, s.position
+    `, projectId),
+    taskCapabilitySnapshots: rows(database, `
+      SELECT s.* FROM task_capability_snapshots s JOIN tasks t ON t.id = s.task_id
+      WHERE t.project_id = ? ORDER BY s.created_at, s.step_id, s.name
     `, projectId),
     agentSessions: rows(database, `
       SELECT s.* FROM agent_sessions s JOIN tasks t ON t.id = s.task_id
@@ -202,7 +221,7 @@ export function previewProjectStateRestore(
     issues.push(`无法读取状态清单：${error instanceof Error ? error.message : String(error)}`);
   }
   if (!manifest) return emptyPreview(projectSpacePath, manifestPath, issues);
-  if (![2, schemaVersion].includes(manifest.schemaVersion)) issues.push(`不支持的状态清单版本：${manifest.schemaVersion}`);
+  if (![2, 3, schemaVersion].includes(manifest.schemaVersion)) issues.push(`不支持的状态清单版本：${manifest.schemaVersion}`);
   if (!manifest.payload || typeof manifest.payload !== 'object') {
     issues.push('状态清单缺少 payload。');
     return emptyPreview(projectSpacePath, manifestPath, issues);
@@ -253,6 +272,7 @@ export function restoreProjectState(
     throw new Error(`项目 ${preview.projectId} 已存在，恢复操作不会覆盖现有数据库。`);
   }
   const stoppedTaskIds: string[] = [];
+  const capabilityIdMap = new Map<string, string>();
   const safeStatuses = new Set(['DRAFT', 'WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL', 'STOPPED', 'DELIVERED', 'ARCHIVED', 'CANCELLED']);
   database.transaction(() => {
     insertRaw(database, 'projects', {
@@ -262,6 +282,26 @@ export function restoreProjectState(
     for (const item of manifest.payload.directories) insertRaw(database, 'project_directories', item);
     for (const item of manifest.payload.projectSettings) {
       insertRaw(database, 'project_settings', rebaseArtifactPath(item, manifest.payload.project, projectSpacePath));
+    }
+    for (const item of manifest.payload.capabilities ?? []) {
+      const originalId = stringValue(item.id);
+      const existing = row(database, 'SELECT id FROM capabilities WHERE id = ?', originalId)
+        ?? row(database, 'SELECT id FROM capabilities WHERE origin_key = ?', stringValue(item.origin_key));
+      if (existing) {
+        capabilityIdMap.set(originalId, stringValue(existing.id));
+      } else {
+        insertRaw(database, 'capabilities', item);
+        capabilityIdMap.set(originalId, originalId);
+      }
+    }
+    for (const item of manifest.payload.projectCapabilities ?? []) {
+      insertRaw(database, 'project_capabilities', {
+        ...item,
+        capability_id: capabilityIdMap.get(stringValue(item.capability_id)) ?? item.capability_id,
+      });
+    }
+    for (const item of manifest.payload.projectCapabilityLocks ?? []) {
+      insertRaw(database, 'project_capability_locks', rebaseArtifactPath(item, manifest.payload.project, projectSpacePath));
     }
     for (const item of manifest.payload.agents) insertRaw(database, 'agent_profiles', item, true);
     for (const item of manifest.payload.teams) insertRaw(database, 'teams', { ...item, is_default: 0 }, true);
@@ -290,6 +330,14 @@ export function restoreProjectState(
       insertRaw(database, 'task_steps', taskStopped && item.status === 'running'
         ? { ...item, status: 'failed', summary: '数据库恢复后需要重新执行该步骤。', completed_at: new Date().toISOString() }
         : item);
+    }
+    for (const item of manifest.payload.taskCapabilitySnapshots ?? []) {
+      insertRaw(database, 'task_capability_snapshots', {
+        ...item,
+        capability_id: capabilityIdMap.get(stringValue(item.capability_id)) ?? item.capability_id,
+        projection_path: null,
+        status: item.status === 'failed' ? 'failed' : 'frozen',
+      });
     }
     for (const item of manifest.payload.agentSessions) {
       const taskStopped = stoppedTaskIds.includes(stringValue(item.task_id));
@@ -377,6 +425,7 @@ function artifactReferences(payload: ProjectStatePayload, projectSpacePath: stri
   const project = payload.project;
   const collections: Array<[string, RawRow[]]> = [
     ['project-settings', payload.projectSettings],
+    ['capability-lock', payload.projectCapabilityLocks ?? []],
     ['directory-profile', payload.directoryProfiles],
     ['task-version', payload.taskVersions],
     ['attachment', payload.taskAttachments ?? []],

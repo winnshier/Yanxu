@@ -3,7 +3,7 @@ import { Alert, Button, Card, Checkbox, Descriptions, Divider, Form, Input, List
 import { CheckOutlined, DeleteOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useParams } from 'react-router-dom';
-import type { AnswerPlanInput, RequestPlanRevisionInput, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
+import type { AnswerPlanInput, ProjectCapability, RequestPlanRevisionInput, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
 import { api, ApiError } from '../lib/api.js';
 import {
   buildPlanQuestionFormAnswers,
@@ -23,6 +23,7 @@ interface PlanFormValues {
   permissionsText: string;
   answers: Record<string, PlanQuestionFormAnswer>;
   stepAgents: Record<string, string | null>;
+  stepCapabilities: Record<string, string[]>;
   branchRoutes: Record<string, { sourceBranch: string; targetBranch: string }>;
   waivedGateIds: string[];
 }
@@ -45,6 +46,10 @@ function commandFor(task: Task, command: TaskCommandInput['command']): TaskComma
   return { command, stateVersion: task.stateVersion };
 }
 
+function capabilitiesName(capabilityId: string, capabilities: ProjectCapability[]): string {
+  return capabilities.find((item) => item.capabilityId === capabilityId)?.capability.name ?? capabilityId;
+}
+
 function formatDuration(milliseconds: number): string {
   const seconds = Math.max(0, Math.round(milliseconds / 1_000));
   const hours = Math.floor(seconds / 3_600);
@@ -63,10 +68,16 @@ function describePlanChanges(current: TaskPlan, previous?: TaskPlan): string[] {
     changes.push('范围或成功标准已调整');
   }
   const stepSignature = (plan: TaskPlan) => plan.steps.map((step) => ({
+    kind: step.kind,
     skillId: step.skillId,
     title: step.title,
     expectedOutput: step.expectedOutput,
     directoryIds: step.directoryIds,
+    requiredCapabilities: step.requiredCapabilities,
+    capabilityIds: step.capabilityIds,
+    verification: step.verification,
+    mode: step.mode,
+    requiresIndependentSession: step.requiresIndependentSession,
   }));
   if (JSON.stringify(stepSignature(current)) !== JSON.stringify(stepSignature(previous))) changes.push('执行步骤或产出已调整');
   const routeSignature = (plan: TaskPlan) => plan.branchRoutes.map((route) => ({
@@ -96,6 +107,8 @@ export function TaskDetailPage() {
   const diagnostics = useQuery({ queryKey: ['task-diagnostics', taskId], queryFn: () => api.taskDiagnostics(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const data = task.data;
   const project = useQuery({ queryKey: ['project', data?.projectId], queryFn: () => api.project(data?.projectId ?? ''), enabled: Boolean(data?.projectId) });
+  const projectCapabilities = useQuery({ queryKey: ['project-capabilities', data?.projectId], queryFn: () => api.projectCapabilities(data?.projectId ?? ''), enabled: Boolean(data?.projectId) });
+  const taskCapabilities = useQuery({ queryKey: ['task-capabilities', taskId], queryFn: () => api.taskCapabilities(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const agents = useQuery({ queryKey: ['agents'], queryFn: api.agents });
   const teams = useQuery({ queryKey: ['teams'], queryFn: api.teams });
   const builtins = useQuery({ queryKey: ['builtins'], queryFn: api.builtins });
@@ -110,6 +123,7 @@ export function TaskDetailPage() {
         permissionsText: data.plan.permissions.join('\n'),
         answers: buildPlanQuestionFormAnswers(data.plan.questions),
         stepAgents: Object.fromEntries(data.plan.steps.map((step) => [step.id, step.agentId])),
+        stepCapabilities: Object.fromEntries(data.plan.steps.map((step) => [step.id, step.capabilityIds ?? []])),
         branchRoutes: Object.fromEntries(data.plan.branchRoutes.map((route) => [route.directoryId, {
           sourceBranch: route.sourceBranch,
           targetBranch: route.targetBranch,
@@ -159,6 +173,7 @@ export function TaskDetailPage() {
         successCriteria: values.successText.split('\n').map((item) => item.trim()).filter(Boolean),
         permissions: values.permissionsText.split('\n').map((item) => item.trim()).filter(Boolean),
         stepAssignments: data.plan.steps.map((step) => ({ stepId: step.id, agentId: values.stepAgents?.[step.id] || null })),
+        stepCapabilities: data.plan.steps.map((step) => ({ stepId: step.id, capabilityIds: values.stepCapabilities?.[step.id] ?? [] })),
         branchRoutes: data.plan.branchRoutes.map((route) => ({
           directoryId: route.directoryId,
           sourceBranch: values.branchRoutes?.[route.directoryId]?.sourceBranch ?? route.sourceBranch,
@@ -348,6 +363,8 @@ export function TaskDetailPage() {
             const team = teams.data?.find((item) => item.id === data.teamId);
             const compatibleAgents = (agents.data ?? []).filter((agent) => {
               if (!team?.memberIds.includes(agent.id)) return false;
+              if (agent.status !== 'active') return false;
+              if (step.kind === 'work_unit') return true;
               return builtins.data?.roles.find((role) => role.id === agent.roleId)?.skillIds.includes(step.skillId);
             });
             return <List.Item>
@@ -356,16 +373,38 @@ export function TaskDetailPage() {
                 description={<Space direction="vertical" size={2}>
                   <Typography.Text type="secondary">{step.description}</Typography.Text>
                   <Typography.Text type="secondary">输入：{step.inputs.join('、') || '当前任务与上游产物'}</Typography.Text>
+                  {step.kind === 'work_unit' && <Typography.Text type="secondary">能力：{step.requiredCapabilities?.join('、') || '通用项目能力'} · {step.mode === 'write' ? '可写' : '只读'}</Typography.Text>}
+                  {step.kind === 'work_unit' && <Typography.Text type="secondary">验证：{step.verification?.join('；') || '对照成功标准与质量门禁'}</Typography.Text>}
                   <Typography.Text type="secondary">产出：{step.expectedOutput}</Typography.Text>
                 </Space>}
               />
-              <Form.Item name={['stepAgents', step.id]} label="执行人员" rules={[{ required: true, message: '请选择执行人员' }]} className="plan-inline-field">
-                <Select
-                  allowClear
-                  placeholder="团队缺少可用人员"
-                  options={compatibleAgents.map((agent) => ({ label: `${agent.name} · ${agent.model}`, value: agent.id }))}
-                />
-              </Form.Item>
+              <Space direction="vertical" size={4} className="plan-inline-field">
+                <Form.Item name={['stepAgents', step.id]} label="执行人员" rules={[{ required: true, message: '请选择执行人员' }]}>
+                  <Select
+                    allowClear
+                    placeholder="团队缺少可用人员"
+                    options={compatibleAgents.map((agent) => ({ label: `${agent.name} · ${agent.model}`, value: agent.id }))}
+                  />
+                </Form.Item>
+                {step.kind === 'work_unit' && <Form.Item noStyle shouldUpdate>
+                  {({ getFieldValue }) => {
+                    const selectedAgentId = getFieldValue(['stepAgents', step.id]) as string | null;
+                    const selectedAgent = agents.data?.find((agent) => agent.id === selectedAgentId);
+                    const enabledCapabilities = (projectCapabilities.data ?? []).filter((item) => item.enabled);
+                    const capabilityOptions = enabledCapabilities
+                      .map((item) => ({
+                        label: `${item.capability.name} · ${item.capability.kind.toUpperCase()} · ${item.lockedVersion}${selectedAgent && !item.capability.compatibility.includes(selectedAgent.executor) ? ` · 不兼容 ${selectedAgent.executor}` : ''}`,
+                        value: item.capabilityId,
+                        disabled: Boolean(selectedAgent && !item.capability.compatibility.includes(selectedAgent.executor)),
+                      }));
+                    const unavailableDefaults = (selectedAgent?.defaultCapabilityIds ?? [])
+                      .filter((capabilityId) => !enabledCapabilities.some((item) => item.capabilityId === capabilityId));
+                    return <><Form.Item name={['stepCapabilities', step.id]} label="装载能力">
+                      <Select mode="multiple" allowClear placeholder="按需选择，可为空" options={capabilityOptions} />
+                    </Form.Item>{unavailableDefaults.length > 0 && <Alert type="info" showIcon title="人员默认能力未在本项目启用" description={`不会自动装载：${unavailableDefaults.map((id) => capabilitiesName(id, projectCapabilities.data ?? [])).join('、')}。可在项目能力页安装/启用，或保持当前降级方案。`} />}</>;
+                  }}
+                </Form.Item>}
+              </Space>
             </List.Item>;
           }} />
         </Card>
@@ -434,10 +473,10 @@ export function TaskDetailPage() {
     },
     {
       key: 'execution', label: '执行', children: <Space direction="vertical" size="middle" className="full-width">
-        <Card title="Skill 执行链"><Timeline items={data.steps.map((step) => ({
+        <Card title={data.flowVersion === 2 ? 'WorkUnit 执行链' : 'Skill 执行链'}><Timeline items={data.steps.map((step) => ({
           key: step.id,
           color: step.status === 'succeeded' ? 'green' : step.status === 'running' ? 'blue' : step.status === 'failed' ? 'red' : 'gray',
-          children: <div><Typography.Text strong>{step.title}</Typography.Text><Typography.Paragraph type="secondary">{step.summary ?? step.description}</Typography.Paragraph><Space><Tag>{step.status}</Tag>{step.attempt > 0 && <Tag color="orange">第 {step.attempt} 次尝试</Tag>}</Space></div>,
+          children: <div><Typography.Text strong>{step.title}</Typography.Text><Typography.Paragraph type="secondary">{step.summary ?? step.description}</Typography.Paragraph><Space wrap><Tag>{step.status}</Tag>{step.attempt > 0 && <Tag color="orange">第 {step.attempt} 次尝试</Tag>}{(taskCapabilities.data ?? []).filter((item) => item.stepId === step.id).map((item) => <Tag key={item.id} color={item.status === 'failed' ? 'red' : 'purple'}>{item.name} · {item.status}</Tag>)}</Space></div>,
         }))} /></Card>
         <ExecutionEvidence taskId={taskId} evidence={evidence.data} />
       </Space>,
@@ -563,13 +602,13 @@ export function TaskDiagnosticsPanel({
   if (error) return <Alert
     type="error"
     showIcon
-    message="运行诊断加载失败"
+    title="运行诊断加载失败"
     description={error.message}
     action={onRetry ? <Button size="small" danger onClick={onRetry}>重试</Button> : undefined}
   />;
   if (!diagnostics) return loading
     ? <Card loading />
-    : <Alert type="info" showIcon message="暂无运行诊断" description="任务产生执行记录后会在这里汇总耗时、失败分类和恢复记录。" />;
+    : <Alert type="info" showIcon title="暂无运行诊断" description="任务产生执行记录后会在这里汇总耗时、失败分类和恢复记录。" />;
   const failureLabels: Record<TaskDiagnostics['failures'][number]['category'], string> = {
     transient: '瞬时故障',
     invalid_output: '输出不合法',
@@ -581,11 +620,11 @@ export function TaskDiagnosticsPanel({
     stale_execution: '旧运行结果',
     system: '系统故障',
   };
-  return <Space direction="vertical" size="middle" className="full-width">
+  return <Space orientation="vertical" size="middle" className="full-width">
     {diagnostics.statusReason && <Alert
       type={diagnostics.status === 'BLOCKED' ? 'error' : diagnostics.status === 'RETRYING' || diagnostics.status === 'REPLANNING' ? 'warning' : 'info'}
       showIcon
-      message={`当前状态：${diagnostics.status}`}
+      title={`当前状态：${diagnostics.status}`}
       description={`${diagnostics.statusReason.message} · ${new Date(diagnostics.statusReason.occurredAt).toLocaleString()}`}
     />}
     <div className="detail-grid">
@@ -615,31 +654,27 @@ export function TaskDiagnosticsPanel({
       </Card>
     </div>
     <Card title={`失败分类时间线 · ${diagnostics.failures.length}`}>
-      <List
-        size="small"
-        locale={{ emptyText: '没有记录到后台执行失败' }}
-        dataSource={diagnostics.failures.slice().reverse()}
-        rowKey={(failure) => `${failure.jobId}-${failure.occurredAt}-${failure.attempt}`}
-        renderItem={(failure) => <List.Item>
-          <List.Item.Meta
-            title={<Space wrap>
+      {diagnostics.failures.length === 0
+        ? <Typography.Text type="secondary">没有记录到后台执行失败</Typography.Text>
+        : <Space orientation="vertical" size={10} className="full-width">
+          {diagnostics.failures.slice().reverse().map((failure) => <div key={`${failure.jobId}-${failure.occurredAt}-${failure.attempt}`}>
+            <Space wrap>
               <Tag color={failure.retryable ? 'orange' : failure.suggestedAction === 'discard' ? 'default' : 'red'}>{failureLabels[failure.category]}</Tag>
               <Typography.Text strong>{failure.jobType}</Typography.Text>
               <Tag>第 {failure.attempt} 次</Tag>
               {failure.repeated && <Tag color="red">重复指纹，停止盲重试</Tag>}
-            </Space>}
-            description={<Space direction="vertical" size={2}>
+            </Space>
+            <Space orientation="vertical" size={2} className="full-width">
               <Typography.Text>{failure.message}</Typography.Text>
               <Typography.Text type="secondary">动作：{failure.suggestedAction} · 指纹 {failure.fingerprint.slice(0, 12)} · {new Date(failure.occurredAt).toLocaleString()}</Typography.Text>
-            </Space>}
-          />
-        </List.Item>}
-      />
+            </Space>
+          </div>)}
+        </Space>}
     </Card>
     <Card title="最近关键决策">
       <Timeline items={diagnostics.recentDecisions.slice().reverse().map((event) => ({
         key: event.id,
-        children: <div>
+        content: <div>
           <Typography.Text strong>{event.message}</Typography.Text>
           <div><Typography.Text type="secondary">{event.type} · {new Date(event.occurredAt).toLocaleString()}</Typography.Text></div>
         </div>,
@@ -657,8 +692,8 @@ export function DeliveryConflictPanel({ conflicts }: {
     className="settings-card"
     type="warning"
     showIcon
-    message="自动合并已停在语义冲突"
-    description={<Space direction="vertical" size="small">
+    title="自动合并已停在语义冲突"
+    description={<Space orientation="vertical" size="small">
       <Typography.Text>系统只自动合并独立插入等机械冲突；以下重叠修改需要你判断。目标分支和任务分支都没有被覆盖。</Typography.Text>
       {pending.map((conflict) => <div key={conflict.id}>
         <Typography.Text strong>{conflict.taskBranch} → {conflict.targetBranch}</Typography.Text>
@@ -704,7 +739,7 @@ export function TaskHistory({ events, evidence }: {
   evidence: TaskEvidence | undefined;
 }) {
   if (!evidence) return <Card loading />;
-  return <Space direction="vertical" size="middle" className="full-width">
+  return <Space orientation="vertical" size="middle" className="full-width">
     <div className="detail-grid">
       <Card title="证据链汇总">
         <Descriptions column={1} size="small" items={[
@@ -716,10 +751,7 @@ export function TaskHistory({ events, evidence }: {
         ]} />
       </Card>
       <Card title="异常与恢复">
-        <List
-          size="small"
-          locale={{ emptyText: '没有语义冲突或调度恢复记录' }}
-          dataSource={[
+        {[
             ...evidence.deliveryConflicts.map((item) => ({
               id: item.id,
               title: `语义冲突 · ${item.taskBranch} → ${item.targetBranch}`,
@@ -730,16 +762,26 @@ export function TaskHistory({ events, evidence }: {
               title: `恢复 · ${item.reason}`,
               detail: `${item.action} · ${new Date(item.createdAt).toLocaleString()}`,
             })),
-          ]}
-          rowKey={(item) => item.id}
-          renderItem={(item) => <List.Item><List.Item.Meta title={item.title} description={item.detail} /></List.Item>}
-        />
+          ].length === 0
+          ? <Typography.Text type="secondary">没有语义冲突或调度恢复记录</Typography.Text>
+          : <Space orientation="vertical" size={8} className="full-width">{[
+            ...evidence.deliveryConflicts.map((item) => ({
+              id: item.id,
+              title: `语义冲突 · ${item.taskBranch} → ${item.targetBranch}`,
+              detail: `${item.status} · ${item.conflicts.map((conflict) => conflict.path).join('、') || '无文件详情'}`,
+            })),
+            ...evidence.recoveries.map((item) => ({
+              id: item.id,
+              title: `恢复 · ${item.reason}`,
+              detail: `${item.action} · ${new Date(item.createdAt).toLocaleString()}`,
+            })),
+          ].map((item) => <div key={item.id}><Typography.Text strong>{item.title}</Typography.Text><div><Typography.Text type="secondary">{item.detail}</Typography.Text></div></div>)}</Space>}
       </Card>
     </div>
     <Card title={`状态与操作时间线 · ${events.length}`}>
       <Timeline items={events.slice().reverse().map((event) => ({
         key: event.id,
-        children: <div>
+        content: <div>
           <Typography.Text strong>{event.message}</Typography.Text>
           <div><Typography.Text type="secondary">{new Date(event.occurredAt).toLocaleString()} · {event.actorType} · {event.type}</Typography.Text></div>
         </div>,
@@ -999,7 +1041,7 @@ function ExecutionEvidence({ taskId, evidence }: { taskId: string; evidence: Tas
       />
     </Card>
     <Card
-      title="OpenCode Runtime 原始日志"
+      title="CLI Runtime 原始日志"
       extra={<Space size="small">
         <Button
           size="small"

@@ -6,13 +6,15 @@ import cors from '@fastify/cors';
 import fastifyStatic from '@fastify/static';
 import {
   agentStatusSchema, answerPlanSchema, createAgentSchema, createProjectRequestSchema, createTaskRequestSchema, createTeamSchema, folderSelectionRequestSchema,
-  knowledgeDecisionSchema, permissionDecisionSchema, requestPlanRevisionSchema, taskCommandSchema, updateSystemSettingsSchema,
+  knowledgeDecisionSchema, permissionDecisionSchema, projectCapabilityUpdateSchema, requestPlanRevisionSchema, taskCommandSchema, updateSystemSettingsSchema,
   type AgentStatusInput, type AnswerPlanInput, type CreateAgentInput, type CreateProjectRequest, type CreateTaskRequest, type CreateTeamInput,
   type FolderSelectionRequest, type KnowledgeDecisionInput, type PermissionDecisionInput, type RequestPlanRevisionInput,
-  type TaskCommandInput, type UpdateProjectSettingsInput,
+  type ProjectCapabilityUpdateInput, type TaskCommandInput, type UpdateProjectSettingsInput,
+  YANXU_VERSION,
 } from '@yanxu/contracts';
 import { DomainError } from '@yanxu/core';
 import type { YanxuStore } from '@yanxu/core';
+import { rotateLogFile } from '@yanxu/executors';
 import { chooseFile, chooseFolder, FileSelectionRegistry, FolderSelectionRegistry } from './folder-picker.js';
 import type { ExecutorRegistry } from './executor-registry.js';
 import type { Scheduler } from './scheduler.js';
@@ -32,6 +34,7 @@ export async function createServer(
   const daemonLogDirectory = join(store.workbenchHome, 'system', 'logs');
   mkdirSync(daemonLogDirectory, { recursive: true });
   const daemonLogPath = join(daemonLogDirectory, 'daemon.log');
+  rotateLogFile(daemonLogPath, 10 * 1024 * 1024, 3);
   const daemonLogStream = createWriteStream(daemonLogPath, { flags: 'a', mode: 0o600 });
   daemonLogStream.on('error', (error) => {
     process.stderr.write(`[yanxu] Failed to write daemon log: ${error.message}\n`);
@@ -114,6 +117,7 @@ export async function createServer(
   const systemHealth = () => {
     const schedulerHealth = scheduler.health();
     return {
+      version: YANXU_VERSION,
       status: schedulerHealth.running ? 'ready' as const : 'starting' as const,
       service: 'yanxu-daemon' as const,
       database: 'ready' as const,
@@ -123,6 +127,7 @@ export async function createServer(
   };
   server.get('/health', systemHealth);
   server.get('/health/live', () => ({
+    version: YANXU_VERSION,
     status: 'live',
     service: 'yanxu-daemon',
     pid: process.pid,
@@ -143,6 +148,38 @@ export async function createServer(
 
   server.get('/api/executors', () => executors.list());
   server.post('/api/executors/probe', () => executors.probe());
+  server.get('/api/capabilities', () => store.listCapabilities());
+  server.get('/api/role-templates', () => store.listRoleTemplates());
+  server.get<{ Params: { roleId: string } }>('/api/role-templates/:roleId/change-preview', (request) =>
+    store.getRoleTemplateChangePreview(request.params.roleId));
+  server.post<{ Body: { address: string } }>('/api/role-templates/import/github', (request) => {
+    if (!request.body?.address?.trim()) throw new DomainError('ROLE_GITHUB_URL_REQUIRED', '请输入 GitHub 地址。', 422);
+    return store.importGitHubRoleTemplates(request.body.address);
+  });
+  server.post<{ Body: FolderSelectionRequest }>(
+    '/api/role-templates/import/local',
+    { schema: { body: folderSelectionRequestSchema } },
+    (request) => store.importLocalRoleTemplates(folderSelections.resolve(request.body.selectionToken)),
+  );
+  server.post<{ Params: { roleId: string }; Body: { capabilityIds?: string[] } }>('/api/role-templates/:roleId/install', (request) =>
+    store.installRoleTemplate(request.params.roleId, request.body?.capabilityIds));
+  server.post<{ Body: { projectId?: string } }>('/api/capabilities/discover', (request) =>
+    store.discoverCapabilities(request.body?.projectId));
+  server.post<{ Params: { capabilityId: string } }>('/api/capabilities/:capabilityId/install', (request) =>
+    store.installCapability(request.params.capabilityId));
+  server.post<{ Body: FolderSelectionRequest }>(
+    '/api/capabilities/import/local',
+    { schema: { body: folderSelectionRequestSchema } },
+    (request) => store.importLocalSkill(folderSelections.resolve(request.body.selectionToken)),
+  );
+  server.post<{ Body: { address: string } }>('/api/capabilities/import/github', (request) => {
+    if (!request.body?.address?.trim()) throw new DomainError('CAPABILITY_GITHUB_URL_REQUIRED', '请输入 GitHub 地址。', 422);
+    return store.importGitHubSkills(request.body.address);
+  });
+  server.post<{ Body: { selectionToken: string } }>('/api/capabilities/import/zip', (request) => {
+    if (!request.body?.selectionToken) throw new DomainError('CAPABILITY_ZIP_SELECTION_REQUIRED', '请选择 ZIP 文件。', 422);
+    return store.importZipSkills(fileSelections.resolve(request.body.selectionToken));
+  });
   server.get('/api/executor-validations', () => store.listExecutorValidations());
   server.post<{ Params: { executor: 'opencode' | 'claude' | 'codex' } }>('/api/executors/:executor/validate', async (request) => {
     const result = await executors.validateRuntime(request.params.executor, store.workbenchHome);
@@ -185,6 +222,13 @@ export async function createServer(
     store.getProjectSettings(request.params.projectId));
   server.put<{ Params: { projectId: string }; Body: UpdateProjectSettingsInput }>('/api/projects/:projectId/settings', (request) =>
     store.updateProjectSettings(request.params.projectId, request.body));
+  server.get<{ Params: { projectId: string } }>('/api/projects/:projectId/capabilities', (request) =>
+    store.listProjectCapabilities(request.params.projectId));
+  server.put<{
+    Params: { projectId: string; capabilityId: string };
+    Body: ProjectCapabilityUpdateInput;
+  }>('/api/projects/:projectId/capabilities/:capabilityId', { schema: { body: projectCapabilityUpdateSchema } }, (request) =>
+    store.updateProjectCapability(request.params.projectId, request.params.capabilityId, request.body));
   server.get<{ Params: { projectId: string } }>('/api/projects/:projectId/project-space-operations', (request) =>
     store.listProjectSpaceOperations(request.params.projectId));
   server.get<{ Params: { projectId: string } }>('/api/projects/:projectId/project-space-integrity', (request) =>
@@ -216,8 +260,8 @@ export async function createServer(
   server.get('/api/agents', () => store.listAgents());
   server.post<{ Body: CreateAgentInput }>('/api/agents', { schema: { body: createAgentSchema } }, async (request, reply) => {
     await executors.probe();
-    if (request.body.executor !== 'opencode') {
-      throw new DomainError('EXECUTOR_ADAPTER_PENDING', '第一版只开放 OpenCode 执行适配器；Claude Code 与 Codex CLI 将按顺序接入。', 422);
+    if (request.body.executor === 'codex') {
+      throw new DomainError('EXECUTOR_ADAPTER_PENDING', '当前版本开放 OpenCode 与 Claude Code；Codex CLI 将在后续版本接入。', 422);
     }
     const agent = store.createAgent({
       ...request.body,
@@ -230,8 +274,8 @@ export async function createServer(
     { schema: { body: createAgentSchema } },
     async (request) => {
       await executors.probe();
-      if (request.body.executor !== 'opencode') {
-        throw new DomainError('EXECUTOR_ADAPTER_PENDING', '第一版只开放 OpenCode 执行适配器；Claude Code 与 Codex CLI 将按顺序接入。', 422);
+      if (request.body.executor === 'codex') {
+        throw new DomainError('EXECUTOR_ADAPTER_PENDING', '当前版本开放 OpenCode 与 Claude Code；Codex CLI 将在后续版本接入。', 422);
       }
       return store.updateAgent(request.params.agentId, request.body, executors.get(request.body.executor));
     },
@@ -261,7 +305,7 @@ export async function createServer(
     if (request.body.submitForAnalysis) {
       await executors.probe();
       const settings = store.getSettings(executors.list());
-      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测 OpenCode 并选择全局协调模型。', 422);
+      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测协调 CLI 并选择全局协调模型。', 422);
     }
     const { attachmentSelectionTokens = [], ...taskInput } = request.body;
     const attachmentPaths = attachmentSelectionTokens.map((token) => fileSelections.resolve(token));
@@ -271,6 +315,8 @@ export async function createServer(
     return reply.status(201).send(task);
   });
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId', (request) => store.getTask(request.params.taskId));
+  server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/capabilities', (request) =>
+    store.listTaskCapabilitySnapshots(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/plans', (request) => store.listTaskPlans(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/evidence', (request) => store.getTaskEvidence(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/diagnostics', (request) => store.getTaskDiagnostics(request.params.taskId));
@@ -279,7 +325,12 @@ export async function createServer(
     Querystring: { cursor?: string; limit?: string };
   }>('/api/tasks/:taskId/runtime-log', (request) => {
     store.getTask(request.params.taskId);
-    const logPath = join(store.workbenchHome, 'runtime', 'tasks', request.params.taskId, 'executor', 'opencode.log');
+    const executorDirectory = join(store.workbenchHome, 'runtime', 'tasks', request.params.taskId, 'executor');
+    const unifiedLogPath = join(executorDirectory, 'runtime.log');
+    const claudeLogPath = join(executorDirectory, 'claude.log');
+    const logPath = existsSync(unifiedLogPath)
+      ? unifiedLogPath
+      : existsSync(claudeLogPath) ? claudeLogPath : join(executorDirectory, 'opencode.log');
     const totalBytes = existsSync(logPath) ? statSync(logPath).size : 0;
     const limit = Math.min(Math.max(Number(request.query.limit ?? 64 * 1024), 1), 256 * 1024);
     const requestedCursor = request.query.cursor === undefined ? Math.max(0, totalBytes - limit) : Number(request.query.cursor);
@@ -296,7 +347,9 @@ export async function createServer(
     }
     return {
       taskId: request.params.taskId,
-      source: 'opencode-runtime' as const,
+      source: existsSync(unifiedLogPath)
+        ? 'unified-runtime' as const
+        : existsSync(claudeLogPath) ? 'claude-runtime' as const : 'opencode-runtime' as const,
       cursor,
       nextCursor: cursor + length,
       totalBytes,
@@ -319,7 +372,7 @@ export async function createServer(
     async (request) => {
       await executors.probe();
       const settings = store.getSettings(executors.list());
-      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测 OpenCode 并选择全局协调模型。', 422);
+      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测协调 CLI 并选择全局协调模型。', 422);
       return store.requestPlanRevision(request.params.taskId, request.body);
     },
   );
@@ -327,7 +380,7 @@ export async function createServer(
     if (request.body.command === 'submit') {
       await executors.probe();
       const settings = store.getSettings(executors.list());
-      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测 OpenCode 并选择全局协调模型。', 422);
+      if (!settings.coordinatorReady) throw new DomainError('COORDINATOR_UNAVAILABLE', '请先在设置中检测协调 CLI 并选择全局协调模型。', 422);
       return store.submitTask(request.params.taskId, request.body.stateVersion);
     }
     if (request.body.command === 'confirm') {
@@ -340,8 +393,15 @@ export async function createServer(
         if (agent.status !== 'active') {
           throw new DomainError('TASK_AGENT_INACTIVE', `执行步骤“${step.title}”对应的人员已停用。`, 422);
         }
-        if (agent.executor !== 'opencode' || installation?.health !== 'available') {
+        if (agent.executor === 'codex' || installation?.health !== 'available') {
           throw new DomainError('TASK_EXECUTOR_UNAVAILABLE', `执行步骤“${step.title}”对应的 ${agent.executor} 执行器当前不可用或尚未接入。`, 422);
+        }
+        if (agent.executor === 'opencode' && installation.models.length > 0 && !installation.models.includes(agent.model)) {
+          throw new DomainError('TASK_MODEL_UNAVAILABLE', `执行步骤“${step.title}”使用的模型 ${agent.model} 已不在 OpenCode 当前模型列表中。`, 422, {
+            agentId: agent.id,
+            executor: agent.executor,
+            model: agent.model,
+          });
         }
       }
     }
@@ -351,7 +411,13 @@ export async function createServer(
       store.recordDeliveryMerge(request.params.taskId, results);
     }
     const taskBeforeCommand = store.getTask(request.params.taskId);
-    const task = store.commandTask(request.params.taskId, request.body.command, request.body.stateVersion, request.body.reason);
+    const task = store.commandTask(
+      request.params.taskId,
+      request.body.command,
+      request.body.stateVersion,
+      request.body.reason,
+      request.body.command === 'confirm' ? executors.list() : [],
+    );
     if (
       request.body.command === 'stop'
       || (request.body.command === 'pause' && taskBeforeCommand.status === 'REPLANNING')

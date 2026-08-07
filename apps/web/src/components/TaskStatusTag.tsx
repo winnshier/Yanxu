@@ -18,5 +18,5 @@ interface TaskStatusTagProps {
 }
 
 export function TaskStatusTag({ status }: TaskStatusTagProps) {
-  return <Tag color={colors[status] ?? 'blue'} bordered={false}>{labels[status]}</Tag>;
+  return <Tag color={colors[status] ?? 'blue'} variant="filled">{labels[status]}</Tag>;
 }
