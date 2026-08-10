@@ -23,6 +23,19 @@ describe('database migration recovery', () => {
     legacy.exec(`
       CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE legacy_marker (value TEXT NOT NULL);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY);
+      CREATE TABLE execution_runs (id TEXT PRIMARY KEY);
+      CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, executor TEXT, model TEXT);
+      CREATE TABLE task_capability_snapshots (id TEXT PRIMARY KEY, task_id TEXT NOT NULL);
+      CREATE TABLE migration_recovery_points (
+        id TEXT PRIMARY KEY,
+        from_version INTEGER NOT NULL,
+        to_version INTEGER NOT NULL,
+        backup_path TEXT NOT NULL,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        restored_at TEXT
+      );
       INSERT INTO legacy_marker(value) VALUES ('before-upgrade');
     `);
     const insert = legacy.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)');
@@ -48,7 +61,7 @@ describe('database migration recovery', () => {
     const rollback = new Database(recovery.backup_path, { readonly: true });
     expect(rollback.pragma('quick_check')).toEqual([{ quick_check: 'ok' }]);
     expect((rollback.prepare('SELECT value FROM legacy_marker').get() as { value: string }).value).toBe('before-upgrade');
-    expect(rollback.prepare("SELECT name FROM sqlite_master WHERE name = 'migration_recovery_points'").get()).toBeUndefined();
+    expect(rollback.prepare("SELECT name FROM sqlite_master WHERE name = 'migration_recovery_points'").get()).toBeDefined();
     rollback.close();
 
     const recoveryScript = resolve(dirname(fileURLToPath(import.meta.url)), '../../../scripts/database-recovery.mjs');
@@ -57,7 +70,7 @@ describe('database migration recovery', () => {
     expect(restored.stdout).toContain('Previous database preserved');
     const restoredDatabase = new Database(databasePath, { readonly: true });
     expect((restoredDatabase.prepare('SELECT value FROM legacy_marker').get() as { value: string }).value).toBe('before-upgrade');
-    expect(restoredDatabase.prepare("SELECT name FROM sqlite_master WHERE name = 'migration_recovery_points'").get()).toBeUndefined();
+    expect(restoredDatabase.prepare("SELECT name FROM sqlite_master WHERE name = 'migration_recovery_points'").get()).toBeDefined();
     restoredDatabase.close();
     expect(readdirSync(join(root, 'system', 'migration-backups'))
       .some((name) => name.startsWith('before-manual-restore-'))).toBe(true);

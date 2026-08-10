@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Button, Checkbox, Segmented, Space } from 'antd';
+import { Button, Checkbox, Segmented, Space, Typography } from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { useQuery } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
@@ -32,10 +32,16 @@ export function TasksPage() {
   return (
     <div className="page-container tasks-page">
       <PageHeader eyebrow="执行看板" title="任务" description="每条任务按实际 WorkUnit 展开，当前、已完成和后续工作一眼可见。" actions={<Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建任务</Button>} />
-      <div className="toolbar toolbar-split"><Segmented value={group} onChange={(value) => setGroup(value as TaskGroup)} options={['全部', '需要处理', '运行中', '暂停 / 等待', '已交付']} /><Checkbox checked={archived} onChange={(event) => setArchived(event.target.checked)}>包含已归档 / 已废弃</Checkbox></div>
-      <QueryState loading={tasks.isLoading} error={tasks.error} empty={filtered.length === 0} emptyText="当前筛选下没有任务。" onRetry={() => { void tasks.refetch(); }}>
-        <Space direction="vertical" size={14} className="full-width">{filtered.map((task) => <TaskTrack key={task.id} task={task} />)}</Space>
-      </QueryState>
+      <section className="module-table task-library" aria-label="任务执行列表">
+        <div className="module-toolbar toolbar-split">
+          <Segmented value={group} onChange={(value) => setGroup(value as TaskGroup)} options={['全部', '需要处理', '运行中', '暂停 / 等待', '已交付']} />
+          <Space><Typography.Text type="secondary">{filtered.length} 条任务</Typography.Text><Checkbox checked={archived} onChange={(event) => setArchived(event.target.checked)}>包含已归档 / 已废弃</Checkbox></Space>
+        </div>
+        <div className="task-list-header" aria-hidden="true"><span>任务</span><span>执行流程</span><span>当前运行</span><span>状态</span></div>
+        <QueryState loading={tasks.isLoading} error={tasks.error} empty={filtered.length === 0} emptyText="当前筛选下没有任务。" onRetry={() => { void tasks.refetch(); }}>
+          <Space direction="vertical" size={0} className="full-width task-list">{filtered.map((task) => <TaskTrack key={task.id} task={task} />)}</Space>
+        </QueryState>
+      </section>
       <CreateTaskModal open={open} projects={projects.data ?? []} teams={teams.data ?? []} onClose={() => setOpen(false)} onCreated={(id) => { void navigate(`/tasks/${id}`); }} />
     </div>
   );

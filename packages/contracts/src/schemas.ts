@@ -64,6 +64,24 @@ export const createTaskRequestSchema = Type.Intersect([
 ]);
 export type CreateTaskRequest = Static<typeof createTaskRequestSchema>;
 
+export const createScheduleSchema = Type.Object({
+  sourceTaskId: Type.String({ minLength: 1 }),
+  name: Type.String({ minLength: 1, maxLength: 120 }),
+  description: Type.Optional(Type.String({ maxLength: 1000 })),
+  mode: Type.Union([Type.Literal('report'), Type.Literal('discover'), Type.Literal('auto_execute')]),
+  triggerType: Type.Union([Type.Literal('once'), Type.Literal('interval')]),
+  timezone: Type.String({ minLength: 1, maxLength: 100 }),
+  startAt: Type.String({ minLength: 1 }),
+  intervalValue: Type.Optional(Type.Integer({ minimum: 1, maximum: 365 })),
+  intervalUnit: Type.Optional(Type.Union([Type.Literal('hour'), Type.Literal('day'), Type.Literal('week')])),
+  missedPolicy: Type.Optional(Type.Union([Type.Literal('catch_up_once'), Type.Literal('skip')])),
+  overlapPolicy: Type.Optional(Type.Union([Type.Literal('coalesce'), Type.Literal('skip')])),
+});
+export type CreateScheduleInput = Static<typeof createScheduleSchema>;
+
+export const updateScheduleSchema = Type.Partial(Type.Omit(createScheduleSchema, ['sourceTaskId']));
+export type UpdateScheduleInput = Static<typeof updateScheduleSchema>;
+
 export const answerPlanSchema = Type.Object({
   answers: Type.Record(Type.String(), Type.String()),
   goal: Type.Optional(Type.String()),
@@ -90,6 +108,9 @@ export type AnswerPlanInput = Static<typeof answerPlanSchema>;
 
 export const projectCapabilityUpdateSchema = Type.Object({
   enabled: Type.Boolean(),
+  configurationMode: Type.Optional(Type.Union([
+    Type.Literal('inherit'), Type.Literal('override'), Type.Literal('clear'),
+  ])),
   configuration: Type.Optional(Type.Record(Type.String(), Type.Unknown())),
 });
 export type ProjectCapabilityUpdateInput = Static<typeof projectCapabilityUpdateSchema>;

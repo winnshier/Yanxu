@@ -20,6 +20,7 @@ import type {
   StructuredExecutionInput,
   StructuredExecutionResult,
 } from './types.js';
+import { signalProcessTree } from './process-tree.js';
 
 interface ClaudeRuntime extends RuntimeHandle {
   executable: string;
@@ -32,12 +33,40 @@ interface ClaudeRuntime extends RuntimeHandle {
 }
 
 interface ClaudeJsonEnvelope {
+  type?: string;
   session_id?: string;
   structured_output?: unknown;
   result?: string;
   is_error?: boolean;
   subtype?: string;
   errors?: unknown;
+  message?: { content?: ClaudeContentBlock[] };
+  event?: {
+    type?: string;
+    delta?: { type?: string; text?: string; thinking?: string; partial_json?: string };
+    content_block?: ClaudeContentBlock;
+  };
+  tools?: string[];
+  slash_commands?: string[];
+  mcp_servers?: Array<{ name?: string; status?: string; error?: string }>;
+}
+
+interface ClaudeContentBlock {
+  type?: string;
+  text?: string;
+  thinking?: string;
+  name?: string;
+  id?: string;
+  tool_use_id?: string;
+  input?: unknown;
+  content?: unknown;
+  is_error?: boolean;
+}
+
+interface ClaudeStreamState {
+  sawTextDelta: boolean;
+  sawThinkingDelta: boolean;
+  toolNames: Map<string, string>;
 }
 
 const maximumCapturedOutputBytes = 16 * 1024 * 1024;
@@ -93,11 +122,27 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
   async executeStructured<T>(input: StructuredExecutionInput): Promise<StructuredExecutionResult<T>> {
     const runtime = this.getRuntime(input.runtime.id);
     const requestedSessionId = input.resumeSessionId ?? randomUUID();
+    await input.onEvent?.({
+      kind: 'status',
+      message: input.resumeSessionId ? '正在恢复 Claude Code Session。' : '正在创建 Claude Code Session。',
+      occurredAt: new Date().toISOString(),
+      data: { requestedSessionId, resumed: Boolean(input.resumeSessionId) },
+    });
     if (!runtime.sessionIds.includes(requestedSessionId)) runtime.sessionIds.push(requestedSessionId);
     await input.onSessionStarted?.(requestedSessionId);
     const settingsPath = this.writeExecutionSettings(runtime, requestedSessionId, input);
     const args = this.executionArguments(input, runtime, settingsPath, requestedSessionId);
-    const envelope = await this.runClaude(runtime, requestedSessionId, args, input.abortSignal);
+    let envelope: ClaudeJsonEnvelope;
+    try {
+      envelope = await this.runClaude(runtime, requestedSessionId, args, input);
+    } catch (error) {
+      await input.onEvent?.({
+        kind: 'error',
+        message: error instanceof Error ? error.message : String(error),
+        occurredAt: new Date().toISOString(),
+      });
+      throw error;
+    }
     const sessionId = envelope.session_id ?? requestedSessionId;
     if (!runtime.sessionIds.includes(sessionId)) runtime.sessionIds.push(sessionId);
     if (sessionId !== requestedSessionId) await input.onSessionStarted?.(sessionId);
@@ -112,6 +157,12 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
     if (!validation.ok) {
       throw new Error(`Claude Code structured output failed local Schema validation: ${validation.errors.join('; ')}`);
     }
+    await input.onEvent?.({
+      kind: 'status',
+      message: 'Claude Code 已返回结构化结果。',
+      occurredAt: new Date().toISOString(),
+      data: { sessionId },
+    });
     return { sessionId, output: validation.value };
   }
 
@@ -119,8 +170,8 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
     const managed = this.runtimes.get(runtime.id);
     const child = managed?.activeProcesses.get(sessionId);
     if (!child || child.exitCode !== null) return;
-    child.kill('SIGTERM');
-    if (!await waitForProcessExit(child, 3_000) && child.exitCode === null) child.kill('SIGKILL');
+    signalProcessTree(child, 'SIGTERM');
+    if (!await waitForProcessExit(child, 3_000) && child.exitCode === null) signalProcessTree(child, 'SIGKILL');
   }
 
   async stopRuntime(runtime: RuntimeHandle): Promise<void> {
@@ -128,8 +179,8 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
     if (!managed) return;
     await Promise.allSettled([...managed.activeProcesses.values()].map(async (child) => {
       if (child.exitCode !== null) return;
-      child.kill('SIGTERM');
-      if (!await waitForProcessExit(child, 3_000) && child.exitCode === null) child.kill('SIGKILL');
+      signalProcessTree(child, 'SIGTERM');
+      if (!await waitForProcessExit(child, 3_000) && child.exitCode === null) signalProcessTree(child, 'SIGKILL');
     }));
     managed.activeProcesses.clear();
     this.runtimes.delete(runtime.id);
@@ -143,7 +194,9 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
   ): string[] {
     const args = [
       '-p',
-      '--output-format', 'json',
+      '--output-format', 'stream-json',
+      '--include-partial-messages',
+      '--verbose',
       '--json-schema', JSON.stringify(input.schema),
       '--model', input.model,
       '--name', input.title.slice(0, 120),
@@ -187,9 +240,10 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
     runtime: ClaudeRuntime,
     sessionId: string,
     args: string[],
-    abortSignal?: AbortSignal,
+    input: StructuredExecutionInput,
   ): Promise<ClaudeJsonEnvelope> {
     return new Promise((resolve, reject) => {
+      const abortSignal = input.abortSignal;
       if (abortSignal?.aborted) {
         reject(abortedClaudeSessionError());
         return;
@@ -205,27 +259,47 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
           DISABLE_AUTOUPDATER: '1',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
       });
       runtime.activeProcesses.set(sessionId, child);
       rotateLogFile(runtime.logPath);
       const log = createWriteStream(runtime.logPath, { flags: 'a', mode: 0o600 });
       log.write(`\n[yanxu] ${new Date().toISOString()} executor=claude session=${sessionId} started\n`);
       let stdout = '';
+      let stdoutLineBuffer = '';
       let stderr = '';
       let outputBytes = 0;
+      const streamState: ClaudeStreamState = {
+        sawTextDelta: false,
+        sawThinkingDelta: false,
+        toolNames: new Map(),
+      };
+      let eventQueue = Promise.resolve();
+      const queueStreamObject = (value: ClaudeJsonEnvelope) => {
+        eventQueue = eventQueue.then(() => emitClaudeStreamObject(input, value, streamState));
+      };
       const append = (target: 'stdout' | 'stderr', chunk: Buffer) => {
         outputBytes += chunk.byteLength;
         if (outputBytes > maximumCapturedOutputBytes) {
-          child.kill('SIGTERM');
+          signalProcessTree(child, 'SIGTERM');
           return;
         }
-        if (target === 'stdout') stdout += chunk.toString();
-        else stderr += chunk.toString();
+        const text = chunk.toString();
+        if (target === 'stdout') {
+          stdout += text;
+          stdoutLineBuffer += text;
+          const lines = stdoutLineBuffer.split('\n');
+          stdoutLineBuffer = lines.pop() ?? '';
+          for (const line of lines) {
+            const value = parseClaudeStreamLine(line);
+            if (value) queueStreamObject(value);
+          }
+        } else stderr += text;
         log.write(chunk);
       };
       child.stdout.on('data', (chunk: Buffer) => append('stdout', chunk));
       child.stderr.on('data', (chunk: Buffer) => append('stderr', chunk));
-      const abort = () => child.kill('SIGTERM');
+      const abort = () => signalProcessTree(child, 'SIGTERM');
       abortSignal?.addEventListener('abort', abort, { once: true });
       child.once('error', (error) => {
         runtime.activeProcesses.delete(sessionId);
@@ -233,11 +307,16 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
         log.end();
         reject(error);
       });
-      child.once('close', (code, signal) => {
+      child.once('close', async (code, signal) => {
         runtime.activeProcesses.delete(sessionId);
         abortSignal?.removeEventListener('abort', abort);
         log.write(`\n[yanxu] ${new Date().toISOString()} executor=claude session=${sessionId} exit=${code ?? signal ?? 'unknown'}\n`);
         log.end();
+        if (stdoutLineBuffer.trim()) {
+          const value = parseClaudeStreamLine(stdoutLineBuffer);
+          if (value) queueStreamObject(value);
+        }
+        await eventQueue;
         if (abortSignal?.aborted) {
           reject(abortedClaudeSessionError());
           return;
@@ -275,6 +354,120 @@ export class ClaudeCodeAdapter implements ExecutorAdapter {
       sessionIds: runtime.sessionIds,
     };
   }
+}
+
+function parseClaudeStreamLine(line: string): ClaudeJsonEnvelope | null {
+  const text = line.trim();
+  if (!text) return null;
+  try {
+    const value = JSON.parse(text) as ClaudeJsonEnvelope;
+    return value && typeof value === 'object' ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function emitClaudeStreamObject(
+  input: StructuredExecutionInput,
+  value: ClaudeJsonEnvelope,
+  state: ClaudeStreamState,
+): Promise<void> {
+  if (!input.onEvent) return;
+  const occurredAt = new Date().toISOString();
+  if (value.type === 'system') {
+    const mcps = (value.mcp_servers ?? []).map((server) => ({
+      name: server.name ?? 'unknown',
+      status: normalizeClaudeMcpStatus(server.status),
+      ...(server.error ? { error: cleanOutput(server.error) } : {}),
+    }));
+    const skills = (value.slash_commands ?? [])
+      .filter((name) => typeof name === 'string' && name.trim().length > 0)
+      .map((name) => ({ name: name.replace(/^\//, ''), status: 'loaded' }));
+    await input.onEvent({
+      kind: 'status',
+      message: 'Claude Code 运行时已初始化。',
+      occurredAt,
+      data: {
+        sessionId: value.session_id ?? null,
+        capabilityRuntime: { skills, mcps },
+        availableTools: value.tools ?? [],
+      },
+    });
+    return;
+  }
+  if (value.type === 'stream_event') {
+    const delta = value.event?.delta;
+    if (delta?.type === 'text_delta' && delta.text) {
+      state.sawTextDelta = true;
+      await input.onEvent({ kind: 'text', message: delta.text.slice(0, 2_000), occurredAt });
+    } else if (delta?.type === 'thinking_delta' && delta.thinking) {
+      state.sawThinkingDelta = true;
+      await input.onEvent({ kind: 'thinking', message: delta.thinking.slice(0, 2_000), occurredAt });
+    }
+    const block = value.event?.content_block;
+    if (block?.type === 'tool_use') await emitClaudeToolCall(input, block, state, occurredAt);
+    return;
+  }
+  const blocks = value.message?.content ?? [];
+  if (value.type === 'assistant') {
+    for (const block of blocks) {
+      if (block.type === 'tool_use') await emitClaudeToolCall(input, block, state, occurredAt);
+      else if (block.type === 'text' && block.text && !state.sawTextDelta) {
+        await input.onEvent({ kind: 'text', message: block.text.slice(0, 2_000), occurredAt });
+      } else if (block.type === 'thinking' && block.thinking && !state.sawThinkingDelta) {
+        await input.onEvent({ kind: 'thinking', message: block.thinking.slice(0, 2_000), occurredAt });
+      }
+    }
+  } else if (value.type === 'user') {
+    for (const block of blocks.filter((item) => item.type === 'tool_result')) {
+      const tool = block.tool_use_id ? state.toolNames.get(block.tool_use_id) : undefined;
+      await input.onEvent({
+        kind: 'tool_result',
+        message: `${tool ?? 'tool'} · ${block.is_error ? 'failed' : 'completed'}`,
+        occurredAt,
+        data: {
+          tool: tool ?? null,
+          toolUseId: block.tool_use_id ?? null,
+          status: block.is_error ? 'failed' : 'completed',
+          output: boundedEventData(block.content),
+        },
+      });
+    }
+  }
+}
+
+async function emitClaudeToolCall(
+  input: StructuredExecutionInput,
+  block: ClaudeContentBlock,
+  state: ClaudeStreamState,
+  occurredAt: string,
+): Promise<void> {
+  if (!input.onEvent || !block.name) return;
+  if (block.id) {
+    if (state.toolNames.has(block.id)) return;
+    state.toolNames.set(block.id, block.name);
+  }
+  await input.onEvent({
+    kind: 'tool_call',
+    message: `${block.name} · running`,
+    occurredAt,
+    data: { tool: block.name, toolUseId: block.id ?? null, status: 'running', input: boundedEventData(block.input) },
+  });
+}
+
+function normalizeClaudeMcpStatus(status?: string): string {
+  if (!status) return 'not_checked';
+  if (/connected|ready|available/i.test(status)) return 'connected';
+  if (/auth/i.test(status)) return 'needs_auth';
+  if (/disabled/i.test(status)) return 'disabled';
+  if (/fail|error/i.test(status)) return 'failed';
+  return status;
+}
+
+function boundedEventData(value: unknown): unknown {
+  if (value === undefined) return null;
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  return serialized.length <= 2_000 ? value : `${serialized.slice(0, 2_000)}…`;
 }
 
 function projectClaudeSkills(configDirectory: string, workspacePath: string): void {

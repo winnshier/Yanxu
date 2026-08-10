@@ -68,6 +68,10 @@ export function classifyExecutionFailure(error: unknown): ClassifiedExecutionFai
     category = 'skill_contract';
     retryable = true;
     suggestedAction = 'retry';
+  } else if (code?.includes('RUNTIME_DRIFT') || code?.includes('CREDENTIAL') || code?.includes('CONFIG')) {
+    category = 'configuration';
+    retryable = false;
+    suggestedAction = 'await_user';
   } else if (code?.includes('PERMISSION') || /permission|权限|operation not permitted/.test(lower)) {
     category = 'permission';
     retryable = false;
@@ -93,7 +97,25 @@ export function classifyExecutionFailure(error: unknown): ClassifiedExecutionFai
     retryable = true;
     suggestedAction = 'retry';
   } else if (
-    /timeout|timed out|econnreset|econnrefused|enotfound|socket hang up|network|rate limit|too many requests|\b429\b|\b5\d\d\b|temporar|runtime crash|aborted/.test(lower)
+    /econnreset|econnrefused|enotfound|socket hang up|network|dns|tls|certificate|rate limit|too many requests|\b429\b|\b5\d\d\b/.test(lower)
+  ) {
+    category = 'network';
+    retryable = true;
+    suggestedAction = 'retry';
+  } else if (
+    /session.*(?:missing|not found|expired|invalid)|resume.*(?:failed|invalid)|context.*(?:lost|window)|会话.*(?:失效|不存在)|上下文.*(?:丢失|超限)/.test(lower)
+  ) {
+    category = 'context';
+    retryable = true;
+    suggestedAction = 'retry';
+  } else if (
+    /spawn .*enoent|daemon.*restart|process group|runtime directory|database is locked|disk full/.test(lower)
+  ) {
+    category = 'infrastructure';
+    retryable = true;
+    suggestedAction = 'retry';
+  } else if (
+    /timeout|timed out|temporar|runtime crash|aborted/.test(lower)
   ) {
     category = 'transient';
     retryable = true;

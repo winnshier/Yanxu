@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Alert, Badge, Button, Card, Descriptions, Empty, Input, List, Modal, Popconfirm, Select, Space, Tabs, Tag, Typography, message } from 'antd';
+import { Alert, Badge, Button, Card, Descriptions, Empty, Input, List, Modal, Popconfirm, Progress, Select, Space, Tabs, Tag, Typography, message } from 'antd';
 import { DeleteOutlined, FolderAddOutlined, HistoryOutlined, PlusOutlined, ReloadOutlined, SettingOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, useParams } from 'react-router-dom';
@@ -17,6 +17,13 @@ export function ProjectDetailPage() {
   const [knowledgeQuery, setKnowledgeQuery] = useState('');
   const [knowledgeDraft, setKnowledgeDraft] = useState<{ id: string; title: string; content: string } | null>(null);
   const [profileDirectoryId, setProfileDirectoryId] = useState<string | null>(null);
+  const [capabilityDraft, setCapabilityDraft] = useState<{
+    capabilityId: string;
+    name: string;
+    enabled: boolean;
+    configurationMode: 'inherit' | 'override' | 'clear';
+    configurationText: string;
+  } | null>(null);
   const [settingsDraft, setSettingsDraft] = useState<{
     description: string;
     permissionMode: 'inherit' | 'standard' | 'managed';
@@ -116,9 +123,18 @@ export function ProjectDetailPage() {
     onError: (error: Error) => message.error(error.message),
   });
   const updateCapability = useMutation({
-    mutationFn: ({ capabilityId, enabled }: { capabilityId: string; enabled: boolean }) =>
-      api.updateProjectCapability(projectId, capabilityId, { enabled }),
+    mutationFn: ({ capabilityId, enabled, configurationMode, configuration }: {
+      capabilityId: string;
+      enabled: boolean;
+      configurationMode?: 'inherit' | 'override' | 'clear';
+      configuration?: Record<string, unknown>;
+    }) => api.updateProjectCapability(projectId, capabilityId, {
+      enabled,
+      ...(configurationMode ? { configurationMode } : {}),
+      ...(configuration ? { configuration } : {}),
+    }),
     onSuccess: (_result, input) => {
+      setCapabilityDraft(null);
       void queryClient.invalidateQueries({ queryKey: ['project-capabilities', projectId] });
       void queryClient.invalidateQueries({ queryKey: ['project-space-operations', projectId] });
       message.success(input.enabled ? '能力已启用并写入项目锁文件' : '能力已从项目停用');
@@ -136,18 +152,12 @@ export function ProjectDetailPage() {
   ];
   const items = data ? [
     {
-      key: 'overview', label: '概览', children: <div className="detail-grid project-overview-grid">
-        <Card title="项目状态"><Descriptions column={1} items={[
-          { key: 'directories', label: '项目目录', children: `${data.directories.length} 个` },
-          { key: 'active', label: '正在推进', children: `${data.taskSummary.active} 个任务` },
-          { key: 'attention', label: '需要处理', children: `${data.taskSummary.attention} 个任务` },
-          { key: 'space', label: 'ProjectSpace', children: <Typography.Text className="mono-text" copyable>{data.projectSpacePath}</Typography.Text> },
-        ]} /></Card>
+      key: 'overview', label: '概览', children: <div className="project-overview-list">
         <Card title="最近任务">{(tasks.data ?? []).slice(0, 4).length ? <Space direction="vertical" className="full-width">{(tasks.data ?? []).slice(0, 4).map((task) => <TaskTrack key={task.id} task={task} compact />)}</Space> : <Empty description="还没有任务" />}</Card>
       </div>,
     },
     {
-      key: 'directories', label: `项目目录 ${data.directories.length}`, children: <Space direction="vertical" size={12} className="full-width">
+      key: 'directories', label: `关联资源 ${data.directories.length}`, children: <Space direction="vertical" size={12} className="full-width">
         {data.directories.map((directory) => {
           const candidate = directoryProfiles.data?.find((profile) =>
             profile.directoryId === directory.id && profile.status === 'candidate');
@@ -201,6 +211,17 @@ export function ProjectDetailPage() {
               const hasUpdate = enabled && capability.lifecycleStatus === 'installed'
                 && projectCapability?.lockedHash !== capability.contentHash;
               return <List.Item actions={[
+                <Button
+                  key="configure"
+                  type="text"
+                  onClick={() => setCapabilityDraft({
+                    capabilityId: capability.id,
+                    name: capability.name,
+                    enabled,
+                    configurationMode: projectCapability?.configurationMode ?? 'inherit',
+                    configurationText: JSON.stringify(projectCapability?.configuration ?? {}, null, 2),
+                  })}
+                >配置</Button>,
                 ...(hasUpdate ? [<Button
                   key="update"
                   type="primary"
@@ -216,7 +237,7 @@ export function ProjectDetailPage() {
                 >{enabled ? '停用' : '启用到项目'}</Button>,
               ]}>
                 <List.Item.Meta
-                  title={<Space wrap><Typography.Text strong>{capability.name}</Typography.Text><Tag>{capability.kind.toUpperCase()}</Tag>{enabled && <Tag color="green">已锁定 {projectCapability?.lockedVersion}</Tag>}</Space>}
+                  title={<Space wrap><Typography.Text strong>{capability.name}</Typography.Text><Tag>{capability.kind.toUpperCase()}</Tag>{enabled && <Tag color="green">已锁定 {projectCapability?.lockedVersion}</Tag>}{projectCapability && <Tag>{projectCapability.configurationMode === 'inherit' ? '继承来源配置' : projectCapability.configurationMode === 'override' ? '项目覆盖' : '显式清空'}</Tag>}</Space>}
                   description={<Space direction="vertical" size={2}><Typography.Text type="secondary">{capability.description || '暂无说明'}</Typography.Text><Typography.Text className="mono-text" type="secondary">{capability.source.ref}</Typography.Text>{enabled && capability.lifecycleStatus !== 'installed' && <Typography.Text type="warning">来源已有变化；项目仍锁定旧版本，更新前不影响已确认任务。</Typography.Text>}</Space>}
                 />
               </List.Item>;
@@ -238,7 +259,7 @@ export function ProjectDetailPage() {
         ] } : {})}><List.Item.Meta title={<Space>{item.title}<Tag>{item.category}</Tag><Tag color={item.status === 'active' ? 'green' : item.status === 'candidate' ? 'gold' : 'default'}>{item.status}</Tag><Tag>v{item.version}</Tag></Space>} description={<Typography.Paragraph className="knowledge-content">{item.content}</Typography.Paragraph>} /></List.Item>} />
       </>,
     },
-    { key: 'settings', label: 'ProjectSpace', children: <Space direction="vertical" size={12} className="full-width">
+    { key: 'settings', label: '项目历史 / ProjectSpace', children: <Space direction="vertical" size={12} className="full-width">
       <Card
         title="完整性检查"
         extra={<Space><Button size="small" loading={refreshRecoveryPoint.isPending} onClick={() => refreshRecoveryPoint.mutate()}>刷新恢复点</Button><Button size="small" icon={<ReloadOutlined />} loading={projectSpaceIntegrity.isFetching} onClick={() => { void projectSpaceIntegrity.refetch(); }}>重新检查</Button></Space>}
@@ -290,7 +311,38 @@ export function ProjectDetailPage() {
           description: data.description,
           permissionMode: projectSettings.data?.permissionMode ?? 'inherit',
           forbiddenPaths: projectSettings.data?.forbiddenPaths.join('\n') ?? '',
-        })}>项目设置</Button><Button type="primary" icon={<PlusOutlined />} onClick={() => setTaskModal(true)}>创建任务</Button></Space>} /><Tabs items={items} /></>}
+        })}>项目设置</Button><Button type="primary" icon={<PlusOutlined />} onClick={() => setTaskModal(true)}>创建任务</Button></Space>} />
+          <div className="entity-detail-layout project-workspace-layout">
+            <main className="entity-detail-main">
+              <Tabs className="workspace-tabs" items={['overview', 'tasks', 'knowledge', 'directories', 'capabilities', 'settings'].map((key) => items.find((item) => item.key === key)).filter((item): item is NonNullable<typeof item> => Boolean(item))} />
+            </main>
+            <aside className="entity-properties-panel" aria-label="项目属性">
+              <div className="properties-panel-title">项目属性</div>
+              <section className="properties-section">
+                <Typography.Text strong>任务进度</Typography.Text>
+                <Progress
+                  percent={(tasks.data?.length ?? 0) > 0 ? Math.round(((tasks.data?.filter((task) => ['DELIVERED', 'ARCHIVED'].includes(task.status)).length ?? 0) / (tasks.data?.length ?? 1)) * 100) : 0}
+                  size="small"
+                  showInfo={false}
+                />
+                <Typography.Text type="secondary">{tasks.data?.filter((task) => ['DELIVERED', 'ARCHIVED'].includes(task.status)).length ?? 0} / {tasks.data?.length ?? 0} 已交付</Typography.Text>
+              </section>
+              <section className="properties-section">
+                <Typography.Text strong>概况</Typography.Text>
+                <Descriptions column={1} size="small" colon={false} items={[
+                  { key: 'active', label: '推进中', children: data.taskSummary.active },
+                  { key: 'attention', label: '需处理', children: data.taskSummary.attention },
+                  { key: 'directories', label: '关联目录', children: data.directories.length },
+                  { key: 'knowledge', label: '有效知识', children: knowledge.data?.length ?? 0 },
+                ]} />
+              </section>
+              <section className="properties-section">
+                <Typography.Text strong>ProjectSpace</Typography.Text>
+                <Typography.Paragraph type="secondary" className="mono-text properties-path" copyable>{data.projectSpacePath}</Typography.Paragraph>
+              </section>
+            </aside>
+          </div>
+        </>}
       </QueryState>
       <CreateTaskModal open={taskModal} projects={data ? [data] : []} teams={teams.data ?? []} initialProjectId={projectId} onClose={() => setTaskModal(false)} onCreated={(id) => { void navigate(`/tasks/${id}`); }} />
       <Modal
@@ -332,6 +384,53 @@ export function ProjectDetailPage() {
             />
           </List.Item>}
         />
+      </Modal>
+      <Modal
+        open={Boolean(capabilityDraft)}
+        title={capabilityDraft ? `${capabilityDraft.name} · 项目配置` : '能力配置'}
+        okText="保存配置"
+        cancelText="取消"
+        confirmLoading={updateCapability.isPending}
+        onCancel={() => setCapabilityDraft(null)}
+        onOk={() => {
+          if (!capabilityDraft) return;
+          try {
+            const parsed = capabilityDraft.configurationMode === 'override'
+              ? JSON.parse(capabilityDraft.configurationText || '{}') as unknown
+              : {};
+            if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('配置必须是 JSON 对象。');
+            updateCapability.mutate({
+              capabilityId: capabilityDraft.capabilityId,
+              enabled: capabilityDraft.enabled,
+              configurationMode: capabilityDraft.configurationMode,
+              configuration: parsed as Record<string, unknown>,
+            });
+          } catch (error) {
+            message.error(error instanceof Error ? error.message : '配置 JSON 不合法。');
+          }
+        }}
+      >
+        <Space direction="vertical" size={12} className="full-width">
+          <Alert type="info" showIcon message="配置只写入项目锁和任务快照，不修改本机 CLI 全局配置" />
+          <Select
+            className="full-width"
+            value={capabilityDraft?.configurationMode ?? 'inherit'}
+            options={[
+              { label: '继承能力来源配置', value: 'inherit' },
+              { label: '在来源配置上做项目覆盖', value: 'override' },
+              { label: '显式清空配置', value: 'clear' },
+            ]}
+            onChange={(configurationMode: 'inherit' | 'override' | 'clear') => setCapabilityDraft((current) => current ? { ...current, configurationMode } : current)}
+          />
+          {capabilityDraft?.configurationMode === 'override' && <Input.TextArea
+            className="mono-text"
+            rows={12}
+            value={capabilityDraft.configurationText}
+            onChange={(event) => setCapabilityDraft((current) => current ? { ...current, configurationText: event.target.value } : current)}
+            placeholder={'{\n  "command": "..."\n}'}
+          />}
+          {capabilityDraft?.configurationMode === 'clear' && <Alert type="warning" showIcon message="显式清空可能使依赖命令或地址的 MCP 无法启动；任务启动前会进行校验。" />}
+        </Space>
       </Modal>
       <Modal
         open={Boolean(settingsDraft)}

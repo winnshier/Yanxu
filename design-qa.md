@@ -1,53 +1,112 @@
-# 能力中心视觉验收
+# Yanxu 页面级布局改版验收
 
-- Source visual truth: `/var/folders/d8/p0rzmdb17lx5q04x9q7pqmv80000gn/T/codex-clipboard-d636fb90-faff-41d4-887c-5ba2f9469efc.png`
-- Implementation screenshot: `/private/tmp/yanxu-capability-center-reference-size.jpg`
-- Route: `http://127.0.0.1:43120/capabilities`
-- State: 已重新扫描本机能力、全部分类、页面顶部、无弹窗
-- Viewport: 2000 × 1300 CSS px
-- Source pixels: 2000 × 1300
-- Implementation pixels: 2000 × 1300
-- Device pixel ratio: 2；浏览器截图已归一化为 CSS 像素尺寸，无需额外缩放
+## 验收结论
 
-## Full-view comparison evidence
+本轮已按“纯左右布局 + 具体模块页面重排”完成第二轮改版。应用壳层不再显示“本地工作区 / ProjectSpace”说明块，也不再显示右侧顶部标签栏；右侧从页面标题开始直接进入连续工作区。项目、任务、团队/角色、能力中心、定时任务和设置均已分别改造，不再只是更换外壳或配色。
 
-参考图的核心结构是“标题操作区 → 汇总分布条 → 单行能力列表”。Yanxu 实现保留现有左侧应用导航，并在主内容区采用相同的信息层级：顶部显示能力总量、Skill/MCP、安装状态和 CLI 分布，下方使用统一行高的管理列表。两张图在相同 2000 × 1300 视口下完成并排核对。
+## 验收范围
 
-## Focused region comparison evidence
+- 应用壳层：固定左侧导航、连续右侧工作区
+- 调度台：横向运行摘要与扁平工作区模块
+- 项目：高密度项目目录
+- 任务：执行目录、步骤链、状态与操作列
+- 项目/任务详情：主内容与属性侧栏
+- AI 团队：人员目录、团队目录与角色库
+- 能力中心：Skill/MCP 能力目录与兼容状态
+- 定时任务：触发器目录与左右分栏编辑器
+- 设置：CLI 运行环境表格、能力矩阵与协调配置
+- 创建任务：需求输入与执行约束左右分栏编辑器
 
-- 汇总区：总量在左，分类与 CLI 彩色胶囊在右；颜色克制、数字权重明确，和参考图的信息读取顺序一致。
-- 列表区：名称、种类、说明、来源、兼容 CLI、运行状态和操作均保持稳定列位；长路径收敛为次级单行文本。
-- 凭据状态：本机 CLI 凭据使用绿色轻量标签，外部不安全凭据和无效配置继续使用警示状态。
-- 操作区：导入入口收进菜单，扫描保持主按钮；详情与安装维持在每行最右侧。
+## 视觉真值与实现证据
 
-## Required fidelity surfaces
+参考图：
 
-- Fonts and typography: 沿用产品现有 Inter、PingFang SC 和系统字体；标题、计数、正文、路径形成四级层次，未出现异常换行或截断。
-- Spacing and layout rhythm: 汇总与列表采用 18px 圆角和细边框，列表行约 95px；主信息、状态和操作对齐稳定。
-- Colors and visual tokens: 继续使用 Yanxu 主蓝色，同时用浅橙、浅绿、浅紫区分 Skill、MCP、OpenCode 和 Claude，语义与参考图一致。
-- Image quality and asset fidelity: 页面没有需要复刻的内容图片；界面图标全部来自现有 Ant Design 图标库，没有使用占位图或自制图形。
-- Copy and content: 保留 Yanxu 的能力生命周期、安全边界、项目启用和版本冻结语义，没有照搬参考产品文案。
+- `docs/assets/multica-ui-reference/03-project-detail.png`
+- `docs/assets/multica-ui-reference/04-new-issue-agent.png`
+- `docs/assets/multica-ui-reference/05-agent-working.png`
+- `docs/assets/multica-ui-reference/06-task-transcript.png`
+- `docs/assets/multica-ui-reference/07-run-result.png`
+- `docs/assets/multica-ui-reference/08-skills-list.png`
+- `docs/assets/multica-ui-reference/09-runtime-detail.png`
+- `docs/assets/multica-ui-reference/10-autopilot-schedule.png`
 
-## Findings
+实现截图：
 
-没有遗留的 P0、P1 或 P2 视觉问题。左侧应用导航、仅展示 OpenCode/Claude 两类执行器，以及安全状态列属于 Yanxu 的产品约束，不作为设计偏差。
+- `docs/assets/design-qa-v2/dashboard-1600.png`
+- `docs/assets/design-qa-v2/projects-1600.png`
+- `docs/assets/design-qa-v2/tasks-1600.png`
+- `docs/assets/design-qa-v2/project-detail-1600.png`
+- `docs/assets/design-qa-v2/task-detail-1600.png`
+- `docs/assets/design-qa-v2/team-agents-1600.png`
+- `docs/assets/design-qa-v2/role-library-1600.png`
+- `docs/assets/design-qa-v2/capabilities-1600.png`
+- `docs/assets/design-qa-v2/settings-1600.png`
+- `docs/assets/design-qa-v2/create-task-1600.png`
+- `docs/assets/design-qa-v2/schedule-editor-1600.png`
 
-## Interaction and responsive checks
+同屏对照证据：
 
-- 本机能力扫描成功，明文凭据旧状态在重扫后更新为“本机凭据”。
-- 导入能力菜单可打开，包含本地 Skill、ZIP 和 GitHub 三种入口。
-- 能力详情安全审查弹窗可正常打开和关闭。
-- 900 × 800 视口下列表改为分行布局，文档宽度等于视口宽度，无横向溢出。
-- 浏览器控制台未发现页面错误。
+- `docs/assets/design-qa-v2/compare-project-detail.png`
+- `docs/assets/design-qa-v2/compare-task-detail.png`
+- `docs/assets/design-qa-v2/compare-capabilities.png`
+- `docs/assets/design-qa-v2/compare-settings.png`
+- `docs/assets/design-qa-v2/compare-create-task.png`
+- `docs/assets/design-qa-v2/compare-schedule-editor.png`
 
-## Comparison history
+浏览器视口为 `1600 × 1000 CSS px`，设备像素比为 `1`，实现截图为 `1600 × 1000 px`。对照图将参考图与实现图等宽归一后并排，用于检查整页布局、信息密度和模块关系。
 
-- Pass 1: 在默认 1280 × 720 视口确认顶部统计、前三行能力和操作区均正确渲染。
-- Pass 2: 在 900 × 800 视口确认响应式折行与无横向溢出。
-- Pass 3: 在与参考图一致的 2000 × 1300 视口完成最终同尺寸比较；无新增 P0/P1/P2 问题。
+## 对照过程与修正记录
 
-## Follow-up polish
+本轮初始发现：
 
-无阻塞项。后续若增加 Codex 等执行器，可直接沿用现有 CLI 胶囊和汇总计数模式。
+- P1：侧栏仍显示“本地工作区 / ProjectSpace”说明块，占用无效空间。
+- P1：右侧仍有标签式顶栏，使布局变成“侧栏 + 顶栏 + 页面容器”三层结构。
+- P1：项目、任务、人员、团队与定时任务主要由大卡片堆叠，未形成参考图中的目录式工作区。
+- P1：调度台模块边界过重，右侧工作区仍像嵌套窗口。
+- P2：角色导入区在首轮重排后出现控件纵向堆叠。
+
+完成的修正：
+
+- 删除侧栏本地工作区说明块与右侧标签顶栏，落实纯左右结构。
+- 去除右侧外层卡片和大圆角容器，页面直接使用连续白色工作区。
+- 调度台改为横向摘要条与扁平模块区。
+- 项目、任务、人员、团队、能力与定时任务改为稳定列对齐的目录/表格结构。
+- 任务行增加进度、当前步骤链、运行信息、状态和操作的单行扫描关系。
+- 项目/任务详情继续使用主内容与固定属性侧栏，并统一页面头部和标签高度。
+- 创建任务、创建定时任务保留左右分栏编辑器，缩短扫描距离。
+- 设置页统一为运行环境表格、能力矩阵和配置区，不再用独立大卡片分割每一项。
+- 修复角色导入控件堆叠问题；保留窄屏下的单列回退。
+
+复核结果：
+
+- Typography：标题、正文、辅助文字和表头层级统一，长文本保留省略与换行边界。
+- Spacing / layout：左侧导航宽度稳定，右侧无额外顶栏；目录行、工具栏、表头和属性栏对齐。
+- Colors / tokens：保留 Yanxu 的品牌蓝与状态色，采用低层级灰色分隔，不复制 Multica 的深色主题。
+- Images / icons：继续使用产品已有图标系统；本轮参考重点是信息架构与排版，不引入装饰性图片。
+- Copy：未为追求截图相似而替换 Yanxu 的 ProjectSpace、CLI、任务阶段、角色与技能等产品语义。
+- 项目概览和任务执行目录使用 Yanxu 自身的任务阶段与进度表达；没有逐字复制 Multica 看板，属于产品语义上的有意适配。
+- 复核后未发现剩余 P0、P1、P2 视觉问题、遮挡或关键操作缺失。
+
+## 交互与技术验证
+
+已验证：
+
+- 左侧导航在调度台、项目、任务、定时任务、AI 团队、能力中心和设置间切换
+- 任务归档筛选与真实任务目录展示
+- 项目详情、任务详情标签及属性侧栏展示
+- AI 人员、团队、角色库标签切换
+- 创建任务弹窗打开及左右分栏展示
+- 创建定时任务弹窗打开及左右分栏展示
+- 能力中心筛选工具栏与能力目录展示
+- 页面在 `1600 × 1000` 视口下无横向溢出、遮挡和顶栏残留
+- 最终浏览器控制台错误：0
+- `pnpm check`：通过
+  - TypeScript 类型检查通过
+  - ESLint 通过
+  - 128 个自动化测试通过，3 个显式跳过的 live 测试不计失败
+  - Web 与 daemon 生产构建通过
+- 最后一处 Ant Design `Tag` 兼容性调整后再次复核 Web：14 个测试、类型检查和生产构建均通过，测试输出无弃用警告
+
+证据边界：Yanxu 特有的任务执行目录、团队组合和角色库没有一一对应的 Multica 参考页，因此采用同一套高密度目录、低层级分隔和单行操作语言进行产品化适配，而不是制造不存在的截图对应关系。
 
 final result: passed

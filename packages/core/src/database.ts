@@ -42,6 +42,8 @@ const migrations = [
   { version: 22, file: '022_agent_default_capabilities.sql' },
   { version: 23, file: '023_migration_recovery_points.sql' },
   { version: 24, file: '024_execution_runs.sql' },
+  { version: 25, file: '025_schedules.sql' },
+  { version: 26, file: '026_runtime_evidence.sql' },
 ] as const;
 
 export const DATABASE_SCHEMA_VERSION = migrations.at(-1)!.version;

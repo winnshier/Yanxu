@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Alert, Button, Card, Checkbox, Descriptions, Divider, Form, Input, List, Modal, Popconfirm, Progress, Radio, Select, Space, Tabs, Tag, Timeline, Typography, message } from 'antd';
 import { CheckOutlined, DeleteOutlined, PauseOutlined, PlayCircleOutlined, ReloadOutlined, StopOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useParams } from 'react-router-dom';
+import { Link, useParams } from 'react-router-dom';
 import type { AnswerPlanInput, ProjectCapability, RequestPlanRevisionInput, Task, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskPlan, WorkflowEvent } from '@yanxu/contracts';
 import { api, ApiError } from '../lib/api.js';
 import {
@@ -251,20 +251,7 @@ export function TaskDetailPage() {
 
   const items = data ? [
     {
-      key: 'overview', label: '概览', children: <div className="detail-grid task-overview-grid">
-        <Card title="当前进度"><Progress percent={data.progress} status={data.status === 'BLOCKED' ? 'exception' : 'active'} /><Descriptions column={1} items={[
-          { key: 'status', label: '状态', children: <TaskStatusTag status={data.status} /> },
-          { key: 'project', label: '项目', children: data.projectName },
-          { key: 'team', label: '团队', children: data.teamName },
-          { key: 'version', label: '状态版本', children: data.stateVersion },
-          {
-            key: 'snapshot',
-            label: '运行快照',
-            children: data.snapshot
-              ? <Typography.Text className="mono-text">task v{data.snapshot.taskVersion} · plan v{data.snapshot.planVersion} · {data.snapshot.contentHash.slice(0, 10)}</Typography.Text>
-              : '计划确认后生成',
-          },
-        ]} /></Card>
+      key: 'overview', label: '概览', children: <div className="task-overview-document">
         <Card title="任务目标"><Typography.Paragraph>{data.description}</Typography.Paragraph><Divider /><Typography.Text strong>预期产出</Typography.Text><Typography.Paragraph type="secondary">{data.expectedOutput || '待计划阶段明确'}</Typography.Paragraph></Card>
         <Card title={`需求附件 · ${evidence.data?.attachments.length ?? 0}`}>
           <List
@@ -476,7 +463,15 @@ export function TaskDetailPage() {
         <Card title={data.flowVersion === 2 ? 'WorkUnit 执行链' : 'Skill 执行链'}><Timeline items={data.steps.map((step) => ({
           key: step.id,
           color: step.status === 'succeeded' ? 'green' : step.status === 'running' ? 'blue' : step.status === 'failed' ? 'red' : 'gray',
-          children: <div><Typography.Text strong>{step.title}</Typography.Text><Typography.Paragraph type="secondary">{step.summary ?? step.description}</Typography.Paragraph><Space wrap><Tag>{step.status}</Tag>{step.attempt > 0 && <Tag color="orange">第 {step.attempt} 次尝试</Tag>}{(taskCapabilities.data ?? []).filter((item) => item.stepId === step.id).map((item) => <Tag key={item.id} color={item.status === 'failed' ? 'red' : 'purple'}>{item.name} · {item.status}</Tag>)}</Space></div>,
+          children: <div><Typography.Text strong>{step.title}</Typography.Text><Typography.Paragraph type="secondary">{step.summary ?? step.description}</Typography.Paragraph><Space wrap><Tag>{step.status}</Tag>{step.attempt > 0 && <Tag color="orange">第 {step.attempt} 次尝试</Tag>}{(taskCapabilities.data ?? []).filter((item) => item.stepId === step.id).map((item) => <Tag
+            key={item.id}
+            color={item.runtimeStatus === 'failed' || item.runtimeStatus === 'needs_auth' || item.status === 'failed'
+              ? 'red'
+              : item.runtimeStatus === 'healthy' || item.runtimeStatus === 'connected' || item.runtimeStatus === 'loaded'
+                ? 'green'
+                : 'purple'}
+            title={item.runtimeCheckedAt ? `运行态检查：${new Date(item.runtimeCheckedAt).toLocaleString()}` : '尚未进入真实运行态检查'}
+          >{item.name} · 投影 {item.status} · 运行 {item.runtimeStatus}</Tag>)}</Space></div>,
         }))} /></Card>
         <ExecutionEvidence taskId={taskId} evidence={evidence.data} />
       </Space>,
@@ -527,7 +522,38 @@ export function TaskDetailPage() {
         {data && <>
           <PageHeader eyebrow={`${data.projectName} · ${data.teamName}`} title={data.title} description="计划、执行、门禁和交付记录都绑定在这个任务版本链上。" actions={actions} />
           {task.error instanceof ApiError && <Alert type="error" message={task.error.message} />}
-          <Tabs defaultActiveKey={planEditable ? 'plan' : 'overview'} items={items} />
+          <div className="entity-detail-layout task-workspace-layout">
+            <main className="entity-detail-main">
+              <Tabs className="workspace-tabs" defaultActiveKey={planEditable ? 'plan' : 'overview'} items={items} />
+            </main>
+            <aside className="entity-properties-panel" aria-label="任务属性">
+              <div className="properties-panel-title">任务属性</div>
+              <section className="properties-section properties-status-section">
+                <Space wrap><TaskStatusTag status={data.status} /><Tag>{data.triggerSource === 'schedule' ? '定时触发' : '人工任务'}</Tag></Space>
+                <Progress percent={data.progress} status={data.status === 'BLOCKED' ? 'exception' : 'active'} size="small" />
+              </section>
+              <section className="properties-section">
+                <Typography.Text strong>当前执行</Typography.Text>
+                <Descriptions column={1} size="small" colon={false} items={[
+                  { key: 'phase', label: '阶段', children: data.activeExecution?.phase ?? data.steps.find((step) => step.status === 'running')?.title ?? '等待下一步' },
+                  { key: 'project', label: '项目', children: data.projectName },
+                  { key: 'team', label: '团队', children: data.teamName },
+                  { key: 'version', label: '状态版本', children: `v${data.stateVersion}` },
+                ]} />
+              </section>
+              <section className="properties-section">
+                <Typography.Text strong>目录与分支</Typography.Text>
+                <Space orientation="vertical" size={6} className="full-width">{data.plan?.branchRoutes.length
+                  ? data.plan.branchRoutes.map((route) => <Tag className="properties-branch" key={route.directoryId}>{route.sourceBranch} → {route.targetBranch}</Tag>)
+                  : <Typography.Text type="secondary">{project.data?.directories.length ?? 0} 个目录 · 尚未冻结分支</Typography.Text>}
+                </Space>
+              </section>
+              <section className="properties-section">
+                <Typography.Text strong>下一步</Typography.Text>
+                <Typography.Paragraph type="secondary">{data.activeExecution?.nextAction ?? data.statusReason?.message ?? '等待当前状态完成后继续推进。'}</Typography.Paragraph>
+              </section>
+            </aside>
+          </div>
           <Modal
             title="请求协调器修改计划"
             open={revisionOpen}
@@ -610,6 +636,11 @@ export function TaskDiagnosticsPanel({
     ? <Card loading />
     : <Alert type="info" showIcon title="暂无运行诊断" description="任务产生执行记录后会在这里汇总耗时、失败分类和恢复记录。" />;
   const failureLabels: Record<TaskDiagnostics['failures'][number]['category'], string> = {
+    infrastructure: '运行基础设施',
+    network: '网络连接',
+    configuration: '运行配置',
+    context: '上下文连续性',
+    business_result: '业务结果',
     transient: '瞬时故障',
     invalid_output: '输出不合法',
     skill_contract: 'Skill 契约',
@@ -638,6 +669,7 @@ export function TaskDiagnosticsPanel({
       </Card>
       <Card title="执行健康度">
         <Descriptions column={1} size="small" items={[
+          { key: 'runs', label: '独立 Run', children: `${diagnostics.runs.succeeded} 成功 / ${diagnostics.runs.failed} 失败 / ${diagnostics.runs.interrupted + diagnostics.runs.stopped} 中断` },
           { key: 'session', label: '会话', children: `${diagnostics.sessions.succeeded} 成功 / ${diagnostics.sessions.failed} 失败 / ${diagnostics.sessions.interrupted} 中断` },
           { key: 'job', label: '后台作业', children: `${diagnostics.jobs.succeeded} 成功 / ${diagnostics.jobs.failed} 失败 / ${diagnostics.jobs.cancelled} 取消` },
           { key: 'retry', label: '自动重试 / 恢复', children: `${diagnostics.jobs.retries} / ${diagnostics.recoveries}` },
@@ -653,6 +685,33 @@ export function TaskDiagnosticsPanel({
         ]} />
       </Card>
     </div>
+    <Card title={`Run 时间线 · ${diagnostics.runs.total}`}>
+      {diagnostics.recentRuns.length === 0
+        ? <Typography.Text type="secondary">尚未启动真实 CLI Run</Typography.Text>
+        : <List
+          size="small"
+          dataSource={diagnostics.recentRuns}
+          rowKey={(run) => run.id}
+          renderItem={(run) => <List.Item actions={[
+            <Link key="view" to={`/tasks/${diagnostics.taskId}/runs/${run.id}`}>查看证据</Link>,
+          ]}>
+            <List.Item.Meta
+              title={<Space wrap>
+                <Typography.Text strong>{run.phase}</Typography.Text>
+                <Tag color={run.status === 'succeeded' ? 'green' : run.status === 'failed' ? 'red' : run.status === 'running' ? 'blue' : 'orange'}>{run.status}</Tag>
+                <Tag>{run.triggerSource}</Tag>
+                {run.retryOfRunId && <Tag color="purple">重试 {run.retryOfRunId.slice(-8)}</Tag>}
+              </Space>}
+              description={<Space orientation="vertical" size={2}>
+                <Typography.Text type="secondary">Run {run.id} · Session {run.externalSessionId ?? '未建立'} · 工作区{run.workspaceReused ? '复用' : '新准备'} / 会话{run.sessionReused ? '复用' : '新建'}</Typography.Text>
+                {run.failureMessage && <Typography.Text type="danger">{run.failureMessage}</Typography.Text>}
+                {run.nextAction && <Typography.Text>下一步：{run.nextAction}</Typography.Text>}
+                <Typography.Text type="secondary">{new Date(run.startedAt).toLocaleString()} · 最近活动 {new Date(run.heartbeatAt ?? run.startedAt).toLocaleString()}</Typography.Text>
+              </Space>}
+            />
+          </List.Item>}
+        />}
+    </Card>
     <Card title={`失败分类时间线 · ${diagnostics.failures.length}`}>
       {diagnostics.failures.length === 0
         ? <Typography.Text type="secondary">没有记录到后台执行失败</Typography.Text>
@@ -816,9 +875,10 @@ function ExecutionEvidence({ taskId, evidence }: { taskId: string; evidence: Tas
             title={<Space><Typography.Text>{item.title}</Typography.Text><Tag>v{item.version}</Tag><Tag color={item.status === 'superseded' ? 'default' : 'blue'}>{item.status}</Tag></Space>}
             description={<Space direction="vertical" className="full-width" size={4}>
               <Typography.Text className="mono-text" type="secondary">{item.contentHash.slice(0, 12)} · {item.skillId}</Typography.Text>
-              <Typography.Paragraph className="artifact-content" ellipsis={{ rows: 6, expandable: true, symbol: '展开产物' }}>
-                {evidence.artifactPreviews.find((preview) => preview.artifactId === item.id)?.content || '产物正文不可用'}
-              </Typography.Paragraph>
+              <MarkdownContent
+                className="artifact-content"
+                content={evidence.artifactPreviews.find((preview) => preview.artifactId === item.id)?.content || '产物正文不可用'}
+              />
             </Space>}
           />
         </List.Item>}

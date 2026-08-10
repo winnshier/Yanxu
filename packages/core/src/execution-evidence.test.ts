@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -128,7 +128,15 @@ describe('execution evidence chain', () => {
 
     const firstStep = store.startOrResumeStep(task.id);
     const firstAgent = store.getAgent(firstStep.agentId ?? '');
-    const sessionId = store.createAgentSession(task.id, firstStep, firstAgent);
+    const sessionId = store.createAgentSession(task.id, firstStep, firstAgent, {
+      runtimeDirectory: join(workbench, 'runtime', 'tasks', task.id, 'executor'),
+    });
+    store.recordExecutionRunEvent(sessionId, {
+      kind: 'status',
+      message: '执行器已进入真实运行态。',
+      occurredAt: new Date().toISOString(),
+      data: { phase: 'executing' },
+    });
     const checkpoints = workspaces.map((workspace) => {
       const baseCommit = manager.head(workspace);
       const inspection = manager.inspectChanges(workspace, baseCommit, [''], []);
@@ -148,12 +156,45 @@ describe('execution evidence chain', () => {
       }],
     }, checkpoints);
 
+    const knowledgeTimestamp = new Date().toISOString();
+    database.prepare(`
+      INSERT INTO knowledge_items(
+        id, project_id, category, title, content, status, source_task_id,
+        version, supersedes_id, created_at, updated_at
+      ) VALUES ('knowledge_api_standard_candidate', ?, 'decision', 'API 验收标准',
+        '技术设计必须引用 AC-1，并覆盖异常路径。', 'candidate', NULL, 1, NULL, ?, ?)
+    `).run(project.id, knowledgeTimestamp, knowledgeTimestamp);
+    const activeKnowledge = store.reviewKnowledge('knowledge_api_standard_candidate', 'accept');
+    database.prepare(`
+      INSERT INTO knowledge_items(
+        id, project_id, category, title, content, status, source_task_id,
+        version, supersedes_id, created_at, updated_at
+      ) VALUES ('knowledge_unrelated_candidate', ?, 'fact', '移动端品牌色',
+        '营销页主色使用珊瑚橙，与接口验收和技术设计无关。', 'candidate', NULL, 1, NULL, ?, ?)
+    `).run(project.id, knowledgeTimestamp, knowledgeTimestamp);
+    store.reviewKnowledge('knowledge_unrelated_candidate', 'accept');
+
     const secondStep = store.startOrResumeStep(task.id);
     const context = store.buildContextPack(task.id, secondStep.id);
     const evidence = store.getTaskEvidence(task.id);
 
     expect(context.upstreamArtifacts).toHaveLength(1);
     expect(context.upstreamArtifacts[0]?.content).toContain('AC-1');
+    expect(context.projectKnowledge).toEqual([
+      expect.objectContaining({
+        id: activeKnowledge.id,
+        relevanceScore: expect.any(Number),
+        matchedTerms: expect.arrayContaining(['设计']),
+        selectionReason: expect.stringContaining('当前任务相关'),
+      }),
+    ]);
+    expect(context.sources).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: 'knowledge',
+        id: activeKnowledge.id,
+        selectionReason: expect.stringContaining('当前任务相关'),
+      }),
+    ]));
     expect(evidence.artifacts[0]).toMatchObject({
       artifactType: 'requirement-spec',
       version: 1,
@@ -161,6 +202,19 @@ describe('execution evidence chain', () => {
     });
     expect(evidence.changeManifests).toHaveLength(1);
     expect(evidence.contextPacks[0]?.contentHash).toBe(context.contentHash);
+    expect(evidence.runs[0]).toMatchObject({
+      id: sessionId,
+      stepId: firstStep.id,
+      status: 'succeeded',
+      phase: 'run_completed',
+      retryOfRunId: null,
+      executor: 'opencode',
+      model: 'test-model',
+      attempt: 1,
+      workspaces: expect.arrayContaining([expect.objectContaining({ directoryId })]),
+      logPath: expect.stringContaining(`/runs/${sessionId}/runtime.log`),
+    });
+    expect(readFileSync(evidence.runs[0]?.logPath ?? '', 'utf8')).toContain('执行器已进入真实运行态');
     expect(evidence.attachments[0]).toMatchObject({
       fileName: 'requirement-notes.md',
       contentPreview: expect.stringContaining('异常路径'),

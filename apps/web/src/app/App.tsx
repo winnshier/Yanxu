@@ -8,8 +8,10 @@ const ProjectsPage = lazy(() => import('../pages/ProjectsPage.js').then((module)
 const ProjectDetailPage = lazy(() => import('../pages/ProjectDetailPage.js').then((module) => ({ default: module.ProjectDetailPage })));
 const TasksPage = lazy(() => import('../pages/TasksPage.js').then((module) => ({ default: module.TasksPage })));
 const TaskDetailPage = lazy(() => import('../pages/TaskDetailPage.js').then((module) => ({ default: module.TaskDetailPage })));
+const RunDetailPage = lazy(() => import('../pages/RunDetailPage.js').then((module) => ({ default: module.RunDetailPage })));
 const TeamPage = lazy(() => import('../pages/TeamPage.js').then((module) => ({ default: module.TeamPage })));
 const CapabilityCenterPage = lazy(() => import('../pages/CapabilityCenterPage.js').then((module) => ({ default: module.CapabilityCenterPage })));
+const SchedulesPage = lazy(() => import('../pages/SchedulesPage.js').then((module) => ({ default: module.SchedulesPage })));
 const SettingsPage = lazy(() => import('../pages/SettingsPage.js').then((module) => ({ default: module.SettingsPage })));
 
 export function App() {
@@ -22,8 +24,10 @@ export function App() {
           <Route path="projects/:projectId" element={<ProjectDetailPage />} />
           <Route path="tasks" element={<TasksPage />} />
           <Route path="tasks/:taskId" element={<TaskDetailPage />} />
+          <Route path="tasks/:taskId/runs/:runId" element={<RunDetailPage />} />
           <Route path="team" element={<TeamPage />} />
           <Route path="capabilities" element={<CapabilityCenterPage />} />
+          <Route path="schedules" element={<SchedulesPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Route>

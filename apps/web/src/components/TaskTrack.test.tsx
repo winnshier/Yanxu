@@ -63,9 +63,15 @@ const task: Task = {
     executor: 'opencode',
     model: 'test/model',
     sessionId: 'session_test',
+    runId: 'run_test',
+    phase: 'executing',
+    nextAction: '等待 CLI 返回结果',
     startedAt: new Date(Date.now() - 70_000).toISOString(),
     heartbeatAt: new Date().toISOString(),
   },
+  triggerSource: 'manual',
+  scheduleOccurrenceId: null,
+  statusReason: null,
 };
 
 describe('task observability components', () => {
@@ -114,6 +120,18 @@ describe('task observability components', () => {
     expect(markup).toContain('等待并发槽位');
   });
 
+  it('renders the reason and next action for a task waiting on people', () => {
+    const waitingTask: Task = {
+      ...task,
+      status: 'BLOCKED',
+      activeExecution: null,
+      statusReason: { type: 'task.blocked', message: '自动重试已耗尽，需要人工选择方案。', occurredAt: new Date().toISOString() },
+    };
+    const markup = renderToStaticMarkup(<MemoryRouter><TaskTrack task={waitingTask} /></MemoryRouter>);
+    expect(markup).toContain('自动重试已耗尽');
+    expect(markup).toContain('打开任务详情处理当前状态');
+  });
+
   it('aggregates permission, conflict, recovery and event evidence in history', () => {
     const evidence: TaskEvidence = {
       requirementVersions: [],
@@ -136,6 +154,7 @@ describe('task observability components', () => {
       artifacts: [],
       artifactPreviews: [],
       sessions: [],
+      runs: [],
       contextPacks: [],
       changeManifests: [],
       designedQualityGates: [],
@@ -215,6 +234,7 @@ describe('task observability components', () => {
       statusReason: { type: decision.type, message: decision.message, occurredAt: decision.occurredAt },
       duration: { totalMs: 120_000, modelMs: 70_000, gateMs: 5_000, waitingMs: 45_000 },
       sessions: { total: 2, running: 0, succeeded: 0, failed: 2, interrupted: 0 },
+      runs: { total: 0, preparing: 0, running: 0, succeeded: 0, failed: 0, interrupted: 0, stopped: 0 },
       jobs: { total: 1, ready: 0, leased: 0, succeeded: 0, failed: 1, cancelled: 0, retries: 1 },
       planning: { versions: 1, currentVersion: 1, replans: 0 },
       context: { packs: 2, estimatedTokens: 12_345, truncatedPacks: 1 },
@@ -228,6 +248,7 @@ describe('task observability components', () => {
         message: 'Runtime crash', fingerprint: 'abcdef1234567890', retryable: true, suggestedAction: 'retry',
         repeated: true, attempt: 2, maxAttempts: 3, context: null, occurredAt: decision.occurredAt,
       }],
+      recentRuns: [],
       recentDecisions: [decision],
     };
     const markup = renderToStaticMarkup(<TaskDiagnosticsPanel diagnostics={diagnostics} />);

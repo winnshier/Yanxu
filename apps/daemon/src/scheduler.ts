@@ -527,6 +527,7 @@ export class Scheduler {
   start(): void {
     this.store.reconcileExpiredLeases(this.instanceId);
     this.store.reconcileOrphanedActiveTasks();
+    this.store.recoverScheduleOccurrences();
     this.timer = setInterval(() => { void this.tick(); }, this.pollIntervalMs);
     void this.tick();
   }
@@ -663,9 +664,19 @@ export class Scheduler {
     };
   }
 
-  private tick(): void {
+  private async tick(): Promise<void> {
     this.store.reconcileTimedOutLeases();
     this.store.reconcileOrphanedActiveTasks();
+    this.store.reconcileScheduleOccurrences();
+    const occurrence = this.store.claimDueScheduleOccurrence();
+    if (occurrence) {
+      try {
+        const installations = await this.executors.probe();
+        this.store.startScheduleOccurrence(occurrence.id, installations);
+      } catch (error) {
+        this.store.failScheduleOccurrence(occurrence.id, error);
+      }
+    }
     const capacity = this.store.getSettings(this.executors.list()).maxParallelTasks;
     if (this.activeJobs.size >= capacity) return;
     const job = this.store.claimReadyJob(this.instanceId);
@@ -675,7 +686,10 @@ export class Scheduler {
   }
 
   private async runJob(job: ClaimedJob): Promise<void> {
-    const heartbeat = setInterval(() => this.store.heartbeatJob(job.id, this.instanceId), 10_000);
+    const heartbeat = setInterval(() => {
+      this.store.heartbeatJob(job.id, this.instanceId);
+      this.store.heartbeatExecutionRunForJob(job.id);
+    }, 10_000);
     try {
       this.store.assertJobExecutionCurrent(job);
       await this.execute(job);
@@ -770,7 +784,14 @@ export class Scheduler {
     const baseCommits = new Map(workspaces.map((workspace) => [workspace.directoryId, this.git.head(workspace)]));
     const contextPack = this.store.buildContextPack(taskId, step.id);
     const contextReadPatterns = contextPackReadPathPatterns(contextPack);
-    const sessionRecordId = this.store.createAgentSession(taskId, step, agent);
+    const workspaceRoot = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'workspace');
+    const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'executor');
+    const sessionRecordId = this.store.createAgentSession(taskId, step, agent, {
+      jobId: job.id,
+      triggerSource: this.store.getTask(taskId).triggerSource,
+      workspaceReused: step.attempt > 1,
+      runtimeDirectory,
+    });
     const readOnly = permissionManifest?.readOnly
       ?? (step.kind === 'work_unit' ? step.mode !== 'write' : step.skillId !== 'implementation');
     const commandPatterns = [...new Set([
@@ -795,6 +816,7 @@ export class Scheduler {
     const abortController = this.registerTaskAbortController(taskId);
     const sessionTimeout = setTimeout(() => abortController.abort(), executionSettings.sessionTimeoutMs);
     let binding = this.runtimes.get(taskId);
+    let resumeSessionId: string | null = null;
     try {
       if (binding && binding.runtime.executor !== agent.executor) {
         await binding.adapter.stopRuntime(binding.runtime);
@@ -802,16 +824,17 @@ export class Scheduler {
         binding = undefined;
       }
       if (!binding) {
-        const workspaceRoot = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'workspace');
-        const runtimeDirectory = join(this.store.workbenchHome, 'runtime', 'tasks', taskId, 'executor');
+        this.store.markExecutionRunPhase(sessionRecordId, 'projecting_capabilities', '准备任务级 Skill、MCP 与凭据环境');
         this.store.prepareTaskCapabilityProjection(taskId, agent.executor, runtimeDirectory);
         const credentialEnvironment = this.store.resolveTaskCapabilityEnvironment(taskId, agent.executor);
+        this.store.markExecutionRunPhase(sessionRecordId, 'starting_cli', `启动 ${agent.executor} CLI`);
         const runtime = await adapter.startRuntime(workspaceRoot, runtimeDirectory, { environment: credentialEnvironment });
         binding = { runtime, adapter };
         this.runtimes.set(taskId, binding);
       }
       const runtime = binding.runtime;
-      const resumeSessionId = step.requiresIndependentSession
+      this.store.markExecutionRunPhase(sessionRecordId, 'starting_session', '建立或恢复 CLI Session');
+      resumeSessionId = step.requiresIndependentSession
         ? null
         : this.store.getResumableExternalSession(taskId, agent.id);
       const result = step.kind === 'work_unit'
@@ -842,8 +865,12 @@ export class Scheduler {
             dependencyInstallPolicy: executionSettings.dependencyInstallPolicy,
           },
           onSessionStarted: (externalSessionId) => {
+            if (resumeSessionId && externalSessionId !== resumeSessionId) {
+              this.store.invalidateExternalSession(taskId, agent.id, resumeSessionId, '执行器未恢复原 Session，已建立新 Session。');
+            }
             this.store.recordExternalSessionId(sessionRecordId, externalSessionId);
           },
+          onEvent: (event) => this.store.recordExecutionRunEvent(sessionRecordId, event),
           onPermission: async (request) => {
             const permission = this.store.createPermissionRequest(taskId, request.sessionId, request);
             while (true) {
@@ -884,8 +911,12 @@ export class Scheduler {
           dependencyInstallPolicy: executionSettings.dependencyInstallPolicy,
         },
         onSessionStarted: (externalSessionId) => {
+          if (resumeSessionId && externalSessionId !== resumeSessionId) {
+            this.store.invalidateExternalSession(taskId, agent.id, resumeSessionId, '执行器未恢复原 Session，已建立新 Session。');
+          }
           this.store.recordExternalSessionId(sessionRecordId, externalSessionId);
         },
+        onEvent: (event) => this.store.recordExecutionRunEvent(sessionRecordId, event),
         onPermission: async (request) => {
           const permission = this.store.createPermissionRequest(taskId, request.sessionId, request);
           while (true) {
@@ -900,6 +931,7 @@ export class Scheduler {
         prompt: this.skillPrompt(this.store.getTask(taskId), step.id, snapshot, contextPack),
       });
       if (step.kind !== 'work_unit') {
+        this.store.markExecutionRunPhase(sessionRecordId, 'validating_output', '校验 Skill 结构化输出');
         const legacyOutput = normalizeSkillResultOutcome(skill!, result.output as SkillResult);
         validateSkillResult(skill!, legacyOutput);
         result.output = legacyOutput;
@@ -907,6 +939,7 @@ export class Scheduler {
         throw new DomainError('WORK_UNIT_BLOCK_REASON_REQUIRED', '执行单元返回 blocked 时必须说明可操作的阻塞原因。', 422);
       }
       this.store.assertJobExecutionCurrent(job, 'before_result', step);
+      this.store.markExecutionRunPhase(sessionRecordId, 'inspecting_changes', '核对 Git 变更范围与敏感文件');
       const taskAfterExecution = this.store.getTask(taskId);
       if (!['RUNNING', 'RETRYING', 'PAUSED'].includes(taskAfterExecution.status)) {
         this.store.recordSessionFailure(sessionRecordId, step.id, `执行在任务状态 ${taskAfterExecution.status} 下结束，结果未入库。`);
@@ -1053,7 +1086,11 @@ export class Scheduler {
         this.runtimes.delete(taskId);
       }
     } catch (error) {
-      this.store.recordSessionFailure(sessionRecordId, step.id, error instanceof Error ? error.message : String(error));
+      const message = error instanceof Error ? error.message : String(error);
+      if (resumeSessionId && /session|resume|conversation|会话|恢复/i.test(message)) {
+        this.store.invalidateExecutorSession(sessionRecordId, message.slice(0, 2_000));
+      }
+      this.store.recordSessionFailure(sessionRecordId, step.id, message);
       const failedBinding = this.runtimes.get(taskId);
       if (failedBinding) {
         await failedBinding.adapter.stopRuntime(failedBinding.runtime);
@@ -1154,6 +1191,9 @@ export class Scheduler {
     const independentRule = step.requiresIndependentSession
       ? '这是独立复核会话，不要默认信任前序人员的自述；以工作区、Git 变更和实际门禁证据为准。'
       : '这是同一任务的连续执行；优先利用会话中已经建立的项目理解，并用当前上下文包校准可能变化的事实。';
+    const discoveryRule = task.triggerSource === 'schedule' && task.constraints.includes('模式：discover')
+      ? '这是定时发现执行：必须把每一项需要后续处理的发现写入 issues 或 findings；只有确实没有任何发现时两者才都返回空数组。不要修改项目，研序会在有发现时据此形成新需求版本并进入计划确认。'
+      : '';
     const loadedCapabilities = (snapshot.capabilities ?? [])
       .filter((item) => item.stepId === step.id && item.agentId === agent?.id)
       .map((item) => ({ id: item.capabilityId, name: item.name, kind: item.kind, version: item.version }));
@@ -1183,6 +1223,7 @@ ${JSON.stringify(workspaces, null, 2)}
 规则：
 - ${modeRule}
 - ${independentRule}
+- ${discoveryRule || '按当前执行单元的目标如实记录问题与发现。'}
 - 只能访问授权工作区和上下文包显式列出的只读证据；不得访问原始仓库、密钥或环境变量文件。
 - 不要 push、创建远程 PR 或部署。需要扩大目录、文件或命令范围时，停止实施并填写 requestedScopeChanges。
 - artifacts 是可选的补充说明，不要求固定类型，也不能代替真实文件和实际检查。

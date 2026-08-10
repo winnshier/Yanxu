@@ -19,6 +19,7 @@ describe('ClaudeCodeAdapter', () => {
       environment: { YANXU_TEST_CREDENTIAL: 'runtime-secret' },
     });
     let sessionId = '';
+    const eventKinds: string[] = [];
     const result = await adapter.executeStructured<{ summary: string }>({
       runtime,
       title: 'test work unit',
@@ -37,9 +38,11 @@ describe('ClaudeCodeAdapter', () => {
         taskGrants: [], forbiddenReadPatterns: ['**/.env'], networkPolicy: 'deny', dependencyInstallPolicy: 'deny',
       },
       onSessionStarted: (value) => { sessionId = value; },
+      onEvent: (event) => { eventKinds.push(event.kind); },
     });
     expect(result.output).toEqual({ summary: 'credential-present' });
     expect(result.sessionId).toBe(sessionId);
+    expect(eventKinds).toEqual(expect.arrayContaining(['status', 'thinking', 'tool_call', 'tool_result']));
     const settings = JSON.parse(readFileSync(join(fixture.runtime, `claude-settings-${sessionId}.json`), 'utf8')) as {
       permissions: { defaultMode: string; allow: string[]; deny: string[] };
     };
@@ -79,11 +82,13 @@ function createFakeClaude(): { installation: ExecutorInstallation; workspace: st
 const args = process.argv.slice(2);
 const value = (name) => { const index = args.indexOf(name); return index >= 0 ? args[index + 1] : undefined; };
 const sessionId = value('--resume') || value('--session-id');
-const finish = () => process.stdout.write(JSON.stringify({
-  session_id: sessionId,
-  is_error: false,
-  structured_output: { summary: process.env.YANXU_TEST_CREDENTIAL === 'runtime-secret' ? 'credential-present' : 'ok' }
-}));
+const finish = () => process.stdout.write([
+  { type: 'system', subtype: 'init', session_id: sessionId, tools: ['Read'], slash_commands: ['/review'], mcp_servers: [{ name: 'local', status: 'connected' }] },
+  { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', thinking: 'checking' } } },
+  { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tool_1', name: 'Read', input: { file_path: 'README.md' } }] } },
+  { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tool_1', content: 'ok', is_error: false }] } },
+  { type: 'result', session_id: sessionId, is_error: false, structured_output: { summary: process.env.YANXU_TEST_CREDENTIAL === 'runtime-secret' ? 'credential-present' : 'ok' } }
+].map((value) => JSON.stringify(value)).join('\\n'));
 if (args.at(-1) === 'WAIT') setTimeout(finish, 5000); else finish();
 `, { mode: 0o700 });
   chmodSync(executable, 0o700);

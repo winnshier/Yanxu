@@ -3,7 +3,6 @@ import { Alert, Button, Card, Descriptions, Dropdown, Empty, Input, Modal, Segme
 import {
   ApiOutlined,
   CheckCircleFilled,
-  CloudDownloadOutlined,
   ExclamationCircleFilled,
   FolderOpenOutlined,
   GithubOutlined,
@@ -144,11 +143,8 @@ export function CapabilityCenterPage() {
         <Button type="primary" icon={<ReloadOutlined />} loading={discover.isPending} onClick={() => discover.mutate()}>扫描本机能力</Button>
       </Space>}
     />
-    <section className="capability-summary" aria-label="能力概况">
-      <div className="capability-summary-total">
-        <span className="capability-summary-icon"><CloudDownloadOutlined /></span>
-        <span><strong>{summary.total}</strong><small>项能力已纳管</small></span>
-      </div>
+    <section className="module-overview-bar capability-summary" aria-label="能力概况">
+      <div className="capability-summary-total"><strong>{summary.total}</strong><span>项能力已纳管</span></div>
       <div className="capability-summary-metrics">
         <button type="button" className={`capability-metric is-all ${kind === 'all' ? 'is-active' : ''}`} onClick={() => setKind('all')}>全部 <strong>{summary.total}</strong></button>
         <button type="button" className={`capability-metric is-skill ${kind === 'skill' ? 'is-active' : ''}`} onClick={() => setKind('skill')}>Skill <strong>{summary.skills}</strong></button>
@@ -162,18 +158,22 @@ export function CapabilityCenterPage() {
     <QueryState loading={capabilities.isLoading} error={capabilities.error} onRetry={() => { void capabilities.refetch(); }}>
       <section className="capability-library" aria-label="能力列表">
         <div className="capability-library-toolbar">
-          <div>
-            <Typography.Title level={4}>能力列表</Typography.Title>
-            <Typography.Text type="secondary">当前显示 {filtered.length} 项</Typography.Text>
-          </div>
+          <Input.Search className="capability-search" allowClear placeholder="搜索名称、说明或来源" value={query} onChange={(event) => setQuery(event.target.value)} />
           <Space wrap>
+            <Typography.Text type="secondary">当前显示 {filtered.length} 项</Typography.Text>
             <Segmented value={kind} onChange={(value) => setKind(value as typeof kind)} options={[
               { label: '全部', value: 'all' }, { label: 'Skill', value: 'skill' }, { label: 'MCP', value: 'mcp' },
             ]} />
-            <Input.Search className="capability-search" allowClear placeholder="搜索名称、说明或来源" value={query} onChange={(event) => setQuery(event.target.value)} />
           </Space>
         </div>
         {filtered.length === 0 ? <Empty description="尚未发现能力，先扫描本机配置或导入本地 Skill" /> : <div className="capability-list">
+          <div className="capability-list-header" aria-hidden="true">
+            <span />
+            <span>能力与来源</span>
+            <span>兼容 CLI</span>
+            <span>状态</span>
+            <span>操作</span>
+          </div>
           {filtered.map((capability) => {
             const status = capabilityStatus(capability);
             return <article className="capability-row" key={capability.id}>
@@ -183,8 +183,8 @@ export function CapabilityCenterPage() {
               <div className="capability-identity">
                 <div className="capability-name-line">
                   <Typography.Text strong>{capability.name}</Typography.Text>
-                  <Tag bordered={false}>{capability.kind.toUpperCase()}</Tag>
-                  {capability.security.localCredentialBindings > 0 && <Tag bordered={false} color="green" icon={<SafetyCertificateOutlined />}>本机凭据 {capability.security.localCredentialBindings}</Tag>}
+                  <Tag variant="filled">{capability.kind.toUpperCase()}</Tag>
+                  {capability.security.localCredentialBindings > 0 && <Tag variant="filled" color="green" icon={<SafetyCertificateOutlined />}>本机凭据 {capability.security.localCredentialBindings}</Tag>}
                 </div>
                 <Typography.Text type="secondary" ellipsis title={capability.description || '暂无说明'}>{capability.description || '暂无说明'}</Typography.Text>
                 <Typography.Text className="capability-source" type="secondary" ellipsis title={capability.source.ref}>{sourceTypeLabel[capability.source.type]} · {capability.source.ref}</Typography.Text>

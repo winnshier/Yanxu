@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Badge, Button, Card, Col, Flex, List, Row, Space, Statistic, Typography, message } from 'antd';
+import { Badge, Button, Flex, List, Space, Typography, message } from 'antd';
 import { ArrowRightOutlined, FolderAddOutlined, PlusOutlined, SettingOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
@@ -37,24 +37,32 @@ export function DashboardPage() {
       />
       <QueryState loading={dashboard.isLoading} error={dashboard.error} onRetry={() => { void dashboard.refetch(); }}>
         {data && <>
-          <Row gutter={[16, 16]} className="metric-row">
-            <Col xs={12} lg={6}><Card><Statistic title="正在推进" value={data.counts.active} suffix={`/ ${data.settings.maxParallelTasks}`} /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="排队任务" value={data.counts.queued} /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="需要处理" value={data.counts.attention} valueStyle={{ color: data.counts.attention ? '#d88a2c' : undefined }} /></Card></Col>
-            <Col xs={12} lg={6}><Card><Statistic title="待交付确认" value={data.counts.delivered} valueStyle={{ color: data.counts.delivered ? '#1f9d72' : undefined }} /></Card></Col>
-          </Row>
+          <section className="dashboard-summary" aria-label="任务概况">
+            <div><span>正在推进</span><strong>{data.counts.active}<small> / {data.settings.maxParallelTasks}</small></strong></div>
+            <div><span>排队任务</span><strong>{data.counts.queued}</strong></div>
+            <div className={data.counts.attention ? 'has-warning' : ''}><span>需要处理</span><strong>{data.counts.attention}</strong></div>
+            <div className={data.counts.delivered ? 'has-success' : ''}><span>待交付确认</span><strong>{data.counts.delivered}</strong></div>
+          </section>
 
           <div className="dashboard-grid">
             <section className="dashboard-main">
-              <Card title="正在运行与排队" extra={<Button type="link" onClick={() => { void navigate('/tasks'); }}>全部任务 <ArrowRightOutlined /></Button>}>
+              <section className="workspace-section">
+                <div className="workspace-section-header"><div><Typography.Text strong>正在运行与排队</Typography.Text><Typography.Text type="secondary">当前执行队列与实时进度</Typography.Text></div><Button type="link" onClick={() => { void navigate('/tasks'); }}>全部任务 <ArrowRightOutlined /></Button></div>
+                <div className="workspace-section-body">
                 {data.active.length ? <Space direction="vertical" size={12} className="full-width">{data.active.map((task) => <TaskTrack key={task.id} task={task} compact />)}</Space> : <div className="quiet-state">当前没有运行中的任务。</div>}
-              </Card>
-              <Card title="已交付待确认">
+                </div>
+              </section>
+              <section className="workspace-section">
+                <div className="workspace-section-header"><div><Typography.Text strong>已交付待确认</Typography.Text><Typography.Text type="secondary">等待人工验收的任务产出</Typography.Text></div></div>
+                <div className="workspace-section-body">
                 {data.delivered.length ? <Space direction="vertical" size={12} className="full-width">{data.delivered.map((task) => <TaskTrack key={task.id} task={task} compact />)}</Space> : <div className="quiet-state">还没有等待确认的交付。</div>}
-              </Card>
+                </div>
+              </section>
             </section>
             <aside className="dashboard-side">
-              <Card title={<Space><Badge status={data.counts.attention ? 'warning' : 'success'} />需要我处理</Space>}>
+              <section className="workspace-section">
+                <div className="workspace-section-header"><Space><Badge status={data.counts.attention ? 'warning' : 'success'} /><Typography.Text strong>需要我处理</Typography.Text></Space></div>
+                <div className="workspace-section-body">
                 {data.permissions.map((permission) => <div className="permission-card" key={permission.id}>
                   <Typography.Text strong>{permission.permission} 权限请求</Typography.Text>
                   <Typography.Paragraph type="secondary" ellipsis={{ rows: 2 }}>{permission.patterns.join('、')}</Typography.Paragraph>
@@ -79,8 +87,11 @@ export function DashboardPage() {
                 {data.attention.length > 0 && <List dataSource={data.attention} renderItem={(task) => <List.Item onClick={() => { void navigate(`/tasks/${task.id}`); }} className="clickable-list-item"><List.Item.Meta title={task.title} description={task.projectName} /><TaskStatusTag status={task.status} /></List.Item>} />}
                 {data.attention.length === 0 && data.permissions.length === 0 && data.systemAttention.length === 0
                   && <div className="quiet-state">没有待处理事项，系统会继续运行。</div>}
-              </Card>
-              <Card title="系统状态" extra={<Button type="link" icon={<SettingOutlined />} onClick={() => { void navigate('/settings'); }}>设置</Button>}>
+                </div>
+              </section>
+              <section className="workspace-section">
+                <div className="workspace-section-header"><Typography.Text strong>系统状态</Typography.Text><Button type="link" icon={<SettingOutlined />} onClick={() => { void navigate('/settings'); }}>设置</Button></div>
+                <div className="workspace-section-body">
                 <Space direction="vertical" size={14} className="full-width">
                   <Flex justify="space-between"><Typography.Text type="secondary">本地调度服务</Typography.Text><Badge
                     status={health.data?.status === 'ready' ? 'success' : 'warning'}
@@ -89,7 +100,8 @@ export function DashboardPage() {
                   <Flex justify="space-between"><Typography.Text type="secondary">全局协调器</Typography.Text><Badge status={data.settings.coordinatorReady ? 'success' : 'warning'} text={data.settings.coordinatorReady ? '可用' : '待配置'} /></Flex>
                   {data.executors.map((executor) => <Flex key={executor.id} justify="space-between"><Typography.Text type="secondary">{executor.name}</Typography.Text><Badge status={executor.health === 'available' ? 'success' : 'default'} text={executor.health === 'available' ? executor.version ?? '可用' : '不可用'} /></Flex>)}
                 </Space>
-              </Card>
+                </div>
+              </section>
             </aside>
           </div>
         </>}

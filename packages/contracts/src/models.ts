@@ -1,4 +1,4 @@
-export const YANXU_VERSION = '1.0.0';
+export const YANXU_VERSION = '1.5.0';
 
 export const taskStatuses = [
   'DRAFT', 'COMPOSING_PLAN', 'WAITING_PLAN_APPROVAL', 'PREPARING', 'QUEUED',
@@ -279,6 +279,7 @@ export interface ProjectCapability {
   lockedVersion: string;
   lockedHash: string;
   configuration: Record<string, unknown>;
+  configurationMode: 'inherit' | 'override' | 'clear';
   enabledAt: string | null;
   updatedAt: string;
   capability: Capability;
@@ -296,8 +297,13 @@ export interface TaskCapabilitySnapshot {
   contentHash: string;
   executor: ExecutorType;
   configuration: Record<string, unknown>;
+  configurationMode: 'inherit' | 'override' | 'clear';
   projectionPath: string | null;
   status: 'frozen' | 'projected' | 'failed';
+  runtimeStatus: 'not_checked' | 'loaded' | 'connected' | 'healthy' | 'failed' | 'needs_auth' | 'disabled';
+  runtimeDetail: Record<string, unknown>;
+  runtimeCheckedAt: string | null;
+  lastRunId: string | null;
   error: string | null;
   createdAt: string;
 }
@@ -511,6 +517,7 @@ export interface TaskRunSnapshot {
   agents: AgentProfile[];
   executors?: Array<{
     executor: ExecutorType;
+    executablePath: string | null;
     version: string | null;
     executableHash: string | null;
     capabilities: string[];
@@ -568,6 +575,13 @@ export interface ContextPackSource {
   title: string;
   hash: string;
   characters: number;
+  selectionReason?: string;
+}
+
+export interface ContextPackKnowledge extends Pick<KnowledgeItem, 'id' | 'category' | 'title' | 'content' | 'version' | 'sourceTaskId' | 'supersedesId'> {
+  relevanceScore: number;
+  matchedTerms: string[];
+  selectionReason: string;
 }
 
 export interface TaskContextPack {
@@ -592,7 +606,7 @@ export interface TaskContextPack {
     resultPath: string;
     contentHash: string;
   }>;
-  projectKnowledge: Array<Pick<KnowledgeItem, 'id' | 'category' | 'title' | 'content' | 'version'>>;
+  projectKnowledge: ContextPackKnowledge[];
   directories: ProjectDirectory[];
   recentEvidence: WorkflowEvent[];
   gateEvidence: Array<{
@@ -724,6 +738,11 @@ export interface ExecutionRun {
   stepId: string;
   jobId: string | null;
   agentId: string;
+  agentName: string | null;
+  stepTitle: string;
+  executor: ExecutorType;
+  model: string;
+  attempt: number;
   executorSessionId: string | null;
   externalSessionId: string | null;
   retryOfRunId: string | null;
@@ -736,6 +755,15 @@ export interface ExecutionRun {
   nextAction: string | null;
   workspaceReused: boolean;
   sessionReused: boolean;
+  sessionInvalidationReason: string | null;
+  workspaces: Array<{
+    directoryId: string;
+    workspacePath: string;
+    scopePath: string;
+    baselineCommit: string;
+    taskBranch: string;
+    targetBranch: string;
+  }>;
   runtimeDirectory: string | null;
   logPath: string | null;
   resultPath: string | null;
@@ -819,7 +847,7 @@ export interface TaskEvidence {
 
 export interface TaskLogChunk {
   taskId: string;
-  source: 'unified-runtime' | 'opencode-runtime' | 'claude-runtime';
+  source: 'unified-runtime' | 'opencode-runtime' | 'claude-runtime' | 'run-runtime';
   cursor: number;
   nextCursor: number;
   totalBytes: number;
@@ -899,6 +927,64 @@ export interface Task {
     startedAt: string | null;
     heartbeatAt: string | null;
   } | null;
+  statusReason?: { type: string; message: string; occurredAt: string } | null;
+  triggerSource: ExecutionTriggerSource;
+  scheduleOccurrenceId: string | null;
+}
+
+export type ScheduleMode = 'report' | 'discover' | 'auto_execute';
+export type ScheduleTriggerType = 'once' | 'interval';
+export type ScheduleOccurrenceStatus = 'queued' | 'running' | 'skipped' | 'completed' | 'failed' | 'awaiting_confirmation';
+
+export interface ScheduleDefinition {
+  id: string;
+  projectId: string;
+  projectName: string;
+  teamId: string;
+  teamName: string;
+  sourceTaskId: string;
+  sourceTaskTitle: string;
+  name: string;
+  description: string;
+  mode: ScheduleMode;
+  triggerType: ScheduleTriggerType;
+  timezone: string;
+  startAt: string;
+  intervalValue: number | null;
+  intervalUnit: 'hour' | 'day' | 'week' | null;
+  missedPolicy: 'catch_up_once' | 'skip';
+  overlapPolicy: 'coalesce' | 'skip';
+  automationBoundary: {
+    directoryIds: string[];
+    permissions: string[];
+    capabilityIds: string[];
+    qualityGateIds: string[];
+    planContentHash: string;
+    agents: Array<{ id: string; executor: ExecutorType; model: string; permissionMode: 'standard' | 'managed' }>;
+    capabilities: Array<{ id: string; version: string; contentHash: string; executor: ExecutorType }>;
+    qualityGates: Array<{ id: string; directoryId: string; commandArgv: string[]; required: boolean }>;
+    projectPermissionMode: 'inherit' | 'standard' | 'managed';
+    networkPolicy: 'ask' | 'deny';
+    dependencyInstallPolicy: 'ask' | 'deny';
+  };
+  enabled: boolean;
+  nextRunAt: string | null;
+  lastTriggeredAt: string | null;
+  archivedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ScheduleOccurrence {
+  id: string;
+  scheduleId: string;
+  plannedAt: string;
+  status: ScheduleOccurrenceStatus;
+  taskId: string | null;
+  reason: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
 }
 
 export interface WorkflowEvent {

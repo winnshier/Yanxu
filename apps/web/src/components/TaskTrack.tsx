@@ -1,5 +1,5 @@
 import { CheckOutlined, ClockCircleOutlined, LoadingOutlined, StopOutlined } from '@ant-design/icons';
-import { Button, Space, Tag, Tooltip, Typography } from 'antd';
+import { Button, Progress, Space, Tag, Tooltip, Typography } from 'antd';
 import { useNavigate } from 'react-router-dom';
 import type { Task, TaskStep } from '@yanxu/contracts';
 import { TaskStatusTag } from './TaskStatusTag.js';
@@ -27,17 +27,26 @@ export function TaskTrack({ task, compact = false }: TaskTrackProps) {
   const navigate = useNavigate();
   const activeStep = task.steps.find((step) => step.status === 'running');
   const execution = task.activeExecution;
+  const completedSteps = task.steps.filter((step) => step.status === 'succeeded').length;
   return (
     <article className={`task-track ${compact ? 'task-track-compact' : ''}`}>
-      <div className="task-track-head">
-        <div>
+      <div className="task-track-identity">
+        <div className="task-track-title">
           <Typography.Text className="task-project">{task.projectName}</Typography.Text>
           <Typography.Title level={5}>{task.title}</Typography.Title>
+          <Space size={[4, 4]} wrap>
+            {task.triggerSource !== 'manual' && <Tag variant="filled" color="purple">{task.triggerSource === 'schedule' ? '定时触发' : task.triggerSource}</Tag>}
+            {execution?.agentName && <Tag variant="filled">{execution.agentName}</Tag>}
+            {execution?.executor && <Tag variant="filled">{execution.executor}</Tag>}
+          </Space>
         </div>
-        <div className="task-track-actions">
-          <TaskStatusTag status={task.status} />
-          <Button type="text" onClick={() => { void navigate(`/tasks/${task.id}`); }}>查看详情</Button>
+      </div>
+      <div className="task-track-flow">
+        <div className="task-track-progress-line">
+          <Typography.Text>{activeStep ? `当前：${activeStep.title}` : task.steps.length ? `${completedSteps}/${task.steps.length} 个环节完成` : '等待生成计划'}</Typography.Text>
+          <Typography.Text type="secondary">{task.progress}%</Typography.Text>
         </div>
+        <Progress percent={task.progress} showInfo={false} size="small" />
       </div>
       {task.steps.length > 0 ? (
         <div className="step-line" aria-label={`任务进度 ${task.progress}%`}>
@@ -54,20 +63,28 @@ export function TaskTrack({ task, compact = false }: TaskTrackProps) {
       ) : (
         <Typography.Text type="secondary">尚未生成执行计划</Typography.Text>
       )}
-      {(activeStep || execution) && <Space size={[6, 4]} wrap className="task-runtime-meta">
-        {activeStep && <Tag color="processing">当前：{activeStep.title}</Tag>}
-        {execution?.agentName && <Tag>{execution.agentName}</Tag>}
-        {execution?.executor && <Tag>{execution.executor}</Tag>}
-        {execution?.model && <Typography.Text type="secondary" className="mono-text">{execution.model}</Typography.Text>}
-        {execution?.startedAt && <Typography.Text type="secondary">已运行 {elapsedLabel(execution.startedAt)}</Typography.Text>}
-        {execution?.heartbeatAt && <Typography.Text type="secondary">
-          心跳 {new Date(execution.heartbeatAt).toLocaleTimeString()}
-        </Typography.Text>}
-      </Space>}
-      {task.status === 'QUEUED' && <Space size={[6, 4]} wrap className="task-runtime-meta">
-        <Tag color="gold">排队第 {task.queuePosition ?? '?'} 位</Tag>
-        <Typography.Text type="secondary">等待并发槽位或前置调度完成</Typography.Text>
-      </Space>}
+      <div className="task-track-runtime">
+        {(activeStep || execution) && <Space size={[6, 4]} wrap className="task-runtime-meta">
+          {execution?.phase && <Tag variant="filled" color="blue">阶段：{execution.phase}</Tag>}
+          {execution?.model && <Typography.Text type="secondary" className="mono-text">{execution.model}</Typography.Text>}
+          {execution?.startedAt && <Typography.Text type="secondary">已运行 {elapsedLabel(execution.startedAt)}</Typography.Text>}
+          {execution?.heartbeatAt && <Typography.Text type="secondary">心跳 {new Date(execution.heartbeatAt).toLocaleTimeString()}</Typography.Text>}
+          {execution?.nextAction && <Typography.Text>下一步：{execution.nextAction}</Typography.Text>}
+        </Space>}
+        {task.status === 'QUEUED' && <Space size={[6, 4]} wrap className="task-runtime-meta">
+          <Tag variant="filled" color="gold">排队第 {task.queuePosition ?? '?'} 位</Tag>
+          <Typography.Text type="secondary">等待并发槽位或前置调度完成</Typography.Text>
+        </Space>}
+        {['WAITING_PLAN_APPROVAL', 'WAITING_APPROVAL', 'WAITING_REAPPROVAL', 'BLOCKED', 'PAUSED', 'STOPPED', 'RETRYING', 'REPLANNING'].includes(task.status)
+          && task.statusReason && <div className="task-status-reason">
+            <Typography.Text strong>{task.statusReason.message}</Typography.Text>
+            <Typography.Text type="secondary">{execution?.nextAction ? `下一步：${execution.nextAction}` : '打开任务详情处理当前状态'}</Typography.Text>
+          </div>}
+      </div>
+      <div className="task-track-actions">
+        <TaskStatusTag status={task.status} />
+        <Button type="text" onClick={() => { void navigate(`/tasks/${task.id}`); }}>查看详情</Button>
+      </div>
     </article>
   );
 }

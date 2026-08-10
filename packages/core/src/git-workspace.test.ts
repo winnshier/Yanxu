@@ -322,6 +322,7 @@ function taskFixture(projectId: string, directoryId: string): Task {
     id: 'task_test1234567890', projectId, projectName: 'Test', teamId: 'team_test', teamName: 'Test', title: 'Test task',
     description: 'Test', expectedOutput: '', constraints: '', forbiddenPaths: [], status: 'PREPARING', stateVersion: 1,
     progress: 0, activeStepId: null, createdAt: timestamp, updatedAt: timestamp, steps: [], snapshot: null,
+    triggerSource: 'manual', scheduleOccurrenceId: null,
     plan: {
       id: 'plan_test', taskId: 'task_test1234567890', version: 1,
       taskVersionId: 'taskv_test', taskVersion: 1, preApprovalSkillIds: [],

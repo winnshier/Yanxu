@@ -1,7 +1,7 @@
 import type {
   AgentProfile, AnswerPlanInput, CreateAgentInput, CreateProjectRequest, CreateTaskRequest, CreateTeamInput, DirectoryProfileVersion,
   Capability, CapabilityDiscoveryReport, DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectCapability, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SkillDefinition, SystemSettings,
-  ProjectCapabilityUpdateInput, RequestPlanRevisionInput, RoleTemplateChangePreview, SystemDiagnostics, SystemHealth, Task, TaskCapabilitySnapshot, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent,
+  ProjectCapabilityUpdateInput, RequestPlanRevisionInput, RoleTemplateChangePreview, SystemDiagnostics, SystemHealth, Task, TaskCapabilitySnapshot, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent, ExecutionRun, ScheduleDefinition, ScheduleOccurrence, CreateScheduleInput, UpdateScheduleInput,
 } from '@yanxu/contracts';
 
 export class ApiError extends Error {
@@ -55,6 +55,7 @@ export function normalizeTaskEvidence(value: Partial<TaskEvidence>): TaskEvidenc
     artifacts: value.artifacts ?? [],
     artifactPreviews: value.artifactPreviews ?? [],
     sessions: value.sessions ?? [],
+    runs: value.runs ?? [],
     contextPacks: value.contextPacks ?? [],
     changeManifests: value.changeManifests ?? [],
     designedQualityGates: value.designedQualityGates ?? [],
@@ -142,11 +143,26 @@ export const api = {
   reviewKnowledge: (id: string, input: { decision: 'accept' | 'reject'; title?: string; content?: string }) =>
     request<KnowledgeItem>(`/api/knowledge/${id}/review`, json('POST', input)),
   tasks: (archived = false) => request<Task[]>(`/api/tasks?archived=${archived}`),
+  schedules: (projectId?: string, archived = false) => request<ScheduleDefinition[]>(
+    `/api/schedules?archived=${archived}${projectId ? `&projectId=${encodeURIComponent(projectId)}` : ''}`,
+  ),
+  createSchedule: (input: CreateScheduleInput) => request<ScheduleDefinition>('/api/schedules', json('POST', input)),
+  updateSchedule: (id: string, input: UpdateScheduleInput) => request<ScheduleDefinition>(`/api/schedules/${id}`, json('PUT', input)),
+  setScheduleEnabled: (id: string, enabled: boolean) => request<ScheduleDefinition>(`/api/schedules/${id}/status`, json('POST', { enabled })),
+  runScheduleNow: (id: string) => request<ScheduleOccurrence>(`/api/schedules/${id}/run`, json('POST')),
+  scheduleOccurrences: (id: string) => request<ScheduleOccurrence[]>(`/api/schedules/${id}/occurrences`),
+  archiveSchedule: (id: string) => request<ScheduleDefinition>(`/api/schedules/${id}`, json('DELETE')),
   task: (id: string) => request<Task>(`/api/tasks/${id}`),
   taskCapabilities: (id: string) => request<TaskCapabilitySnapshot[]>(`/api/tasks/${id}/capabilities`),
   taskPlans: (id: string) => request<TaskPlan[]>(`/api/tasks/${id}/plans`),
   taskEvidence: (id: string) => request<Partial<TaskEvidence>>(`/api/tasks/${id}/evidence`).then(normalizeTaskEvidence),
   taskDiagnostics: (id: string) => request<TaskDiagnostics>(`/api/tasks/${id}/diagnostics`),
+  taskRuns: (id: string) => request<ExecutionRun[]>(`/api/tasks/${id}/runs`),
+  taskRun: (taskId: string, runId: string) => request<ExecutionRun>(`/api/tasks/${taskId}/runs/${runId}`),
+  taskRunEvents: (taskId: string, runId: string) => request<WorkflowEvent[]>(`/api/tasks/${taskId}/runs/${runId}/events`),
+  taskRunLog: (taskId: string, runId: string, cursor?: number) => request<TaskLogChunk>(
+    `/api/tasks/${taskId}/runs/${runId}/log${cursor === undefined ? '' : `?cursor=${cursor}`}`,
+  ),
   taskRuntimeLog: (id: string, cursor?: number) => request<TaskLogChunk>(
     `/api/tasks/${id}/runtime-log${cursor === undefined ? '' : `?cursor=${cursor}`}`,
   ),

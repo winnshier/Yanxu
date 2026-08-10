@@ -104,8 +104,6 @@ function commonExecutablePaths(command: string, userHome: string): string[] {
     join(userHome, '.volta', 'bin', command),
     join(userHome, '.bun', 'bin', command),
     join(userHome, '.claude', 'local', command),
-    join('/opt/homebrew/bin', command),
-    join('/usr/local/bin', command),
   ];
   const nvmRoot = join(userHome, '.nvm', 'versions', 'node');
   try {
@@ -117,6 +115,7 @@ function commonExecutablePaths(command: string, userHome: string): string[] {
   } catch {
     // NVM is optional.
   }
+  candidates.push(join('/opt/homebrew/bin', command), join('/usr/local/bin', command));
   return [...new Set(candidates)];
 }
 

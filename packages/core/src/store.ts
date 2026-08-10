@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { builtinRoles, builtinSkills, defaultExecutionSkillIds } from '@yanxu/builtins';
 import { YANXU_VERSION } from '@yanxu/contracts';
@@ -19,6 +19,7 @@ import type {
   CreateAgentInput,
   CreateProjectInput,
   CreateTaskInput,
+  CreateScheduleInput,
   CreateTeamInput,
   DashboardData,
   DeliveryAction,
@@ -51,6 +52,8 @@ import type {
   RoleTemplate,
   RoleTemplateChangePreview,
   SkillArtifactOutput,
+  ScheduleDefinition,
+  ScheduleOccurrence,
   SystemSettings,
   SystemDiagnostics,
   Task,
@@ -67,6 +70,7 @@ import type {
   TaskVersionSummary,
   Team,
   UpdateProjectSettingsInput,
+  UpdateScheduleInput,
   WorkflowEvent,
 } from '@yanxu/contracts';
 import { DATABASE_SCHEMA_VERSION, type SqliteDatabase } from './database.js';
@@ -112,6 +116,23 @@ interface TaskRow {
   id: string; project_id: string; team_id: string; project_name: string; team_name: string; title: string; description: string;
   expected_output: string; constraints_text: string; forbidden_paths_json: string; status: TaskStatus; state_version: number;
   active_step_id: string | null; flow_version: 1 | 2; created_at: string; updated_at: string;
+  trigger_source: ExecutionTriggerSource; schedule_occurrence_id: string | null;
+}
+
+interface ScheduleDefinitionRow {
+  id: string; project_id: string; project_name: string; team_id: string; team_name: string;
+  source_task_id: string; source_task_title: string; name: string; description: string;
+  mode: ScheduleDefinition['mode']; trigger_type: ScheduleDefinition['triggerType']; timezone: string;
+  start_at: string; interval_value: number | null; interval_unit: ScheduleDefinition['intervalUnit'];
+  missed_policy: ScheduleDefinition['missedPolicy']; overlap_policy: ScheduleDefinition['overlapPolicy'];
+  automation_boundary_json: string; enabled: number; next_run_at: string | null; last_triggered_at: string | null;
+  archived_at: string | null;
+  created_at: string; updated_at: string;
+}
+
+interface ScheduleOccurrenceRow {
+  id: string; schedule_id: string; planned_at: string; status: ScheduleOccurrence['status'];
+  task_id: string | null; reason: string | null; created_at: string; started_at: string | null; completed_at: string | null;
 }
 interface PlanRow {
   id: string; task_id: string; version: number; content_json: string; created_at: string; confirmed_at: string | null;
@@ -149,6 +170,8 @@ interface TaskCapabilityRow {
   kind: TaskCapabilitySnapshot['kind']; name: string; version: string; content_hash: string;
   executor: TaskCapabilitySnapshot['executor']; configuration_json: string; projection_path: string | null;
   status: TaskCapabilitySnapshot['status']; error: string | null; created_at: string;
+  runtime_status: TaskCapabilitySnapshot['runtimeStatus']; runtime_detail_json: string;
+  runtime_checked_at: string | null; last_run_id: string | null;
 }
 interface RoleTemplateRow {
   id: string; origin_key: string; name: string; description: string; instructions: string;
@@ -339,6 +362,11 @@ interface ExecutionRunRow {
   step_id: string;
   job_id: string | null;
   agent_id: string;
+  agent_name: string | null;
+  step_title: string;
+  executor: AgentProfile['executor'];
+  model: string;
+  attempt: number;
   executor_session_id: string | null;
   external_session_id: string | null;
   retry_of_run_id: string | null;
@@ -351,6 +379,8 @@ interface ExecutionRunRow {
   next_action: string | null;
   workspace_reused: number;
   session_reused: number;
+  invalidation_reason: string | null;
+  workspaces_json: string;
   runtime_directory: string | null;
   log_path: string | null;
   result_path: string | null;
@@ -546,14 +576,34 @@ export class YanxuStore {
     expected?: NonNullable<TaskRunSnapshot['executors']>[number],
   ): void {
     const versionDrift = Boolean(expected?.version && installation.version && expected.version !== installation.version);
+    const executablePathDrift = Boolean(expected?.executablePath && installation.path
+      && expected.executablePath !== installation.path);
     const executableDrift = Boolean(expected?.executableHash && installation.path
-      && expected.executableHash !== sha256(installation.path));
+      && expected.executableHash !== executableContentHash(installation.path));
+    const missingCapabilities = (expected?.capabilities ?? []).filter((capability) =>
+      !installation.capabilities.includes(capability));
+    const missingModels = (expected?.selectedModels ?? []).filter((model) =>
+      installation.models.length > 0 && !installation.models.includes(model));
+    if (missingCapabilities.length > 0 || missingModels.length > 0) {
+      this.appendEvent('task', taskId, 'executor.runtime_drift_blocked', 'scheduler',
+        `${installation.name} 当前能力无法满足已确认运行快照。`, {
+          stepId,
+          executor: installation.id,
+          missingCapabilities,
+          missingModels,
+        });
+      throw new DomainError('EXECUTOR_RUNTIME_DRIFT_INCOMPATIBLE', 'CLI 或模型环境变化后已不满足任务确认快照，需要用户处理。', 409, {
+        executor: installation.id,
+        missingCapabilities,
+        missingModels,
+      });
+    }
     this.appendEvent(
       'task',
       taskId,
-      versionDrift || executableDrift ? 'executor.runtime_drift' : 'executor.runtime_checked',
+      versionDrift || executableDrift || executablePathDrift ? 'executor.runtime_drift' : 'executor.runtime_checked',
       'scheduler',
-      versionDrift || executableDrift
+      versionDrift || executableDrift || executablePathDrift
         ? `${installation.name} 的本地运行环境与任务确认快照不同，已记录差异并继续按当前兼容契约执行。`
         : `${installation.name} 运行环境与任务快照兼容。`,
       {
@@ -562,6 +612,9 @@ export class YanxuStore {
         expectedVersion: expected?.version ?? null,
         currentVersion: installation.version,
         versionDrift,
+        expectedPath: expected?.executablePath ?? null,
+        currentPath: installation.path,
+        executablePathDrift,
         executableDrift,
         capabilities: installation.capabilities,
       },
@@ -1128,17 +1181,26 @@ export class YanxuStore {
     const rows = this.database.prepare(`
       SELECT * FROM project_capabilities WHERE project_id = ? ORDER BY updated_at DESC
     `).all(projectId) as ProjectCapabilityRow[];
-    return rows.map((row) => ({
-      projectId: row.project_id,
-      capabilityId: row.capability_id,
-      enabled: Boolean(row.enabled),
-      lockedVersion: row.locked_version,
-      lockedHash: row.locked_hash,
-      configuration: parseJson(row.configuration_json, {}),
-      enabledAt: row.enabled_at,
-      updatedAt: row.updated_at,
-      capability: this.getCapability(row.capability_id),
-    }));
+    return rows.map((row) => {
+      const storedConfiguration = parseJson<Record<string, unknown>>(row.configuration_json, {});
+      const configurationMode = storedConfiguration.__yanxuConfigurationMode === 'override'
+        || storedConfiguration.__yanxuConfigurationMode === 'clear'
+        ? storedConfiguration.__yanxuConfigurationMode
+        : 'inherit';
+      const { __yanxuConfigurationMode: _mode, ...configuration } = storedConfiguration;
+      return {
+        projectId: row.project_id,
+        capabilityId: row.capability_id,
+        enabled: Boolean(row.enabled),
+        lockedVersion: row.locked_version,
+        lockedHash: row.locked_hash,
+        configuration,
+        configurationMode,
+        enabledAt: row.enabled_at,
+        updatedAt: row.updated_at,
+        capability: this.getCapability(row.capability_id),
+      };
+    });
   }
 
   updateProjectCapability(
@@ -1157,7 +1219,23 @@ export class YanxuStore {
     const baseConfiguration = isRecordValue(capability.manifest.configuration)
       ? capability.manifest.configuration
       : {};
-    const configuration = { ...baseConfiguration, ...(input.configuration ?? {}) };
+    const existingRow = this.database.prepare(`
+      SELECT configuration_json FROM project_capabilities WHERE project_id = ? AND capability_id = ?
+    `).get(projectId, capabilityId) as { configuration_json: string } | undefined;
+    const existingStored = parseJson<Record<string, unknown>>(existingRow?.configuration_json ?? '{}', {});
+    const existingMode = existingStored.__yanxuConfigurationMode === 'override'
+      || existingStored.__yanxuConfigurationMode === 'clear'
+      ? existingStored.__yanxuConfigurationMode
+      : 'inherit';
+    const { __yanxuConfigurationMode: _existingMode, ...existingConfiguration } = existingStored;
+    const configurationMode = input.configurationMode ?? existingMode;
+    const suppliedConfiguration = input.configuration ?? existingConfiguration;
+    const effectiveConfiguration = configurationMode === 'clear'
+      ? {}
+      : configurationMode === 'override'
+        ? { ...baseConfiguration, ...suppliedConfiguration }
+        : baseConfiguration;
+    const configuration = { ...effectiveConfiguration, __yanxuConfigurationMode: configurationMode };
     assertNoLiteralCredential(configuration);
     const timestamp = now();
     this.database.prepare(`
@@ -1177,6 +1255,7 @@ export class YanxuStore {
         kind: capability.kind,
         version: capability.version,
         contentHash: capability.contentHash,
+        configurationMode,
       });
     this.recordProjectSpaceCommit(project.projectSpacePath,
       `${input.enabled ? 'feat' : 'chore'}: ${input.enabled ? 'enable' : 'disable'} capability ${capability.name}`);
@@ -1261,9 +1340,16 @@ export class YanxuStore {
         const normalized = isRecordValue(snapshot.configuration)
           ? snapshot.configuration
           : {};
+        const {
+          __yanxuConfigurationMode: _configurationMode,
+          __yanxuLocalCredentialBindings: _credentialBindings,
+          __yanxuFiles: _files,
+          __yanxuManifest: _manifest,
+          ...runtimeConfiguration
+        } = normalized;
         mcpDefinitions[snapshot.name] = executor === 'opencode'
-          ? toOpenCodeMcpConfiguration(normalized)
-          : toClaudeMcpConfiguration(normalized);
+          ? toOpenCodeMcpConfiguration(runtimeConfiguration)
+          : toClaudeMcpConfiguration(runtimeConfiguration);
         mcpNames.push(snapshot.name);
       }
       const skillPermission = Object.fromEntries([
@@ -1434,6 +1520,11 @@ export class YanxuStore {
   }
 
   private taskCapabilityFromRow(row: TaskCapabilityRow): TaskCapabilitySnapshot {
+    const configuration = parseJson<Record<string, unknown>>(row.configuration_json, {});
+    const configurationMode = configuration.__yanxuConfigurationMode === 'override'
+      || configuration.__yanxuConfigurationMode === 'clear'
+      ? configuration.__yanxuConfigurationMode
+      : 'inherit';
     return {
       id: row.id,
       taskId: row.task_id,
@@ -1445,9 +1536,14 @@ export class YanxuStore {
       version: row.version,
       contentHash: row.content_hash,
       executor: row.executor,
-      configuration: parseJson(row.configuration_json, {}),
+      configuration,
+      configurationMode,
       projectionPath: row.projection_path,
       status: row.status,
+      runtimeStatus: row.runtime_status,
+      runtimeDetail: parseJson(row.runtime_detail_json, {}),
+      runtimeCheckedAt: row.runtime_checked_at,
+      lastRunId: row.last_run_id,
       error: row.error,
       createdAt: row.created_at,
     };
@@ -1471,6 +1567,7 @@ export class YanxuStore {
       compatibility: item.capability.compatibility,
       source: item.capability.source,
       configuration: item.configuration,
+      configurationMode: item.configurationMode,
       credentialRefs: item.capability.credentialRefs,
       updatedAt: item.updatedAt,
     }));
@@ -1549,18 +1646,25 @@ export class YanxuStore {
           version: projectCapability.lockedVersion,
           contentHash: projectCapability.lockedHash,
           executor: agent.executor,
+          configurationMode: projectCapability.configurationMode,
           configuration: capability.kind === 'skill'
             ? {
               ...projectCapability.configuration,
+              __yanxuConfigurationMode: projectCapability.configurationMode,
               __yanxuFiles: capability.security.files,
               __yanxuManifest: capability.manifest,
             }
             : {
               ...projectCapability.configuration,
+              __yanxuConfigurationMode: projectCapability.configurationMode,
               __yanxuLocalCredentialBindings: localBindings,
             },
           projectionPath: null,
           status: 'frozen',
+          runtimeStatus: 'not_checked',
+          runtimeDetail: {},
+          runtimeCheckedAt: null,
+          lastRunId: null,
           error: null,
           createdAt,
         });
@@ -1574,13 +1678,15 @@ export class YanxuStore {
     const insert = this.database.prepare(`
       INSERT INTO task_capability_snapshots(
         id, task_id, step_id, agent_id, capability_id, kind, name, version, content_hash,
-        executor, configuration_json, projection_path, status, error, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        executor, configuration_json, projection_path, status, error, created_at,
+        runtime_status, runtime_detail_json, runtime_checked_at, last_run_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     for (const snapshot of snapshots) {
       insert.run(snapshot.id, snapshot.taskId, snapshot.stepId, snapshot.agentId, snapshot.capabilityId,
         snapshot.kind, snapshot.name, snapshot.version, snapshot.contentHash, snapshot.executor,
-        JSON.stringify(snapshot.configuration), snapshot.projectionPath, snapshot.status, snapshot.error, snapshot.createdAt);
+        JSON.stringify(snapshot.configuration), snapshot.projectionPath, snapshot.status, snapshot.error, snapshot.createdAt,
+        snapshot.runtimeStatus, JSON.stringify(snapshot.runtimeDetail), snapshot.runtimeCheckedAt, snapshot.lastRunId);
     }
   }
 
@@ -2101,7 +2207,10 @@ export class YanxuStore {
     return this.teamFromRow(row);
   }
 
-  createTask(input: CreateTaskInput): Task {
+  createTask(
+    input: CreateTaskInput,
+    origin: { triggerSource?: ExecutionTriggerSource; scheduleOccurrenceId?: string } = {},
+  ): Task {
     const project = this.getProject(input.projectId);
     this.getTeam(input.teamId);
     const timestamp = now();
@@ -2109,12 +2218,15 @@ export class YanxuStore {
     this.database.transaction(() => {
       this.database.prepare(`
         INSERT INTO tasks(id, project_id, team_id, title, description, expected_output, constraints_text, forbidden_paths_json,
-          status, state_version, flow_version, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', 0, 2, ?, ?)
+          status, state_version, flow_version, trigger_source, schedule_occurrence_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', 0, 2, ?, ?, ?, ?)
       `).run(taskId, input.projectId, input.teamId, input.title.trim(), input.description.trim(), input.expectedOutput?.trim() ?? '',
-        input.constraints?.trim() ?? '', JSON.stringify(input.forbiddenPaths ?? []), timestamp, timestamp);
+        input.constraints?.trim() ?? '', JSON.stringify(input.forbiddenPaths ?? []), origin.triggerSource ?? 'manual',
+        origin.scheduleOccurrenceId ?? null, timestamp, timestamp);
       this.appendEvent('task', taskId, 'task.created', 'user', '保存任务草稿。', {
         projectId: input.projectId, teamId: input.teamId,
+        triggerSource: origin.triggerSource ?? 'manual',
+        scheduleOccurrenceId: origin.scheduleOccurrenceId ?? null,
       });
     })();
 
@@ -2215,6 +2327,516 @@ export class YanxuStore {
     `).get(taskId) as TaskRow | undefined;
     if (!row) throw new DomainError('TASK_NOT_FOUND', '任务不存在。', 404);
     return this.taskFromRow(row);
+  }
+
+  listSchedules(options: { projectId?: string; includeArchived?: boolean } = {}): ScheduleDefinition[] {
+    const conditions: string[] = [];
+    const parameters: string[] = [];
+    if (options.projectId) {
+      conditions.push('s.project_id = ?');
+      parameters.push(options.projectId);
+    }
+    if (!options.includeArchived) conditions.push('s.archived_at IS NULL');
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+    const rows = this.database.prepare(`
+      SELECT s.*, p.name AS project_name, tm.name AS team_name, t.title AS source_task_title
+      FROM schedule_definitions s
+      JOIN projects p ON p.id = s.project_id
+      JOIN teams tm ON tm.id = s.team_id
+      JOIN tasks t ON t.id = s.source_task_id
+      ${where}
+      ORDER BY s.updated_at DESC
+    `).all(...parameters) as ScheduleDefinitionRow[];
+    return rows.map((row) => this.scheduleDefinitionFromRow(row));
+  }
+
+  getSchedule(scheduleId: string): ScheduleDefinition {
+    const row = this.database.prepare(`
+      SELECT s.*, p.name AS project_name, tm.name AS team_name, t.title AS source_task_title
+      FROM schedule_definitions s
+      JOIN projects p ON p.id = s.project_id
+      JOIN teams tm ON tm.id = s.team_id
+      JOIN tasks t ON t.id = s.source_task_id
+      WHERE s.id = ?
+    `).get(scheduleId) as ScheduleDefinitionRow | undefined;
+    if (!row) throw new DomainError('SCHEDULE_NOT_FOUND', '定时任务不存在。', 404);
+    return this.scheduleDefinitionFromRow(row);
+  }
+
+  createSchedule(input: CreateScheduleInput): ScheduleDefinition {
+    const sourceTask = this.getTask(input.sourceTaskId);
+    const snapshot = this.getRunSnapshot(sourceTask.id);
+    if (!sourceTask.plan?.confirmedAt || !snapshot) {
+      throw new DomainError('SCHEDULE_SOURCE_NOT_CONFIRMED', '定时任务必须基于已经确认并形成运行快照的需求。', 409);
+    }
+    if (['report', 'discover'].includes(input.mode) && sourceTask.steps.some((step) => step.mode === 'write')) {
+      throw new DomainError('SCHEDULE_READ_ONLY_SOURCE_WRITES', '仅报告和发现模式只能选择全部为只读 WorkUnit 的已确认任务。', 422);
+    }
+    assertValidTimeZone(input.timezone);
+    const startAt = new Date(input.startAt);
+    if (!Number.isFinite(startAt.getTime())) throw new DomainError('SCHEDULE_TIME_INVALID', '首次运行时间不合法。', 422);
+    if (input.triggerType === 'interval' && (!input.intervalValue || !input.intervalUnit)) {
+      throw new DomainError('SCHEDULE_INTERVAL_REQUIRED', '周期任务必须设置周期数值和单位。', 422);
+    }
+    const timestamp = now();
+    const scheduleId = id('schedule');
+    const usedAgentIds = new Set(snapshot.plan.steps.flatMap((step) => step.agentId ? [step.agentId] : []));
+    const systemSettings = this.getSettings();
+    const automationBoundary: ScheduleDefinition['automationBoundary'] = {
+      directoryIds: [...new Set(snapshot.plan.branchRoutes.map((route) => route.directoryId))],
+      permissions: [...new Set(snapshot.plan.permissions)],
+      capabilityIds: [...new Set((snapshot.capabilities ?? []).map((capability) => capability.capabilityId))],
+      qualityGateIds: [...new Set(snapshot.plan.qualityGates.map((gate) => gate.id))],
+      planContentHash: snapshot.contentHash,
+      agents: snapshot.agents.filter((agent) => usedAgentIds.has(agent.id)).map((agent) => ({
+        id: agent.id,
+        executor: agent.executor,
+        model: agent.model,
+        permissionMode: agent.permissionMode,
+      })),
+      capabilities: (snapshot.capabilities ?? []).map((capability) => ({
+        id: capability.capabilityId,
+        version: capability.version,
+        contentHash: capability.contentHash,
+        executor: capability.executor,
+      })),
+      qualityGates: snapshot.plan.qualityGates.map((gate) => ({
+        id: gate.id,
+        directoryId: gate.directoryId,
+        commandArgv: gate.commandArgv ?? [],
+        required: gate.required,
+      })),
+      projectPermissionMode: this.getProjectSettings(sourceTask.projectId).permissionMode,
+      networkPolicy: systemSettings.networkPolicy,
+      dependencyInstallPolicy: systemSettings.dependencyInstallPolicy,
+    };
+    this.database.prepare(`
+      INSERT INTO schedule_definitions(
+        id, project_id, team_id, source_task_id, name, description, mode, trigger_type, timezone,
+        start_at, interval_value, interval_unit, missed_policy, overlap_policy, automation_boundary_json,
+        enabled, next_run_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    `).run(
+      scheduleId,
+      sourceTask.projectId,
+      sourceTask.teamId,
+      sourceTask.id,
+      input.name.trim(),
+      input.description?.trim() ?? '',
+      input.mode,
+      input.triggerType,
+      input.timezone,
+      startAt.toISOString(),
+      input.triggerType === 'interval' ? input.intervalValue ?? null : null,
+      input.triggerType === 'interval' ? input.intervalUnit ?? null : null,
+      input.missedPolicy ?? 'catch_up_once',
+      input.overlapPolicy ?? 'coalesce',
+      JSON.stringify(automationBoundary),
+      startAt.toISOString(),
+      timestamp,
+      timestamp,
+    );
+    const project = this.getProject(sourceTask.projectId);
+    const definition = this.getSchedule(scheduleId);
+    writeVersionedArtifact(project.projectSpacePath, `schedules/${scheduleId}.json`, `${JSON.stringify(definition, null, 2)}\n`);
+    this.recordProjectSpaceCommit(project.projectSpacePath, `chore: create schedule ${scheduleId}`);
+    this.appendEvent('project', sourceTask.projectId, 'schedule.created', 'user', `已创建定时任务“${definition.name}”。`, {
+      scheduleId,
+      sourceTaskId: sourceTask.id,
+      mode: definition.mode,
+      nextRunAt: definition.nextRunAt,
+    });
+    return definition;
+  }
+
+  updateSchedule(scheduleId: string, input: UpdateScheduleInput): ScheduleDefinition {
+    const current = this.getSchedule(scheduleId);
+    if (current.archivedAt) throw new DomainError('SCHEDULE_ARCHIVED', '已删除的定时任务不能修改。', 409);
+    const timezone = input.timezone ?? current.timezone;
+    assertValidTimeZone(timezone);
+    const triggerType = input.triggerType ?? current.triggerType;
+    const startAt = new Date(input.startAt ?? current.startAt);
+    const intervalValue = triggerType === 'interval' ? input.intervalValue ?? current.intervalValue : null;
+    const intervalUnit = triggerType === 'interval' ? input.intervalUnit ?? current.intervalUnit : null;
+    if (!Number.isFinite(startAt.getTime())) throw new DomainError('SCHEDULE_TIME_INVALID', '首次运行时间不合法。', 422);
+    if (triggerType === 'interval' && (!intervalValue || !intervalUnit)) {
+      throw new DomainError('SCHEDULE_INTERVAL_REQUIRED', '周期任务必须设置周期数值和单位。', 422);
+    }
+    const resultingMode = input.mode ?? current.mode;
+    const sourceTask = this.getTask(current.sourceTaskId);
+    if (['report', 'discover'].includes(resultingMode) && sourceTask.steps.some((step) => step.mode === 'write')) {
+      throw new DomainError('SCHEDULE_READ_ONLY_SOURCE_WRITES', '仅报告和发现模式只能选择全部为只读 WorkUnit 的已确认任务。', 422);
+    }
+    const timestamp = now();
+    const timingChanged = triggerType !== current.triggerType
+      || startAt.toISOString() !== current.startAt
+      || intervalValue !== current.intervalValue
+      || intervalUnit !== current.intervalUnit;
+    let nextRunAt = current.nextRunAt;
+    if (timingChanged) {
+      let next = startAt;
+      if (triggerType === 'interval') {
+        while (next.getTime() <= Date.now()) {
+          next = nextScheduleTime({ triggerType, intervalValue, intervalUnit, timezone }, next);
+        }
+      }
+      nextRunAt = next.toISOString();
+    }
+    this.database.prepare(`
+      UPDATE schedule_definitions SET name = ?, description = ?, mode = ?, trigger_type = ?, timezone = ?,
+        start_at = ?, interval_value = ?, interval_unit = ?, missed_policy = ?, overlap_policy = ?,
+        next_run_at = ?, updated_at = ? WHERE id = ?
+    `).run(
+      input.name?.trim() ?? current.name,
+      input.description?.trim() ?? current.description,
+      resultingMode,
+      triggerType,
+      timezone,
+      startAt.toISOString(),
+      intervalValue,
+      intervalUnit,
+      input.missedPolicy ?? current.missedPolicy,
+      input.overlapPolicy ?? current.overlapPolicy,
+      nextRunAt,
+      timestamp,
+      scheduleId,
+    );
+    if (timingChanged) {
+      this.database.prepare(`
+        UPDATE schedule_occurrences SET status = 'skipped', reason = 'schedule_definition_updated', completed_at = ?
+        WHERE schedule_id = ? AND status = 'queued' AND COALESCE(reason, '') != 'manual_trigger'
+      `).run(timestamp, scheduleId);
+    }
+    const updated = this.getSchedule(scheduleId);
+    const project = this.getProject(updated.projectId);
+    writeVersionedArtifact(project.projectSpacePath, `schedules/${scheduleId}.json`, `${JSON.stringify(updated, null, 2)}\n`);
+    this.recordProjectSpaceCommit(project.projectSpacePath, `chore: update schedule ${scheduleId}`);
+    this.appendEvent('project', updated.projectId, 'schedule.updated', 'user', `已更新定时任务“${updated.name}”，历史触发记录保持不变。`, {
+      scheduleId,
+      nextRunAt: updated.nextRunAt,
+      mode: updated.mode,
+    });
+    return updated;
+  }
+
+  setScheduleEnabled(scheduleId: string, enabled: boolean): ScheduleDefinition {
+    const schedule = this.getSchedule(scheduleId);
+    if (schedule.archivedAt) throw new DomainError('SCHEDULE_ARCHIVED', '已删除的定时任务不能启用。', 409);
+    const nextRunAt = enabled
+      ? (schedule.nextRunAt ?? nextScheduleTime(schedule, new Date()).toISOString())
+      : null;
+    this.database.prepare('UPDATE schedule_definitions SET enabled = ?, next_run_at = ?, updated_at = ? WHERE id = ?')
+      .run(Number(enabled), nextRunAt, now(), scheduleId);
+    return this.getSchedule(scheduleId);
+  }
+
+  archiveSchedule(scheduleId: string): ScheduleDefinition {
+    const schedule = this.getSchedule(scheduleId);
+    if (!schedule.archivedAt) this.database.prepare(`
+      UPDATE schedule_definitions SET enabled = 0, next_run_at = NULL, archived_at = ?, updated_at = ? WHERE id = ?
+    `).run(now(), now(), scheduleId);
+    return this.getSchedule(scheduleId);
+  }
+
+  listScheduleOccurrences(scheduleId: string): ScheduleOccurrence[] {
+    this.getSchedule(scheduleId);
+    return (this.database.prepare(`
+      SELECT * FROM schedule_occurrences WHERE schedule_id = ? ORDER BY planned_at DESC
+    `).all(scheduleId) as ScheduleOccurrenceRow[]).map((row) => this.scheduleOccurrenceFromRow(row));
+  }
+
+  triggerScheduleNow(scheduleId: string): ScheduleOccurrence {
+    const schedule = this.getSchedule(scheduleId);
+    if (schedule.archivedAt) throw new DomainError('SCHEDULE_ARCHIVED', '已删除的定时任务不能立即执行。', 409);
+    const plannedAt = now();
+    const occurrenceId = id('occurrence');
+    this.database.prepare(`
+      INSERT INTO schedule_occurrences(id, schedule_id, planned_at, status, reason, created_at)
+      VALUES (?, ?, ?, 'queued', 'manual_trigger', ?)
+    `).run(occurrenceId, scheduleId, plannedAt, plannedAt);
+    return this.scheduleOccurrenceFromRow(this.database.prepare('SELECT * FROM schedule_occurrences WHERE id = ?')
+      .get(occurrenceId) as ScheduleOccurrenceRow);
+  }
+
+  claimDueScheduleOccurrence(): ScheduleOccurrence | null {
+    const timestamp = now();
+    this.materializeDueScheduleOccurrences(new Date(timestamp));
+    const row = this.database.prepare(`
+      SELECT candidate.* FROM schedule_occurrences candidate
+      WHERE candidate.status = 'queued'
+        AND NOT EXISTS (
+          SELECT 1 FROM schedule_occurrences active
+          WHERE active.schedule_id = candidate.schedule_id AND active.status = 'running'
+        )
+      ORDER BY candidate.planned_at LIMIT 1
+    `).get() as ScheduleOccurrenceRow | undefined;
+    if (!row) return null;
+    const result = this.database.prepare(`
+      UPDATE schedule_occurrences SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'
+    `).run(timestamp, row.id);
+    return result.changes === 1
+      ? { ...this.scheduleOccurrenceFromRow(row), status: 'running', startedAt: timestamp }
+      : null;
+  }
+
+  startScheduleOccurrence(occurrenceId: string, executorInstallations: ExecutorInstallation[]): Task {
+    const occurrence = this.database.prepare('SELECT * FROM schedule_occurrences WHERE id = ?')
+      .get(occurrenceId) as ScheduleOccurrenceRow | undefined;
+    if (!occurrence || occurrence.status !== 'running') {
+      throw new DomainError('SCHEDULE_OCCURRENCE_NOT_CLAIMED', '定时触发记录未处于可启动状态。', 409);
+    }
+    const schedule = this.getSchedule(occurrence.schedule_id);
+    const sourceTask = this.getTask(schedule.sourceTaskId);
+    const sourceSnapshot = this.getRunSnapshot(sourceTask.id);
+    if (!sourceTask.plan?.confirmedAt || !sourceSnapshot) {
+      throw new DomainError('SCHEDULE_SOURCE_EXPIRED', '定时任务来源的确认快照已经不可用。', 409);
+    }
+    const currentProject = this.getProject(schedule.projectId);
+    const boundaryDrift = this.scheduleBoundaryDriftReasons(schedule, sourceSnapshot);
+    let task = this.createTask({
+      projectId: schedule.projectId,
+      teamId: schedule.teamId,
+      title: `${sourceTask.title} · ${new Date(occurrence.planned_at).toLocaleString('zh-CN', { timeZone: schedule.timezone })}`,
+      description: `${sourceTask.description}${boundaryDrift.length > 0 ? `\n\n定时边界变化：\n${boundaryDrift.map((reason) => `- ${reason}`).join('\n')}` : ''}`,
+      expectedOutput: sourceTask.expectedOutput,
+      constraints: `${sourceTask.constraints}\n定时任务：${schedule.name}；模式：${schedule.mode}。`.trim(),
+      forbiddenPaths: sourceTask.forbiddenPaths,
+    }, { triggerSource: 'schedule', scheduleOccurrenceId: occurrence.id });
+    this.database.prepare('UPDATE schedule_occurrences SET task_id = ? WHERE id = ?').run(task.id, occurrence.id);
+    task = this.submitTask(task.id, task.stateVersion);
+    if (boundaryDrift.length > 0) {
+      this.database.prepare(`
+        UPDATE schedule_occurrences SET status = 'awaiting_confirmation', reason = ? WHERE id = ?
+      `).run(`boundary_drift: ${boundaryDrift.join('；')}`, occurrence.id);
+      this.appendEvent('task', task.id, 'schedule.boundary_drift', 'scheduler',
+        '定时任务边界已变化，已转为重新规划并等待人工确认。', {
+          scheduleId: schedule.id,
+          occurrenceId: occurrence.id,
+          boundaryDrift,
+        });
+      return task;
+    }
+    const clonedSteps = sourceTask.plan.steps.map((step) => ({
+      ...step,
+      id: id('step'),
+      taskId: task.id,
+      mode: schedule.mode === 'report' || schedule.mode === 'discover' ? 'read_only' as const : step.mode ?? 'read_only',
+      requiresIndependentSession: step.requiresIndependentSession ?? false,
+      status: 'pending' as const,
+      attempt: 0,
+      startedAt: null,
+      completedAt: null,
+      summary: null,
+    }));
+    task = this.saveComposedPlan(task.id, {
+      ...sourceTask.plan,
+      id: id('plan'),
+      taskId: task.id,
+      version: 1,
+      taskVersionId: this.getCurrentTaskVersion(task.id).id,
+      taskVersion: 1,
+      preApprovalSkillIds: [],
+      preApprovalArtifacts: [],
+      questions: sourceTask.plan.questions.map((question) => ({ ...question, id: id('question') })),
+      steps: clonedSteps,
+      branchRoutes: sourceTask.plan.branchRoutes.map((route) => {
+        const directory = currentProject.directories.find((item) => item.id === route.directoryId);
+        const repository = directory?.gitRootPath ?? directory?.realPath;
+        const sourceCommit = repository ? git(repository, ['rev-parse', '--verify', `refs/heads/${route.sourceBranch}`]) : '';
+        if (!sourceCommit && route.sourceCommit !== 'UNBORN') {
+          throw new DomainError('SCHEDULE_SOURCE_BRANCH_MISSING', `目录 ${route.directoryId} 的来源分支 ${route.sourceBranch} 不可用，需要人工确认。`, 409);
+        }
+        return { ...route, sourceCommit: sourceCommit || 'UNBORN' };
+      }),
+      qualityGates: sourceTask.plan.qualityGates.map((gate) => ({ ...gate, id: id('gate'), status: 'pending' })),
+      createdAt: now(),
+      confirmedAt: null,
+    });
+    task = this.commandTask(task.id, 'confirm', task.stateVersion, `定时任务 ${schedule.name} 在已确认边界内自动启动。`, executorInstallations);
+    this.appendEvent('task', task.id, 'schedule.occurrence_started', 'scheduler', `由定时任务“${schedule.name}”触发。`, {
+      scheduleId: schedule.id,
+      occurrenceId: occurrence.id,
+      plannedAt: occurrence.planned_at,
+      mode: schedule.mode,
+    });
+    return task;
+  }
+
+  failScheduleOccurrence(occurrenceId: string, error: unknown): void {
+    this.database.prepare(`
+      UPDATE schedule_occurrences SET status = 'failed', reason = ?, completed_at = ? WHERE id = ?
+    `).run(error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000), now(), occurrenceId);
+  }
+
+  reconcileScheduleOccurrences(): number {
+    const rows = this.database.prepare(`
+      SELECT o.id, o.task_id, o.schedule_id, o.status AS occurrence_status, o.reason,
+        t.status AS task_status, s.mode AS schedule_mode
+      FROM schedule_occurrences o
+      LEFT JOIN tasks t ON t.id = o.task_id
+      JOIN schedule_definitions s ON s.id = o.schedule_id
+      WHERE o.status IN ('running', 'awaiting_confirmation') AND o.task_id IS NOT NULL
+    `).all() as Array<{
+      id: string; task_id: string; schedule_id: string; occurrence_status: ScheduleOccurrence['status']; reason: string | null;
+      task_status: TaskStatus; schedule_mode: ScheduleDefinition['mode'];
+    }>;
+    let updated = 0;
+    for (const row of rows) {
+      let status: ScheduleOccurrence['status'] | null = null;
+      let reason: string | null = null;
+      if (row.occurrence_status === 'awaiting_confirmation'
+        && ['PREPARING', 'QUEUED', 'RUNNING', 'VALIDATING', 'RETRYING', 'REPLANNING'].includes(row.task_status)) {
+        this.database.prepare(`
+          UPDATE schedule_occurrences SET status = 'running', reason = 'confirmation_received', completed_at = NULL WHERE id = ?
+        `).run(row.id);
+        updated += 1;
+        continue;
+      }
+      const taskEvents = this.listEvents(row.task_id);
+      const discoveryAlreadyPromoted = taskEvents.some((event) => event.type === 'schedule.discovery_findings_promoted');
+      if (row.task_status === 'DELIVERED' && row.schedule_mode === 'discover' && !discoveryAlreadyPromoted) {
+        const findings = taskEvents
+          .filter((event) => ['work_unit.succeeded', 'skill_step.succeeded'].includes(event.type))
+          .flatMap((event) => {
+            const issues = Array.isArray(event.payload.issues)
+              ? event.payload.issues.filter((item): item is string => typeof item === 'string')
+              : [];
+            const reviewFindings = Array.isArray(event.payload.findings)
+              ? event.payload.findings.filter(isRecordValue).map((item) => String(item.title ?? item.description ?? '')).filter(Boolean)
+              : [];
+            return [...issues, ...reviewFindings];
+          });
+        if (findings.length === 0) {
+          status = 'completed';
+          reason = 'discovery_completed_without_findings';
+        } else {
+          let task = this.getTask(row.task_id);
+          task = this.commandTask(task.id, 'reopen', task.stateVersion,
+            `定时发现产生以下待处理内容：\n${[...new Set(findings)].map((finding) => `- ${finding}`).join('\n')}`);
+          this.submitTask(task.id, task.stateVersion);
+          this.database.prepare(`
+            UPDATE schedule_occurrences SET status = 'awaiting_confirmation', reason = ?, completed_at = NULL WHERE id = ?
+          `).run(`discovery_findings: ${findings.length}`, row.id);
+          this.appendEvent('task', row.task_id, 'schedule.discovery_findings_promoted', 'scheduler',
+            `定时发现得到 ${findings.length} 项内容，已形成新需求版本并进入计划确认。`, {
+              scheduleId: row.schedule_id,
+              occurrenceId: row.id,
+              findings: [...new Set(findings)],
+            });
+          updated += 1;
+          continue;
+        }
+      } else if (['DELIVERED', 'ARCHIVED'].includes(row.task_status)) status = 'completed';
+      else if (['WAITING_PLAN_APPROVAL', 'WAITING_REAPPROVAL', 'WAITING_APPROVAL', 'BLOCKED'].includes(row.task_status)) {
+        status = 'awaiting_confirmation';
+        reason = `task_${row.task_status.toLowerCase()}`;
+      } else if (['STOPPED', 'CANCELLED'].includes(row.task_status)) {
+        status = 'failed';
+        reason = `task_${row.task_status.toLowerCase()}`;
+      }
+      if (!status) continue;
+      this.database.prepare(`UPDATE schedule_occurrences SET status = ?, reason = ?, completed_at = ? WHERE id = ?`)
+        .run(status, reason, status === 'awaiting_confirmation' ? null : now(), row.id);
+      updated += 1;
+    }
+    return updated;
+  }
+
+  recoverScheduleOccurrences(): number {
+    return this.database.prepare(`
+      UPDATE schedule_occurrences SET status = 'queued', started_at = NULL, reason = 'daemon_restarted_before_task_creation'
+      WHERE status = 'running' AND task_id IS NULL
+    `).run().changes;
+  }
+
+  private materializeDueScheduleOccurrences(currentTime: Date): void {
+    const due = this.listSchedules().filter((schedule) => schedule.enabled && schedule.nextRunAt
+      && new Date(schedule.nextRunAt).getTime() <= currentTime.getTime());
+    for (const schedule of due) {
+      const plannedAt = schedule.nextRunAt as string;
+      const running = this.database.prepare(`
+        SELECT 1 FROM schedule_occurrences WHERE schedule_id = ? AND status = 'running' LIMIT 1
+      `).get(schedule.id);
+      const pendingCoalesced = this.database.prepare(`
+        SELECT 1 FROM schedule_occurrences WHERE schedule_id = ? AND status = 'queued' LIMIT 1
+      `).get(schedule.id);
+      const missed = currentTime.getTime() - new Date(plannedAt).getTime() > 60_000;
+      const coalesce = Boolean(running) && schedule.overlapPolicy === 'coalesce' && !pendingCoalesced;
+      const shouldSkip = (Boolean(running) && !coalesce) || (missed && schedule.missedPolicy === 'skip');
+      this.database.prepare(`
+        INSERT OR IGNORE INTO schedule_occurrences(id, schedule_id, planned_at, status, reason, created_at, completed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        id('occurrence'),
+        schedule.id,
+        plannedAt,
+        shouldSkip ? 'skipped' : 'queued',
+        running
+          ? coalesce ? 'overlap_coalesced_pending' : pendingCoalesced ? 'coalesced_into_pending_occurrence' : 'overlap_skip'
+          : missed && shouldSkip ? 'missed_while_daemon_offline' : null,
+        now(),
+        shouldSkip ? now() : null,
+      );
+      let nextRunAt: string | null = null;
+      if (schedule.triggerType === 'interval') {
+        let next = nextScheduleTime(schedule, new Date(plannedAt));
+        while (next.getTime() <= currentTime.getTime()) next = nextScheduleTime(schedule, next);
+        nextRunAt = next.toISOString();
+      }
+      this.database.prepare(`
+        UPDATE schedule_definitions SET next_run_at = ?, last_triggered_at = ?,
+          enabled = CASE WHEN trigger_type = 'once' THEN 0 ELSE enabled END, updated_at = ? WHERE id = ?
+      `).run(nextRunAt, plannedAt, now(), schedule.id);
+    }
+  }
+
+  private scheduleBoundaryDriftReasons(schedule: ScheduleDefinition, snapshot: TaskRunSnapshot): string[] {
+    const reasons: string[] = [];
+    const project = this.getProject(schedule.projectId);
+    const directoryIds = new Set(project.directories.map((directory) => directory.id));
+    const missingDirectories = schedule.automationBoundary.directoryIds.filter((directoryId) => !directoryIds.has(directoryId));
+    if (missingDirectories.length > 0) reasons.push(`项目目录已移除：${missingDirectories.join('、')}`);
+    for (const route of snapshot.plan.branchRoutes) {
+      const directory = project.directories.find((item) => item.id === route.directoryId);
+      if (!directory || route.sourceCommit === 'UNBORN') continue;
+      const repository = directory.gitRootPath ?? directory.realPath;
+      if (!git(repository, ['rev-parse', '--verify', `refs/heads/${route.sourceBranch}`])) {
+        reasons.push(`来源分支已不可用：${directory.displayName}/${route.sourceBranch}`);
+      }
+    }
+    if (schedule.automationBoundary.planContentHash && schedule.automationBoundary.planContentHash !== snapshot.contentHash) {
+      reasons.push('来源任务的确认快照已变化');
+    }
+    const currentTeam = this.getTeam(schedule.teamId);
+    const memberIds = new Set(currentTeam.memberIds);
+    for (const expected of schedule.automationBoundary.agents ?? []) {
+      if (!memberIds.has(expected.id)) {
+        reasons.push(`人员已移出团队：${expected.id}`);
+        continue;
+      }
+      const agent = this.getAgent(expected.id);
+      if (agent.executor !== expected.executor || agent.model !== expected.model || agent.permissionMode !== expected.permissionMode) {
+        reasons.push(`人员配置已变化：${agent.name}`);
+      }
+    }
+    const projectCapabilities = new Map(this.listProjectCapabilities(schedule.projectId)
+      .filter((item) => item.enabled)
+      .map((item) => [item.capabilityId, item]));
+    for (const expected of schedule.automationBoundary.capabilities ?? []) {
+      const current = projectCapabilities.get(expected.id);
+      if (!current || current.lockedHash !== expected.contentHash || current.lockedVersion !== expected.version) {
+        reasons.push(`能力锁已变化：${expected.id}`);
+      }
+    }
+    const projectSettings = this.getProjectSettings(schedule.projectId);
+    if (schedule.automationBoundary.projectPermissionMode
+      && projectSettings.permissionMode !== schedule.automationBoundary.projectPermissionMode) reasons.push('项目权限模式已变化');
+    const systemSettings = this.getSettings();
+    if (schedule.automationBoundary.networkPolicy
+      && systemSettings.networkPolicy !== schedule.automationBoundary.networkPolicy) reasons.push('网络权限策略已变化');
+    if (schedule.automationBoundary.dependencyInstallPolicy
+      && systemSettings.dependencyInstallPolicy !== schedule.automationBoundary.dependencyInstallPolicy) reasons.push('依赖安装策略已变化');
+    return [...new Set(reasons)];
   }
 
   buildPlanningContext(projectId: string, query: string): PlanningDirectoryContext[] {
@@ -2502,15 +3124,24 @@ export class YanxuStore {
         contentHash: sha256(raw),
       };
     }).filter((item) => item.logExcerpt.length > 0);
-    const projectKnowledge = rankKnowledge(
-      this.listKnowledge(task.projectId).filter((item) => item.status === 'active'),
-      queryText,
-    ).slice(0, 6).map((item) => {
+    const projectKnowledge = this.retrieveRelevantKnowledge(task.projectId, queryText, 24)
+      .slice(0, 6).map(({ item, relevanceScore, matchedTerms, selectionReason }) => {
       const budget = Math.max(0, Math.min(6_000, remainingCharacters));
       const content = item.content.slice(0, budget);
       if (content.length < item.content.length) truncated = true;
       remainingCharacters -= content.length;
-      return { id: item.id, category: item.category, title: item.title, content, version: item.version };
+      return {
+        id: item.id,
+        category: item.category,
+        title: item.title,
+        content,
+        version: item.version,
+        sourceTaskId: item.sourceTaskId,
+        supersedesId: item.supersedesId,
+        relevanceScore,
+        matchedTerms,
+        selectionReason,
+      };
     }).filter((item) => item.content.length > 0);
     const recentEvidence = this.listEvents(taskId).filter((event) =>
       ['skill_step.succeeded', 'skill_step.failed', 'work_unit.succeeded', 'work_unit.changes_required', 'work_unit.blocked',
@@ -2545,6 +3176,7 @@ export class YanxuStore {
         title: item.title,
         hash: sha256(item.content),
         characters: item.content.length,
+        selectionReason: item.selectionReason,
       })),
       ...snapshot.directories.filter((directory) => currentStep.directoryIds.includes(directory.id)).map((directory) => ({
         type: 'directory' as const,
@@ -2764,9 +3396,12 @@ export class YanxuStore {
   listExecutionRuns(taskId: string): ExecutionRun[] {
     this.getTask(taskId);
     const rows = this.database.prepare(`
-      SELECT r.*, s.external_session_id
+      SELECT r.*, s.external_session_id, s.invalidation_reason,
+        ts.title AS step_title, a.name AS agent_name
       FROM execution_runs r
       LEFT JOIN executor_sessions s ON s.id = r.executor_session_id
+      JOIN task_steps ts ON ts.id = r.step_id
+      LEFT JOIN agent_profiles a ON a.id = r.agent_id
       WHERE r.task_id = ? ORDER BY r.started_at DESC
     `).all(taskId) as ExecutionRunRow[];
     return rows.map((row) => this.executionRunFromRow(row));
@@ -2775,9 +3410,12 @@ export class YanxuStore {
   getExecutionRun(taskId: string, runId: string): ExecutionRun {
     this.getTask(taskId);
     const row = this.database.prepare(`
-      SELECT r.*, s.external_session_id
+      SELECT r.*, s.external_session_id, s.invalidation_reason,
+        ts.title AS step_title, a.name AS agent_name
       FROM execution_runs r
       LEFT JOIN executor_sessions s ON s.id = r.executor_session_id
+      JOIN task_steps ts ON ts.id = r.step_id
+      LEFT JOIN agent_profiles a ON a.id = r.agent_id
       WHERE r.task_id = ? AND r.id = ?
     `).get(taskId, runId) as ExecutionRunRow | undefined;
     if (!row) throw new DomainError('EXECUTION_RUN_NOT_FOUND', '运行记录不存在。', 404);
@@ -3066,20 +3704,46 @@ export class YanxuStore {
         } : {}),
       });
       if (command === 'stop') {
+        const timestamp = now();
         this.database.prepare(`
           UPDATE permission_requests SET status = 'resolved', decision = 'reject', message = '任务已停止。', resolved_at = ?
           WHERE task_id = ? AND status = 'pending'
-        `).run(now(), taskId);
+        `).run(timestamp, taskId);
+        this.database.prepare(`UPDATE agent_sessions SET status = 'interrupted', completed_at = ?, error = COALESCE(error, '任务已停止。') WHERE task_id = ? AND status = 'running'`)
+          .run(timestamp, taskId);
+        this.database.prepare(`
+          UPDATE execution_runs SET status = 'stopped', phase = 'stopped', next_action = '可由用户恢复并创建新 Run',
+            failure_message = COALESCE(failure_message, '任务由用户停止。'), heartbeat_at = ?, completed_at = ?
+          WHERE task_id = ? AND status IN ('preparing', 'running')
+        `).run(timestamp, timestamp, taskId);
+      }
+      if (command === 'pause') {
+        const timestamp = now();
+        this.database.prepare(`UPDATE agent_sessions SET status = 'interrupted', completed_at = ?, error = COALESCE(error, '任务已暂停。') WHERE task_id = ? AND status = 'running'`)
+          .run(timestamp, taskId);
+        this.database.prepare(`
+          UPDATE execution_runs SET status = 'interrupted', phase = 'paused', next_action = '恢复任务后创建新 Run',
+            failure_message = COALESCE(failure_message, '任务由用户暂停。'), heartbeat_at = ?, completed_at = ?
+          WHERE task_id = ? AND status IN ('preparing', 'running')
+        `).run(timestamp, timestamp, taskId);
       }
       if (command === 'cancel') {
+        const timestamp = now();
         this.database.prepare(`
           UPDATE permission_requests SET status = 'resolved', decision = 'reject', message = '任务已废弃。', resolved_at = ?
           WHERE task_id = ? AND status = 'pending'
-        `).run(now(), taskId);
+        `).run(timestamp, taskId);
         this.database.prepare(`
           UPDATE jobs SET status = 'CANCELLED', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?
           WHERE aggregate_id = ? AND status = 'READY'
-        `).run(now(), taskId);
+        `).run(timestamp, taskId);
+        this.database.prepare(`UPDATE agent_sessions SET status = 'interrupted', completed_at = ?, error = COALESCE(error, '任务已废弃。') WHERE task_id = ? AND status = 'running'`)
+          .run(timestamp, taskId);
+        this.database.prepare(`
+          UPDATE execution_runs SET status = 'stopped', phase = 'cancelled', next_action = NULL,
+            failure_message = COALESCE(failure_message, '任务已废弃。'), heartbeat_at = ?, completed_at = ?
+          WHERE task_id = ? AND status IN ('preparing', 'running')
+        `).run(timestamp, timestamp, taskId);
       }
       if (command === 'self_merge') {
         this.database.prepare(`
@@ -3510,22 +4174,45 @@ export class YanxuStore {
 
   searchKnowledge(projectId: string, query: string): KnowledgeItem[] {
     this.getProject(projectId);
-    const terms = query.trim().split(/\s+/).filter(Boolean).map((term) => `"${term.replaceAll('"', '""')}"*`);
-    if (terms.length === 0) return this.listKnowledge(projectId);
-    const ids = this.database.prepare(`SELECT entity_id FROM context_fts WHERE project_id = ? AND context_fts MATCH ? LIMIT 20`)
-      .all(projectId, terms.join(' OR ')) as Array<{ entity_id: string }>;
-    if (ids.length === 0) {
-      const normalized = query.trim().toLowerCase();
-      return rankKnowledge(
-        this.listKnowledge(projectId).filter((item) => item.status === 'active'),
-        query,
-      ).filter((item) => `${item.title}\n${item.content}`.toLowerCase().includes(normalized)).slice(0, 20);
+    if (!query.trim()) return this.listKnowledge(projectId);
+    return this.retrieveRelevantKnowledge(projectId, query, 20).map(({ item }) => item);
+  }
+
+  private retrieveRelevantKnowledge(projectId: string, query: string, candidateLimit: number): ReturnType<typeof rankKnowledgeWithReasons> {
+    const terms = contextTerms(query).slice(0, 16);
+    if (terms.length === 0) return [];
+    const candidateIds = new Set<string>();
+    try {
+      const match = terms.map((term) => `"${term.replaceAll('"', '""')}"*`).join(' OR ');
+      const ftsRows = this.database.prepare(`
+        SELECT entity_id FROM context_fts
+        WHERE project_id = ? AND context_fts MATCH ? LIMIT ?
+      `).all(projectId, match, candidateLimit) as Array<{ entity_id: string }>;
+      for (const row of ftsRows) candidateIds.add(row.entity_id);
+    } catch {
+      // LIKE candidates below remain available when an older SQLite tokenizer
+      // cannot parse a particular Unicode query.
     }
+    const clauses = terms.map(() => '(lower(title) LIKE ? OR lower(content) LIKE ?)').join(' OR ');
+    const likeParameters = terms.flatMap((term) => [`%${term}%`, `%${term}%`]);
+    const likeRows = this.database.prepare(`
+      SELECT * FROM knowledge_items
+      WHERE project_id = ? AND status = 'active' AND (${clauses})
+      ORDER BY updated_at DESC LIMIT ?
+    `).all(projectId, ...likeParameters, candidateLimit) as KnowledgeRow[];
+    for (const row of likeRows) candidateIds.add(row.id);
+    if (candidateIds.size === 0) return [];
+    const ids = [...candidateIds].slice(0, candidateLimit);
     const placeholders = ids.map(() => '?').join(',');
-    const rows = this.database.prepare(`SELECT * FROM knowledge_items WHERE id IN (${placeholders})`).all(...ids.map((item) => item.entity_id)) as KnowledgeRow[];
-    return rows.map((row) => ({ id: row.id, projectId: row.project_id, category: row.category, title: row.title, content: row.content,
+    const rows = this.database.prepare(`
+      SELECT * FROM knowledge_items WHERE project_id = ? AND status = 'active' AND id IN (${placeholders})
+    `).all(projectId, ...ids) as KnowledgeRow[];
+    const items = rows.map((row): KnowledgeItem => ({
+      id: row.id, projectId: row.project_id, category: row.category, title: row.title, content: row.content,
       status: row.status, sourceTaskId: row.source_task_id, version: row.version, supersedesId: row.supersedes_id,
-      createdAt: row.created_at, updatedAt: row.updated_at }));
+      createdAt: row.created_at, updatedAt: row.updated_at,
+    }));
+    return rankKnowledgeWithReasons(items, query).filter((result) => result.relevanceScore > 0);
   }
 
   reviewKnowledge(itemId: string, decision: 'accept' | 'reject', edits?: { title?: string; content?: string }): KnowledgeItem {
@@ -3877,10 +4564,13 @@ export class YanxuStore {
       triggerSource?: ExecutionTriggerSource;
       workspaceReused?: boolean;
       runtimeDirectory?: string;
+      logPath?: string;
     } = {},
   ): string {
     const runId = id('run');
     const timestamp = now();
+    const workspaces = this.getPreparedWorkspaces(taskId);
+    const runLogPath = options.logPath ?? join(this.workbenchHome, 'runtime', 'tasks', taskId, 'runs', runId, 'runtime.log');
     const previous = this.database.prepare(`
       SELECT id FROM execution_runs
       WHERE task_id = ? AND step_id = ? AND status != 'running'
@@ -3895,8 +4585,8 @@ export class YanxuStore {
       this.database.prepare(`
         INSERT INTO execution_runs(
           id, task_id, step_id, job_id, agent_id, retry_of_run_id, trigger_source, status, phase,
-          workspace_reused, runtime_directory, started_at, heartbeat_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'preparing', 'preparing_runtime', ?, ?, ?, ?)
+          executor, model, attempt, workspaces_json, workspace_reused, runtime_directory, log_path, started_at, heartbeat_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'preparing', 'preparing_runtime', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         runId,
         taskId,
@@ -3905,8 +4595,13 @@ export class YanxuStore {
         agent.id,
         previous?.id ?? null,
         options.triggerSource ?? 'manual',
+        agent.executor,
+        agent.model,
+        step.attempt,
+        JSON.stringify(workspaces),
         Number(options.workspaceReused ?? Boolean(previous)),
         options.runtimeDirectory ?? null,
+        runLogPath,
         timestamp,
         timestamp,
       );
@@ -4001,6 +4696,78 @@ export class YanxuStore {
     `).run(phase, nextAction, now(), runId);
   }
 
+  recordExecutionRunEvent(runId: string, event: {
+    kind: 'status' | 'thinking' | 'text' | 'tool_call' | 'tool_result' | 'log' | 'error';
+    message: string;
+    occurredAt: string;
+    data?: Record<string, unknown>;
+  }): void {
+    const run = this.database.prepare('SELECT task_id, agent_id, executor, status, log_path FROM execution_runs WHERE id = ?').get(runId) as {
+      task_id: string; agent_id: string; executor: AgentProfile['executor']; status: ExecutionRun['status']; log_path: string | null;
+    } | undefined;
+    if (!run) return;
+    if (['preparing', 'running'].includes(run.status)) {
+      this.database.prepare('UPDATE execution_runs SET heartbeat_at = ? WHERE id = ?').run(event.occurredAt, runId);
+    }
+    if (run.log_path) {
+      mkdirSync(dirname(run.log_path), { recursive: true });
+      appendFileSync(run.log_path, `${JSON.stringify({ runId, ...event })}\n`, { encoding: 'utf8', mode: 0o600 });
+    }
+    this.updateTaskCapabilityRuntime(runId, run.task_id, run.agent_id, run.executor, event);
+    this.appendEvent('task', run.task_id, `run.event.${event.kind}`, 'executor', event.message.slice(0, 2_000), {
+      runId,
+      kind: event.kind,
+      ...(event.data ?? {}),
+    });
+  }
+
+  private updateTaskCapabilityRuntime(
+    runId: string,
+    taskId: string,
+    agentId: string,
+    executor: AgentProfile['executor'],
+    event: { kind: string; data?: Record<string, unknown> },
+  ): void {
+    const checkedAt = now();
+    const capabilities = isRecordValue(event.data?.capabilityRuntime) ? event.data.capabilityRuntime : null;
+    const updateNamed = (kind: 'skill' | 'mcp', entries: unknown) => {
+      if (!Array.isArray(entries)) return;
+      for (const entry of entries) {
+        if (!isRecordValue(entry) || typeof entry.name !== 'string') continue;
+        const rawStatus = typeof entry.status === 'string' ? entry.status : 'not_checked';
+        const status: TaskCapabilitySnapshot['runtimeStatus'] = kind === 'skill'
+          ? 'loaded'
+          : rawStatus === 'connected' ? 'connected'
+            : rawStatus === 'needs_auth' || rawStatus === 'disabled' || rawStatus === 'failed' ? rawStatus : 'not_checked';
+        this.database.prepare(`
+          UPDATE task_capability_snapshots
+          SET runtime_status = ?, runtime_detail_json = ?, runtime_checked_at = ?, last_run_id = ?
+          WHERE task_id = ? AND agent_id = ? AND executor = ? AND kind = ? AND lower(name) = lower(?)
+        `).run(status, JSON.stringify(entry), checkedAt, runId, taskId, agentId, executor, kind, entry.name);
+      }
+    };
+    if (capabilities) {
+      updateNamed('skill', capabilities.skills);
+      updateNamed('mcp', capabilities.mcps);
+    }
+    const tool = typeof event.data?.tool === 'string' ? event.data.tool : null;
+    if (!tool || (event.kind !== 'tool_call' && event.kind !== 'tool_result')) return;
+    const snapshots = (this.database.prepare(`
+      SELECT id, name FROM task_capability_snapshots
+      WHERE task_id = ? AND agent_id = ? AND executor = ? AND kind = 'mcp'
+    `).all(taskId, agentId, executor) as Array<{ id: string; name: string }>);
+    for (const snapshot of snapshots) {
+      const normalizedName = snapshot.name.replaceAll('-', '_');
+      if (!tool.startsWith(`mcp__${snapshot.name}__`) && !tool.startsWith(`mcp__${normalizedName}__`)
+        && !tool.startsWith(`${snapshot.name}_`) && !tool.startsWith(`${normalizedName}_`)) continue;
+      const failed = event.kind === 'tool_result' && /failed|error/i.test(String(event.data?.status ?? ''));
+      this.database.prepare(`
+        UPDATE task_capability_snapshots SET runtime_status = ?, runtime_detail_json = ?,
+          runtime_checked_at = ?, last_run_id = ? WHERE id = ?
+      `).run(failed ? 'failed' : 'healthy', JSON.stringify({ tool, status: event.data?.status ?? null }), checkedAt, runId, snapshot.id);
+    }
+  }
+
   invalidateExecutorSession(runId: string, reason: string): void {
     const run = this.database.prepare(`SELECT task_id, executor_session_id FROM execution_runs WHERE id = ?`)
       .get(runId) as { task_id: string; executor_session_id: string | null } | undefined;
@@ -4015,6 +4782,20 @@ export class YanxuStore {
       executorSessionId: run.executor_session_id,
       reason,
     });
+  }
+
+  invalidateExternalSession(taskId: string, agentId: string, externalSessionId: string, reason: string): void {
+    const timestamp = now();
+    const result = this.database.prepare(`
+      UPDATE executor_sessions SET status = 'invalidated', invalidated_at = ?, invalidation_reason = ?
+      WHERE task_id = ? AND agent_id = ? AND external_session_id = ? AND status = 'active'
+    `).run(timestamp, reason, taskId, agentId, externalSessionId);
+    if (result.changes > 0) this.appendEvent('task', taskId, 'executor_session.invalidated', 'executor',
+      '原 CLI Session 未能保持连续性，当前 Run 已切换到新 Session。', {
+        agentId,
+        externalSessionId,
+        reason,
+      });
   }
 
   completeStep(
@@ -5092,6 +5873,13 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         SET status = 'interrupted', completed_at = ?, error = COALESCE(error, 'Daemon restarted while the session was active.')
         WHERE status = 'running'
       `).run(timestamp);
+      this.database.prepare(`
+        UPDATE execution_runs SET status = 'interrupted', phase = 'daemon_restarted',
+          failure_category = 'infrastructure', failure_code = 'DAEMON_RESTARTED',
+          failure_message = COALESCE(failure_message, 'Daemon restarted while the Run was active.'),
+          next_action = '后台作业重新排队后创建恢复 Run', heartbeat_at = ?, completed_at = ?
+        WHERE status IN ('preparing', 'running')
+      `).run(timestamp, timestamp);
       const reset = this.database.prepare(`
         UPDATE jobs SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL, available_at = ?, updated_at = ?,
           last_error = COALESCE(last_error, 'Daemon restarted while the job lease was active.')
@@ -5125,6 +5913,13 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
     `).all(timestamp) as Array<{ id: string; aggregate_id: string }>;
     if (expired.length === 0) return 0;
     this.database.transaction(() => {
+      this.database.prepare(`
+        UPDATE execution_runs SET status = 'interrupted', phase = 'lease_timed_out',
+          failure_category = 'infrastructure', failure_code = 'RUN_LEASE_TIMED_OUT',
+          failure_message = COALESCE(failure_message, 'Run heartbeat expired.'),
+          next_action = '后台作业重新排队后创建恢复 Run', heartbeat_at = ?, completed_at = ?
+        WHERE job_id IN (${expired.map(() => '?').join(',')}) AND status IN ('preparing', 'running')
+      `).run(timestamp, timestamp, ...expired.map((job) => job.id));
       const reset = this.database.prepare(`
         UPDATE jobs SET status = 'READY', lease_owner = NULL, lease_expires_at = NULL,
           available_at = ?, updated_at = ?, last_error = COALESCE(last_error, 'Job lease expired.')
@@ -5231,6 +6026,13 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
             WHERE task_id = ? AND step_id = ? AND status = 'running'
           `).run(timestamp, task.id, runningStep.id);
           this.database.prepare(`
+            UPDATE execution_runs SET status = 'interrupted', phase = 'orphaned',
+              failure_category = 'infrastructure', failure_code = 'RUN_ORPHANED',
+              failure_message = COALESCE(failure_message, 'Active Run no longer had a runnable job.'),
+              next_action = '创建恢复 Run', heartbeat_at = ?, completed_at = ?
+            WHERE task_id = ? AND step_id = ? AND status IN ('preparing', 'running')
+          `).run(timestamp, timestamp, task.id, runningStep.id);
+          this.database.prepare(`
             UPDATE tasks SET active_step_id = NULL, updated_at = ? WHERE id = ?
           `).run(timestamp, task.id);
         }
@@ -5274,6 +6076,11 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       stepId: row.step_id,
       jobId: row.job_id,
       agentId: row.agent_id,
+      agentName: row.agent_name,
+      stepTitle: row.step_title,
+      executor: row.executor,
+      model: row.model,
+      attempt: row.attempt,
       executorSessionId: row.executor_session_id,
       externalSessionId: row.external_session_id,
       retryOfRunId: row.retry_of_run_id,
@@ -5286,11 +6093,68 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       nextAction: row.next_action,
       workspaceReused: Boolean(row.workspace_reused),
       sessionReused: Boolean(row.session_reused),
+      sessionInvalidationReason: row.invalidation_reason,
+      workspaces: parseJson(row.workspaces_json, []),
       runtimeDirectory: row.runtime_directory,
       logPath: row.log_path,
       resultPath: row.result_path,
       startedAt: row.started_at,
       heartbeatAt: row.heartbeat_at,
+      completedAt: row.completed_at,
+    };
+  }
+
+  private scheduleDefinitionFromRow(row: ScheduleDefinitionRow): ScheduleDefinition {
+    const storedBoundary = parseJson<Partial<ScheduleDefinition['automationBoundary']>>(row.automation_boundary_json, {});
+    const currentProjectSettings = this.getProjectSettings(row.project_id);
+    const currentSystemSettings = this.getSettings();
+    return {
+      id: row.id,
+      projectId: row.project_id,
+      projectName: row.project_name,
+      teamId: row.team_id,
+      teamName: row.team_name,
+      sourceTaskId: row.source_task_id,
+      sourceTaskTitle: row.source_task_title,
+      name: row.name,
+      description: row.description,
+      mode: row.mode,
+      triggerType: row.trigger_type,
+      timezone: row.timezone,
+      startAt: row.start_at,
+      intervalValue: row.interval_value,
+      intervalUnit: row.interval_unit,
+      missedPolicy: row.missed_policy,
+      overlapPolicy: row.overlap_policy,
+      automationBoundary: {
+        ...{
+        directoryIds: [], permissions: [], capabilityIds: [], qualityGateIds: [],
+          planContentHash: '', agents: [], capabilities: [], qualityGates: [],
+          projectPermissionMode: currentProjectSettings.permissionMode,
+          networkPolicy: currentSystemSettings.networkPolicy,
+          dependencyInstallPolicy: currentSystemSettings.dependencyInstallPolicy,
+        },
+        ...storedBoundary,
+      },
+      enabled: Boolean(row.enabled),
+      nextRunAt: row.next_run_at,
+      lastTriggeredAt: row.last_triggered_at,
+      archivedAt: row.archived_at,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  private scheduleOccurrenceFromRow(row: ScheduleOccurrenceRow): ScheduleOccurrence {
+    return {
+      id: row.id,
+      scheduleId: row.schedule_id,
+      plannedAt: row.planned_at,
+      status: row.status,
+      taskId: row.task_id,
+      reason: row.reason,
+      createdAt: row.created_at,
+      startedAt: row.started_at,
       completedAt: row.completed_at,
     };
   }
@@ -5538,6 +6402,11 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       heartbeatAt: activeSession?.heartbeat_at ?? jobHeartbeat?.heartbeat_at ?? null,
     } : null;
     const succeeded = steps.filter((step) => step.status === 'succeeded' || step.status === 'skipped').length;
+    const latestStatusEvent = this.database.prepare(`
+      SELECT event_type, message, occurred_at FROM workflow_events
+      WHERE aggregate_id = ? AND event_type NOT LIKE 'run.event.%'
+      ORDER BY seq DESC LIMIT 1
+    `).get(row.id) as { event_type: string; message: string; occurred_at: string } | undefined;
     return {
       id: row.id, projectId: row.project_id, projectName: row.project_name, teamId: row.team_id, teamName: row.team_name,
       title: row.title, description: row.description, expectedOutput: row.expected_output, constraints: row.constraints_text,
@@ -5545,6 +6414,13 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
       flowVersion: row.flow_version ?? 1,
       progress: steps.length > 0 ? Math.round((succeeded / steps.length) * 100) : 0, activeStepId: row.active_step_id,
       createdAt: row.created_at, updatedAt: row.updated_at, plan, steps, snapshot, activeExecution,
+      statusReason: latestStatusEvent ? {
+        type: latestStatusEvent.event_type,
+        message: latestStatusEvent.message,
+        occurredAt: latestStatusEvent.occurred_at,
+      } : null,
+      triggerSource: row.trigger_source ?? 'manual',
+      scheduleOccurrenceId: row.schedule_occurrence_id ?? null,
     };
   }
 
@@ -6012,8 +6888,9 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
         const installation = executorInstallations.find((item) => item.id === executor);
         return {
           executor,
+          executablePath: installation?.path ?? null,
           version: installation?.version ?? null,
-          executableHash: installation?.path ? sha256(installation.path) : null,
+          executableHash: installation?.path ? executableContentHash(installation.path) : null,
           capabilities: installation?.capabilities ?? [],
           selectedModels: [...new Set(agents.filter((agent) => agent.executor === executor).map((agent) => agent.model))],
           health: installation?.health ?? 'unchecked' as const,
@@ -6691,6 +7568,10 @@ ${report.risks.length ? report.risks.map((risk) => `- ${risk}`).join('\n') : '- 
           agentId: agent.id,
           projectionPath: null,
           status: 'frozen' as const,
+          runtimeStatus: 'not_checked' as const,
+          runtimeDetail: {},
+          runtimeCheckedAt: null,
+          lastRunId: null,
           error: null,
           createdAt,
         };
@@ -6928,6 +7809,77 @@ function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
 
+function executableContentHash(path: string): string | null {
+  try {
+    return createHash('sha256').update(readFileSync(path)).digest('hex');
+  } catch {
+    return null;
+  }
+}
+
+function assertValidTimeZone(timeZone: string): void {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone }).format(new Date());
+  } catch {
+    throw new DomainError('SCHEDULE_TIMEZONE_INVALID', '定时任务时区不合法。', 422, { timeZone });
+  }
+}
+
+function nextScheduleTime(schedule: Pick<ScheduleDefinition, 'triggerType' | 'intervalValue' | 'intervalUnit' | 'timezone'>, from: Date): Date {
+  if (schedule.triggerType !== 'interval' || !schedule.intervalValue || !schedule.intervalUnit) return from;
+  const parts = zonedDateParts(from, schedule.timezone);
+  const calendar = new Date(Date.UTC(parts.year, parts.month - 1, parts.day, parts.hour, parts.minute, parts.second));
+  if (schedule.intervalUnit === 'hour') calendar.setUTCHours(calendar.getUTCHours() + schedule.intervalValue);
+  if (schedule.intervalUnit === 'day') calendar.setUTCDate(calendar.getUTCDate() + schedule.intervalValue);
+  if (schedule.intervalUnit === 'week') calendar.setUTCDate(calendar.getUTCDate() + schedule.intervalValue * 7);
+  const desired = {
+    year: calendar.getUTCFullYear(),
+    month: calendar.getUTCMonth() + 1,
+    day: calendar.getUTCDate(),
+    hour: calendar.getUTCHours(),
+    minute: calendar.getUTCMinutes(),
+    second: calendar.getUTCSeconds(),
+  };
+  let candidate = new Date(Date.UTC(desired.year, desired.month - 1, desired.day, desired.hour, desired.minute, desired.second));
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const actual = zonedDateParts(candidate, schedule.timezone);
+    const desiredStamp = Date.UTC(desired.year, desired.month - 1, desired.day, desired.hour, desired.minute, desired.second);
+    const actualStamp = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute, actual.second);
+    const delta = desiredStamp - actualStamp;
+    if (delta === 0) break;
+    candidate = new Date(candidate.getTime() + delta);
+  }
+  if (candidate.getTime() <= from.getTime()) {
+    const fallbackHours = schedule.intervalUnit === 'hour'
+      ? schedule.intervalValue
+      : schedule.intervalUnit === 'day' ? schedule.intervalValue * 24 : schedule.intervalValue * 24 * 7;
+    return new Date(from.getTime() + fallbackHours * 60 * 60 * 1000);
+  }
+  return candidate;
+}
+
+function zonedDateParts(date: Date, timeZone: string): {
+  year: number; month: number; day: number; hour: number; minute: number; second: number;
+} {
+  const formatter = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hourCycle: 'h23',
+  });
+  const parts = Object.fromEntries(formatter.formatToParts(date)
+    .filter((part) => part.type !== 'literal')
+    .map((part) => [part.type, Number(part.value)]));
+  return {
+    year: parts.year ?? date.getUTCFullYear(),
+    month: parts.month ?? date.getUTCMonth() + 1,
+    day: parts.day ?? date.getUTCDate(),
+    hour: parts.hour ?? date.getUTCHours(),
+    minute: parts.minute ?? date.getUTCMinutes(),
+    second: parts.second ?? date.getUTCSeconds(),
+  };
+}
+
 function parseGitHubSkillAddress(address: string): {
   cloneUrl: string;
   canonicalUrl: string;
@@ -7126,14 +8078,28 @@ function sanitizeArtifactType(value: string): string {
 }
 
 function rankKnowledge(items: KnowledgeItem[], query: string): KnowledgeItem[] {
+  return rankKnowledgeWithReasons(items, query).map(({ item }) => item);
+}
+
+function rankKnowledgeWithReasons(items: KnowledgeItem[], query: string): Array<{
+  item: KnowledgeItem;
+  relevanceScore: number;
+  matchedTerms: string[];
+  selectionReason: string;
+}> {
   const terms = contextTerms(query);
   return items.map((item) => {
     const title = item.title.toLowerCase();
     const content = item.content.toLowerCase();
-    const score = terms.reduce((total, term) => total + (title.includes(term) ? 4 : 0) + (content.includes(term) ? 1 : 0), 0);
-    return { item, score };
-  }).sort((left, right) => right.score - left.score || right.item.updatedAt.localeCompare(left.item.updatedAt))
-    .map(({ item }) => item);
+    const titleMatches = terms.filter((term) => title.includes(term));
+    const contentMatches = terms.filter((term) => !titleMatches.includes(term) && content.includes(term));
+    const matchedTerms = [...titleMatches, ...contentMatches].slice(0, 12);
+    const relevanceScore = titleMatches.length * 4 + contentMatches.length;
+    const selectionReason = relevanceScore > 0
+      ? `与当前任务相关：标题命中 ${titleMatches.length} 个词，正文命中 ${contentMatches.length} 个词（${matchedTerms.join('、')}）。`
+      : '未命中直接关键词，作为最近确认的当前有效项目认知补充。';
+    return { item, relevanceScore, matchedTerms, selectionReason };
+  }).sort((left, right) => right.relevanceScore - left.relevanceScore || right.item.updatedAt.localeCompare(left.item.updatedAt));
 }
 
 function contextTerms(value: string): string[] {

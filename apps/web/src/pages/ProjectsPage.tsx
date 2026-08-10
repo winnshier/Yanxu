@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { Alert, Button, Card, Col, Descriptions, Input, Modal, Row, Space, Tag, Typography, message } from 'antd';
-import { FolderOpenOutlined, FolderOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { Alert, Button, Descriptions, Input, Modal, Space, Tag, Typography, message } from 'antd';
+import { ArrowRightOutlined, FolderOpenOutlined, FolderOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from 'react-router-dom';
 import type { ProjectSpaceRestorePreview } from '@yanxu/contracts';
@@ -44,20 +44,41 @@ export function ProjectsPage() {
   return (
     <div className="page-container projects-page">
       <PageHeader eyebrow="项目资产" title="项目" description="项目是任务、目录、计划和经验沉淀的共同边界。" actions={<Space><Button icon={<FolderOpenOutlined />} loading={chooseRestoreSource.isPending} onClick={() => chooseRestoreSource.mutate()}>从 ProjectSpace 恢复</Button><Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建项目</Button></Space>} />
-      <div className="toolbar"><Input allowClear prefix={<SearchOutlined />} placeholder="搜索项目" value={query} onChange={(event) => setQuery(event.target.value)} /></div>
-      <QueryState loading={projects.isLoading} error={projects.error} empty={filtered.length === 0} emptyText="还没有项目，先选择一个本地目录创建项目。" onRetry={() => { void projects.refetch(); }}>
-        <Row gutter={[16, 16]} className="project-grid">
-          {filtered.map((project) => (
-            <Col key={project.id} xs={24} md={12} xl={8}>
-              <Card hoverable className="project-card" onClick={() => { void navigate(`/projects/${project.id}`); }}>
-                <div className="project-icon"><FolderOutlined /></div>
-                <Typography.Title level={4}>{project.name}</Typography.Title>
-                <Typography.Paragraph type="secondary" ellipsis={{ rows: 2 }}>{project.description || '暂无项目简介'}</Typography.Paragraph>
-                <Space wrap><Tag>{project.directories.length} 个目录</Tag>{project.taskSummary.active > 0 && <Tag color="processing">{project.taskSummary.active} 运行中</Tag>}{project.taskSummary.attention > 0 && <Tag color="warning">{project.taskSummary.attention} 待处理</Tag>}</Space>
-              </Card>
-            </Col>
-          ))}
-        </Row>
+      <QueryState loading={projects.isLoading} error={projects.error} empty={(projects.data?.length ?? 0) === 0} emptyText="还没有项目，先选择一个本地目录创建项目。" onRetry={() => { void projects.refetch(); }}>
+        <section className="module-table project-library" aria-label="项目列表">
+          <div className="module-toolbar">
+            <Input allowClear prefix={<SearchOutlined />} placeholder="搜索项目" value={query} onChange={(event) => setQuery(event.target.value)} />
+            <Typography.Text type="secondary">共 {filtered.length} 个项目</Typography.Text>
+          </div>
+          <div className="project-list-header" aria-hidden="true">
+            <span>项目</span><span>目录</span><span>任务状态</span><span>操作</span>
+          </div>
+          <div className="project-list">
+            {filtered.length === 0 && <div className="module-empty">没有匹配的项目。</div>}
+            {filtered.map((project) => (
+              <article
+                key={project.id}
+                className="project-list-row"
+                role="button"
+                tabIndex={0}
+                onClick={() => { void navigate(`/projects/${project.id}`); }}
+                onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') void navigate(`/projects/${project.id}`); }}
+              >
+                <span className="project-list-icon"><FolderOutlined /></span>
+                <div className="project-list-identity">
+                  <Typography.Text strong>{project.name}</Typography.Text>
+                  <Typography.Text type="secondary" ellipsis title={project.description || '暂无项目简介'}>{project.description || '暂无项目简介'}</Typography.Text>
+                </div>
+                <div className="project-list-directory"><Typography.Text>{project.directories.length}</Typography.Text><Typography.Text type="secondary">个关联目录</Typography.Text></div>
+                <div className="project-list-status">
+                  {project.taskSummary.active > 0 ? <Tag color="processing">{project.taskSummary.active} 运行中</Tag> : <Tag>无运行任务</Tag>}
+                  {project.taskSummary.attention > 0 && <Tag color="warning">{project.taskSummary.attention} 待处理</Tag>}
+                </div>
+                <Button type="text" icon={<ArrowRightOutlined />} aria-label={`打开 ${project.name}`} />
+              </article>
+            ))}
+          </div>
+        </section>
       </QueryState>
       <CreateProjectModal open={open} onClose={() => setOpen(false)} onCreated={(id) => { void navigate(`/projects/${id}`); }} />
       <Modal

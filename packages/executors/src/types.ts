@@ -25,7 +25,15 @@ export interface StructuredExecutionInput {
   resumeSessionId?: string;
   policy?: RuntimePermissionPolicy;
   onSessionStarted?: (sessionId: string) => void | Promise<void>;
+  onEvent?: (event: ExecutorEvent) => void | Promise<void>;
   onPermission?: (request: ExecutorPermissionRequest) => Promise<'once' | 'always' | 'reject'>;
+}
+
+export interface ExecutorEvent {
+  kind: 'status' | 'thinking' | 'text' | 'tool_call' | 'tool_result' | 'log' | 'error';
+  message: string;
+  occurredAt: string;
+  data?: Record<string, unknown>;
 }
 
 export interface RuntimePermissionPolicy {

@@ -26,17 +26,20 @@ ReactDOM.createRoot(root).render(
       locale={zhCN}
       theme={{
         token: {
-          colorPrimary: '#4169e1',
-          colorInfo: '#4169e1',
-          colorSuccess: '#1f9d72',
-          colorWarning: '#d88a2c',
-          colorError: '#d34c4c',
-          borderRadius: 10,
+          colorPrimary: '#4f64d9',
+          colorInfo: '#4f64d9',
+          colorSuccess: '#26825f',
+          colorWarning: '#b57821',
+          colorError: '#c54b4b',
+          colorText: '#1c2230',
+          colorTextSecondary: '#6d7482',
+          colorBorderSecondary: '#e3e5ea',
+          borderRadius: 8,
           fontFamily: 'Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
         },
         components: {
           Button: { controlHeight: 38, fontWeight: 600 },
-          Card: { headerFontSize: 15 },
+          Card: { headerFontSize: 14 },
           Menu: { itemBorderRadius: 8 },
         },
       }}

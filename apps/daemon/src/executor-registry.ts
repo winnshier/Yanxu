@@ -7,6 +7,7 @@ export class ExecutorRegistry {
   private installations: ExecutorInstallation[];
   private probePromise: Promise<ExecutorInstallation[]> | null = null;
   private readonly adapters = new Map<ExecutorType, ExecutorAdapter>();
+  private readonly adapterOverrides = new Set<ExecutorType>();
 
   constructor(
     initialInstallations: ExecutorInstallation[] = [
@@ -19,7 +20,10 @@ export class ExecutorRegistry {
   ) {
     this.installations = initialInstallations;
     for (const [executor, adapter] of Object.entries(adapterOverrides)) {
-      if (adapter) this.adapters.set(executor as ExecutorType, adapter);
+      if (adapter) {
+        this.adapters.set(executor as ExecutorType, adapter);
+        this.adapterOverrides.add(executor as ExecutorType);
+      }
     }
   }
 
@@ -35,6 +39,14 @@ export class ExecutorRegistry {
     if (this.probePromise) return this.probePromise;
     this.probePromise = this.probeExecutorsFn()
       .then((installations) => {
+        for (const installation of installations) {
+          const previous = this.get(installation.id);
+          if (!this.adapterOverrides.has(installation.id)
+            && previous
+            && (previous.path !== installation.path || previous.version !== installation.version)) {
+            this.adapters.delete(installation.id);
+          }
+        }
         this.installations = installations;
         return this.installations;
       })
@@ -48,7 +60,7 @@ export class ExecutorRegistry {
     let installation = this.get(executor);
     const checkedAt = installation?.lastCheckedAt ? Date.parse(installation.lastCheckedAt) : Number.NaN;
     const checkedRecently = Number.isFinite(checkedAt) && Date.now() - checkedAt < 15_000;
-    if (!installation || installation.health === 'unchecked' || (installation.health !== 'available' && !checkedRecently)) {
+    if (!installation || installation.health === 'unchecked' || !checkedRecently) {
       await this.probe();
       installation = this.get(executor);
     }
@@ -103,19 +115,37 @@ export class ExecutorRegistry {
     const runtimePath = join(workbenchHome, 'runtime', 'executor-validation', executor, 'runtime');
     mkdirSync(workspacePath, { recursive: true });
     const adapter = await this.adapter(executor);
+    let runtime: Awaited<ReturnType<ExecutorAdapter['startRuntime']>> | null = null;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 60_000);
     try {
-      const runtime = await adapter.startRuntime(workspacePath, runtimePath);
-      await adapter.stopRuntime(runtime);
+      const model = installation.models[0];
+      if (!model) throw new Error(`${installation.name} 未检测到可用于真实调用的模型。`);
+      runtime = await adapter.startRuntime(workspacePath, runtimePath);
+      const result = await adapter.executeStructured<{ ok: boolean }>({
+        runtime,
+        title: '研序 CLI 运行时验证',
+        prompt: '这是一次只读连通性验证。不要调用工具，只返回 ok=true。',
+        model,
+        schema: {
+          type: 'object',
+          properties: { ok: { type: 'boolean', const: true } },
+          required: ['ok'],
+          additionalProperties: false,
+        },
+        abortSignal: controller.signal,
+        toolMode: 'disabled',
+        readOnly: true,
+      });
+      if (!result.output.ok) throw new Error(`${installation.name} 返回了无效的验证结果。`);
       return {
         executor,
         status: 'passed',
-        message: executor === 'opencode'
-          ? `OpenCode ${installation.version ?? ''} 的 serve、SDK health 与终止流程均可用。`.trim()
-          : `Claude Code ${installation.version ?? ''} 的进程、任务配置投影与终止流程均可用；账号授权将在首次真实任务中验证。`.trim(),
+        message: `${installation.name} ${installation.version ?? ''} 已完成真实模型调用、结构化输出校验与终止验证。`.trim(),
         version: installation.version,
         capabilities: installation.capabilities,
         models: installation.models,
-        loginStatus: executor === 'opencode' && installation.models.length > 0 ? 'configured' : 'unknown',
+        loginStatus: 'configured',
         checkedAt,
       };
     } catch (error) {
@@ -129,6 +159,9 @@ export class ExecutorRegistry {
         loginStatus: executor === 'opencode' && installation.models.length > 0 ? 'configured' : 'unknown',
         checkedAt,
       };
+    } finally {
+      clearTimeout(timeout);
+      if (runtime) await adapter.stopRuntime(runtime).catch(() => undefined);
     }
   }
 }

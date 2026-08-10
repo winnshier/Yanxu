@@ -16,6 +16,7 @@ import type {
 } from './types.js';
 import { createStructuredOutputValidator, isStructuredOutputCompatibilityError } from './structured-output.js';
 import { rotateLogFile } from './log-rotation.js';
+import { signalProcessTree } from './process-tree.js';
 
 interface ManagedRuntime extends RuntimeHandle {
   password: string;
@@ -36,11 +37,24 @@ interface PromptResult<T = unknown> {
     error?: { name?: string; data?: { message?: string } };
   };
   parts: Array<{
+    id?: string;
     type: string;
     text?: string;
     tool?: string;
-    state?: { status?: string };
+    state?: {
+      status?: string;
+      input?: unknown;
+      output?: unknown;
+      error?: unknown;
+      title?: string;
+      metadata?: unknown;
+    };
   }>;
+}
+
+interface OpenCodePartEmissionState {
+  textLengths: Map<string, number>;
+  toolStatuses: Map<string, string>;
 }
 
 const structuredRepairAttempts = 2;
@@ -115,6 +129,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         ...capabilityEnvironment,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
     });
     const logPath = join(runtimeDirectory, 'runtime.log');
     rotateLogFile(logPath);
@@ -132,7 +147,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       await this.waitForHealth(handle);
     } catch (error) {
       this.runtimes.delete(handle.id);
-      if (handle.process.exitCode === null) handle.process.kill('SIGTERM');
+      if (handle.process.exitCode === null) signalProcessTree(handle.process, 'SIGTERM');
       throw error;
     }
     return this.publicHandle(handle);
@@ -143,6 +158,12 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const client = this.client(runtime);
     const rules = permissionRules(input.permissionMode ?? 'standard', input.readOnly ?? false, input.policy);
     let session: { id: string } | null = null;
+    await input.onEvent?.({
+      kind: 'status',
+      message: input.resumeSessionId ? '正在验证并恢复 OpenCode Session。' : '正在创建 OpenCode Session。',
+      occurredAt: new Date().toISOString(),
+      data: { requestedSessionId: input.resumeSessionId ?? null },
+    });
     if (input.resumeSessionId) {
       try {
         const existing = unwrap<{ id: string } | undefined>(await client.session.get({
@@ -170,6 +191,15 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       }));
     if (!runtime.sessionIds.includes(session.id)) runtime.sessionIds.push(session.id);
     await input.onSessionStarted?.(session.id);
+    await input.onEvent?.({
+      kind: 'status',
+      message: input.resumeSessionId && session.id === input.resumeSessionId
+        ? 'OpenCode Session 已恢复。'
+        : 'OpenCode Session 已建立。',
+      occurredAt: new Date().toISOString(),
+      data: { sessionId: session.id, resumed: Boolean(input.resumeSessionId && session.id === input.resumeSessionId) },
+    });
+    await this.emitRuntimeCapabilities(client, runtime, input);
     const executionAbort = new AbortController();
     const forwardInputAbort = () => executionAbort.abort();
     if (input.abortSignal?.aborted) executionAbort.abort();
@@ -230,7 +260,21 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     try {
       const result = await Promise.race([promptWorker, permissionGuard]);
       completed = true;
+      await input.onEvent?.({
+        kind: 'status',
+        message: 'OpenCode 已返回结构化结果。',
+        occurredAt: new Date().toISOString(),
+        data: { sessionId: session.id },
+      });
       return result;
+    } catch (error) {
+      await input.onEvent?.({
+        kind: 'error',
+        message: error instanceof Error ? error.message : String(error),
+        occurredAt: new Date().toISOString(),
+        data: { sessionId: session.id },
+      });
+      throw error;
     } finally {
       promptSettled = true;
       if (!completed) abort();
@@ -259,6 +303,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       input.abortSignal,
       { type: 'json_schema', schema: input.schema, retryCount: structuredRepairAttempts },
       input.toolMode,
+      input,
     );
     throwPromptError(data);
     if (data.info.structured === undefined) throw new Error('OpenCode did not return structured output.');
@@ -291,6 +336,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         input.abortSignal,
         undefined,
         input.toolMode,
+        input,
       );
       throwPromptError(data);
       lastResponse = data.parts
@@ -316,6 +362,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     abortSignal?: AbortSignal,
     format?: { type: 'json_schema'; schema: Record<string, unknown>; retryCount: number },
     toolMode: 'enabled' | 'disabled' = 'enabled',
+    eventInput?: StructuredExecutionInput,
   ): Promise<PromptResult<T>> {
     const existingResponse = await client.session.messages({
       sessionID: sessionId,
@@ -337,6 +384,10 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     });
 
     let consecutivePollingErrors = 0;
+    const emissionState: OpenCodePartEmissionState = {
+      textLengths: new Map(),
+      toolStatuses: new Map(),
+    };
     while (true) {
       if (abortSignal?.aborted) throw abortedSessionError();
       if (runtime.process.exitCode !== null) {
@@ -348,6 +399,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
           directory: runtime.workspacePath,
         });
         const messages = unwrap<Array<PromptResult<T>>>(response);
+        if (eventInput) await emitOpenCodeUpdates(eventInput, messages, existingMessageIds, emissionState);
         if (toolMode === 'disabled') {
           const attemptedTool = selectNewToolAttempt(messages, existingMessageIds);
           if (attemptedTool) throw unexpectedToolCallError(attemptedTool);
@@ -397,10 +449,10 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     await Promise.allSettled(managed.sessionIds.map((sessionId) =>
       client.session.abort({ sessionID: sessionId, directory: managed.workspacePath })));
     if (managed.process.exitCode !== null) return;
-    managed.process.kill('SIGTERM');
+    signalProcessTree(managed.process, 'SIGTERM');
     const exited = await waitForProcessExit(managed.process, 5_000);
     if (!exited && managed.process.exitCode === null) {
-      managed.process.kill('SIGKILL');
+      signalProcessTree(managed.process, 'SIGKILL');
       await waitForProcessExit(managed.process, 2_000);
     }
   }
@@ -451,6 +503,42 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     return tools;
   }
 
+  private async emitRuntimeCapabilities(
+    client: SdkClient,
+    runtime: ManagedRuntime,
+    input: StructuredExecutionInput,
+  ): Promise<void> {
+    try {
+      const [skillsResponse, mcpResponse] = await Promise.all([
+        client.app.skills({ directory: runtime.workspacePath }),
+        client.mcp.status({ directory: runtime.workspacePath }),
+      ]);
+      const skills = unwrap<Array<{ name: string; location: string }>>(skillsResponse)
+        .map((skill) => ({ name: skill.name, status: 'loaded', location: skill.location }));
+      const statuses = unwrap<Record<string, { status: string; error?: string }>>(mcpResponse);
+      const mcps = Object.entries(statuses).map(([name, status]) => ({
+        name,
+        status: status.status,
+        ...(status.error ? { error: status.error.slice(0, 2_000) } : {}),
+      }));
+      await input.onEvent?.({
+        kind: 'status',
+        message: `OpenCode 运行时已加载 ${skills.length} 个 Skill，检测到 ${mcps.length} 个 MCP。`,
+        occurredAt: new Date().toISOString(),
+        data: { capabilityRuntime: { skills, mcps } },
+      });
+    } catch (error) {
+      await input.onEvent?.({
+        kind: 'status',
+        message: 'OpenCode 已启动，但运行时能力状态读取失败。',
+        occurredAt: new Date().toISOString(),
+        data: {
+          capabilityRuntimeError: error instanceof Error ? error.message.slice(0, 2_000) : String(error).slice(0, 2_000),
+        },
+      });
+    }
+  }
+
   private async waitForHealth(runtime: ManagedRuntime): Promise<void> {
     const client = this.client(runtime);
     const startedAt = Date.now();
@@ -463,7 +551,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
     }
-    runtime.process.kill('SIGTERM');
+    signalProcessTree(runtime.process, 'SIGTERM');
     throw new Error('Timed out waiting for OpenCode server health check.');
   }
 
@@ -508,6 +596,62 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       if (!settled()) await new Promise((resolve) => setTimeout(resolve, 400));
     }
   }
+}
+
+async function emitOpenCodeUpdates(
+  input: StructuredExecutionInput,
+  messages: PromptResult[],
+  existingMessageIds: ReadonlySet<string>,
+  state: OpenCodePartEmissionState,
+): Promise<void> {
+  if (!input.onEvent) return;
+  for (const message of messages) {
+    const messageId = message.info.id;
+    if (message.info.role !== 'assistant' || !messageId || existingMessageIds.has(messageId)) continue;
+    for (const [partIndex, part] of message.parts.entries()) {
+      const key = `${messageId}:${part.id ?? partIndex}`;
+      if ((part.type === 'text' || /reason|thinking/i.test(part.type)) && part.text) {
+        const previousLength = state.textLengths.get(key) ?? 0;
+        const start = part.text.length >= previousLength ? previousLength : 0;
+        const delta = part.text.slice(start);
+        state.textLengths.set(key, part.text.length);
+        if (delta) {
+          await input.onEvent({
+            kind: part.type === 'text' ? 'text' : 'thinking',
+            message: delta.slice(0, 2_000),
+            occurredAt: new Date().toISOString(),
+            data: { messageId, partId: part.id ?? null },
+          });
+        }
+      } else if (part.tool) {
+        const status = part.state?.status ?? part.type;
+        if (state.toolStatuses.get(key) === status) continue;
+        state.toolStatuses.set(key, status);
+        const completed = /completed|success|failed|error/i.test(status);
+        await input.onEvent({
+          kind: completed ? 'tool_result' : 'tool_call',
+          message: `${part.tool} · ${status}`,
+          occurredAt: new Date().toISOString(),
+          data: {
+            tool: part.tool,
+            status,
+            partType: part.type,
+            messageId,
+            partId: part.id ?? null,
+            input: boundedOpenCodeEventData(part.state?.input),
+            output: boundedOpenCodeEventData(part.state?.output),
+            error: boundedOpenCodeEventData(part.state?.error),
+          },
+        });
+      }
+    }
+  }
+}
+
+function boundedOpenCodeEventData(value: unknown): unknown {
+  if (value === undefined) return null;
+  const serialized = typeof value === 'string' ? value : JSON.stringify(value);
+  return serialized.length <= 2_000 ? value : `${serialized.slice(0, 2_000)}…`;
 }
 
 export function permissionPollingFailure(

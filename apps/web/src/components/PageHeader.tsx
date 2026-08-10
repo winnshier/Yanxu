@@ -11,7 +11,7 @@ interface PageHeaderProps {
 export function PageHeader({ eyebrow, title, description, actions }: PageHeaderProps) {
   return (
     <header className="page-header">
-      <div>
+      <div className="page-header-copy">
         {eyebrow && <div className="page-eyebrow">{eyebrow}</div>}
         <Typography.Title level={2}>{title}</Typography.Title>
         {description && <Typography.Paragraph type="secondary">{description}</Typography.Paragraph>}

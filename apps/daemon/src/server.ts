@@ -7,9 +7,11 @@ import fastifyStatic from '@fastify/static';
 import {
   agentStatusSchema, answerPlanSchema, createAgentSchema, createProjectRequestSchema, createTaskRequestSchema, createTeamSchema, folderSelectionRequestSchema,
   knowledgeDecisionSchema, permissionDecisionSchema, projectCapabilityUpdateSchema, requestPlanRevisionSchema, taskCommandSchema, updateSystemSettingsSchema,
+  createScheduleSchema, updateScheduleSchema,
   type AgentStatusInput, type AnswerPlanInput, type CreateAgentInput, type CreateProjectRequest, type CreateTaskRequest, type CreateTeamInput,
   type FolderSelectionRequest, type KnowledgeDecisionInput, type PermissionDecisionInput, type RequestPlanRevisionInput,
   type ProjectCapabilityUpdateInput, type TaskCommandInput, type UpdateProjectSettingsInput,
+  type CreateScheduleInput, type UpdateScheduleInput,
   YANXU_VERSION,
 } from '@yanxu/contracts';
 import { DomainError } from '@yanxu/core';
@@ -296,6 +298,24 @@ export async function createServer(
   server.put<{ Params: { teamId: string }; Body: CreateTeamInput }>('/api/teams/:teamId', { schema: { body: createTeamSchema } }, (request) =>
     store.updateTeam(request.params.teamId, request.body));
 
+  server.get<{ Querystring: { projectId?: string; archived?: string } }>('/api/schedules', (request) =>
+    store.listSchedules({
+      ...(request.query.projectId ? { projectId: request.query.projectId } : {}),
+      includeArchived: request.query.archived === 'true',
+    }));
+  server.post<{ Body: CreateScheduleInput }>('/api/schedules', { schema: { body: createScheduleSchema } }, (request, reply) =>
+    reply.status(201).send(store.createSchedule(request.body)));
+  server.put<{ Params: { scheduleId: string }; Body: UpdateScheduleInput }>('/api/schedules/:scheduleId', { schema: { body: updateScheduleSchema } }, (request) =>
+    store.updateSchedule(request.params.scheduleId, request.body));
+  server.post<{ Params: { scheduleId: string }; Body: { enabled: boolean } }>('/api/schedules/:scheduleId/status', (request) =>
+    store.setScheduleEnabled(request.params.scheduleId, request.body.enabled));
+  server.post<{ Params: { scheduleId: string } }>('/api/schedules/:scheduleId/run', (request, reply) =>
+    reply.status(202).send(store.triggerScheduleNow(request.params.scheduleId)));
+  server.get<{ Params: { scheduleId: string } }>('/api/schedules/:scheduleId/occurrences', (request) =>
+    store.listScheduleOccurrences(request.params.scheduleId));
+  server.delete<{ Params: { scheduleId: string } }>('/api/schedules/:scheduleId', (request) =>
+    store.archiveSchedule(request.params.scheduleId));
+
   server.get<{ Querystring: { projectId?: string; archived?: string } }>('/api/tasks', (request) =>
     store.listTasks({
       ...(request.query.projectId ? { projectId: request.query.projectId } : {}),
@@ -320,6 +340,38 @@ export async function createServer(
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/plans', (request) => store.listTaskPlans(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/evidence', (request) => store.getTaskEvidence(request.params.taskId));
   server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/diagnostics', (request) => store.getTaskDiagnostics(request.params.taskId));
+  server.get<{ Params: { taskId: string } }>('/api/tasks/:taskId/runs', (request) =>
+    store.listExecutionRuns(request.params.taskId));
+  server.get<{ Params: { taskId: string; runId: string } }>('/api/tasks/:taskId/runs/:runId', (request) =>
+    store.getExecutionRun(request.params.taskId, request.params.runId));
+  server.get<{ Params: { taskId: string; runId: string } }>('/api/tasks/:taskId/runs/:runId/events', (request) =>
+    store.listExecutionRunEvents(request.params.taskId, request.params.runId));
+  server.get<{
+    Params: { taskId: string; runId: string };
+    Querystring: { cursor?: string; limit?: string };
+  }>('/api/tasks/:taskId/runs/:runId/log', (request) => {
+    const run = store.getExecutionRun(request.params.taskId, request.params.runId);
+    const logPath = run.logPath ?? '';
+    const totalBytes = logPath && existsSync(logPath) ? statSync(logPath).size : 0;
+    const limit = Math.min(Math.max(Number(request.query.limit ?? 64 * 1024), 1), 256 * 1024);
+    const requestedCursor = request.query.cursor === undefined ? Math.max(0, totalBytes - limit) : Number(request.query.cursor);
+    const cursor = Math.min(Math.max(Number.isFinite(requestedCursor) ? requestedCursor : 0, 0), totalBytes);
+    const length = Math.min(limit, totalBytes - cursor);
+    const buffer = Buffer.alloc(length);
+    if (length > 0) {
+      const descriptor = openSync(logPath, 'r');
+      try { readSync(descriptor, buffer, 0, length, cursor); } finally { closeSync(descriptor); }
+    }
+    return {
+      taskId: request.params.taskId,
+      source: 'run-runtime' as const,
+      cursor,
+      nextCursor: cursor + length,
+      totalBytes,
+      eof: cursor + length >= totalBytes,
+      content: buffer.toString('utf8'),
+    };
+  });
   server.get<{
     Params: { taskId: string };
     Querystring: { cursor?: string; limit?: string };
@@ -410,7 +462,6 @@ export async function createServer(
       const results = await scheduler.mergeTask(request.params.taskId);
       store.recordDeliveryMerge(request.params.taskId, results);
     }
-    const taskBeforeCommand = store.getTask(request.params.taskId);
     const task = store.commandTask(
       request.params.taskId,
       request.body.command,
@@ -418,10 +469,7 @@ export async function createServer(
       request.body.reason,
       request.body.command === 'confirm' ? executors.list() : [],
     );
-    if (
-      request.body.command === 'stop'
-      || (request.body.command === 'pause' && taskBeforeCommand.status === 'REPLANNING')
-    ) {
+    if (['stop', 'pause', 'cancel'].includes(request.body.command)) {
       await scheduler.abortTask(request.params.taskId);
     }
     return task;
