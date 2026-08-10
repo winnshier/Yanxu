@@ -14,16 +14,6 @@ export interface ClassifiedExecutionFailure {
   suggestedAction: ExecutionFailureAction;
 }
 
-const skillContractCodes = new Set([
-  'SKILL_ARTIFACT_CONTRACT_FAILED',
-  'SKILL_COMPLETION_CHECK_MISSING',
-  'SKILL_COMPLETION_CHECK_FAILED',
-  'SKILL_BLOCK_REASON_REQUIRED',
-  'SKILL_OUTCOME_NOT_ALLOWED',
-  'DELIVERY_REVIEW_ISSUES_REQUIRE_CHANGES',
-  'IMPLEMENTATION_CHANGE_REQUIRED',
-]);
-
 const staleCodes = new Set([
   'STATE_VERSION_CONFLICT',
   'RUN_CONTEXT_STALE',
@@ -64,10 +54,6 @@ export function classifyExecutionFailure(error: unknown): ClassifiedExecutionFai
   if (code && staleCodes.has(code)) {
     category = 'stale_execution';
     suggestedAction = 'discard';
-  } else if (code && skillContractCodes.has(code)) {
-    category = 'skill_contract';
-    retryable = true;
-    suggestedAction = 'retry';
   } else if (code?.includes('RUNTIME_DRIFT') || code?.includes('CREDENTIAL') || code?.includes('CONFIG')) {
     category = 'configuration';
     retryable = false;

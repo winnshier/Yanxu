@@ -1,6 +1,6 @@
 import type {
   AgentProfile, AnswerPlanInput, CreateAgentInput, CreateProjectRequest, CreateTaskRequest, CreateTeamInput, DirectoryProfileVersion,
-  Capability, CapabilityDiscoveryReport, DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectCapability, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SkillDefinition, SystemSettings,
+  Capability, CapabilityDiscoveryReport, DashboardData, ExecutorInstallation, ExecutorRuntimeValidation, FileSelection, FolderSelection, KnowledgeItem, LocalSession, PermissionRequest, Project, ProjectCapability, ProjectSettings, ProjectSpaceIntegrityReport, ProjectSpaceOperation, ProjectSpaceRestorePreview, RoleTemplate, SystemSettings,
   ProjectCapabilityUpdateInput, RequestPlanRevisionInput, RoleTemplateChangePreview, SystemDiagnostics, SystemHealth, Task, TaskCapabilitySnapshot, TaskCommandInput, TaskDiagnostics, TaskEvidence, TaskFileDiff, TaskLogChunk, TaskPlan, Team, UpdateProjectSettingsInput, WorkflowEvent, ExecutionRun, ScheduleDefinition, ScheduleOccurrence, CreateScheduleInput, UpdateScheduleInput,
 } from '@yanxu/contracts';
 
@@ -183,7 +183,7 @@ export const api = {
   teams: () => request<Team[]>('/api/teams'),
   createTeam: (input: CreateTeamInput) => request<Team>('/api/teams', json('POST', input)),
   updateTeam: (id: string, input: CreateTeamInput) => request<Team>(`/api/teams/${id}`, json('PUT', input)),
-  builtins: () => request<{ roles: RoleTemplate[]; skills: SkillDefinition[] }>('/api/builtins'),
+  builtins: () => request<{ roles: RoleTemplate[] }>('/api/builtins'),
   executors: () => request<ExecutorInstallation[]>('/api/executors'),
   probeExecutors: () => request<ExecutorInstallation[]>('/api/executors/probe', json('POST')),
   validateExecutor: (executor: ExecutorInstallation['id']) =>

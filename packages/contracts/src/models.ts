@@ -10,8 +10,6 @@ export type TaskStatus = (typeof taskStatuses)[number];
 export type ExecutorType = 'opencode' | 'claude' | 'codex';
 export type ExecutorHealth = 'available' | 'unavailable' | 'unchecked';
 export type TaskStepStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'skipped';
-export type TaskFlowVersion = 1 | 2;
-export type TaskStepKind = 'legacy_skill' | 'work_unit';
 export type WorkUnitMode = 'read_only' | 'write';
 export type KnowledgeCategory = 'profile' | 'decision' | 'experience' | 'candidate';
 export type CapabilityKind = 'skill' | 'mcp';
@@ -28,7 +26,6 @@ export type ExecutionFailureCategory =
   | 'business_result'
   | 'transient'
   | 'invalid_output'
-  | 'skill_contract'
   | 'permission'
   | 'scope_change'
   | 'model_capability'
@@ -188,7 +185,6 @@ export interface RoleTemplate {
   name: string;
   description: string;
   responsibilities: string[];
-  skillIds: string[];
   defaultPermissions: string[];
   version: string;
   origin: 'builtin' | 'external';
@@ -213,20 +209,6 @@ export interface RoleTemplateChangePreview {
   previous: { version: string; contentHash: string; createdAt: string } | null;
   changedFields: string[];
   instructionChanges: { added: string[]; removed: string[] };
-}
-
-export interface SkillDefinition {
-  id: string;
-  name: string;
-  roleId: string;
-  description: string;
-  inputs: string[];
-  outputs: string[];
-  artifactTypes: string[];
-  completionChecks: string[];
-  permissions: string[];
-  canBlockDelivery: boolean;
-  version: string;
 }
 
 export interface CapabilitySource {
@@ -358,8 +340,7 @@ export interface TaskStep {
   id: string;
   taskId: string;
   position: number;
-  skillId: string;
-  kind?: TaskStepKind;
+  unitKey: string;
   requiredCapabilities?: string[];
   capabilityIds?: string[];
   verification?: string[];
@@ -381,8 +362,7 @@ export interface TaskStep {
 export interface ExecutionPlanStep {
   id: string;
   position: number;
-  skillId: string;
-  kind?: TaskStepKind;
+  unitKey: string;
   requiredCapabilities?: string[];
   capabilityIds?: string[];
   verification?: string[];
@@ -466,8 +446,6 @@ export interface TaskPlan {
   version: number;
   taskVersionId: string;
   taskVersion: number;
-  flowVersion?: TaskFlowVersion;
-  preApprovalSkillIds: string[];
   goal: string;
   scope: string[];
   nonScope: string[];
@@ -526,7 +504,6 @@ export interface TaskRunSnapshot {
     checkedAt: string | null;
   }>;
   roles: RoleTemplate[];
-  skills: SkillDefinition[];
   capabilities?: TaskCapabilitySnapshot[];
   directories: ProjectDirectory[];
   permissionManifests: PermissionManifest[];
@@ -545,7 +522,7 @@ export interface TaskRunSnapshotSummary {
   createdAt: string;
 }
 
-export interface SkillArtifactOutput {
+export interface StepArtifactOutput {
   type: string;
   title?: string;
   content: string;
@@ -557,7 +534,7 @@ export interface ArtifactVersion {
   id: string;
   taskId: string;
   stepId: string;
-  skillId: string;
+  unitKey: string;
   artifactType: string;
   title: string;
   version: number;
@@ -644,7 +621,7 @@ export interface ChangeManifest {
   id: string;
   taskId: string;
   stepId: string;
-  skillId: string;
+  unitKey: string;
   attempt: number;
   directoryId: string;
   baseCommit: string;
@@ -906,7 +883,6 @@ export interface Task {
   forbiddenPaths: string[];
   status: TaskStatus;
   stateVersion: number;
-  flowVersion?: TaskFlowVersion;
   progress: number;
   queuePosition?: number | null;
   activeStepId: string | null;

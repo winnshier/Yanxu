@@ -33,7 +33,7 @@ afterEach(() => {
 });
 
 describe('review enforcement', () => {
-  it('routes changes_required back to implementation instead of delivering the task', () => {
+  it('routes changes_required back to the preceding write WorkUnit instead of delivering the task', () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-review-test-'));
     temporaryDirectories.push(root);
     const repository = join(root, 'repository');
@@ -75,24 +75,26 @@ describe('review enforcement', () => {
       {
         id: 'implementation-step',
         position: 0,
-        skillId: 'implementation',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '内容实施',
         description: '实现功能。',
         inputs: ['计划'],
         expectedOutput: '实现摘要',
         directoryIds: [directoryId],
+        mode: 'write',
       },
       {
         id: 'review-step',
         position: 1,
-        skillId: 'delivery-review',
+        unitKey: 'work-unit',
         agentId: reviewer.id,
         title: '交付评审',
         description: '独立检查实现。',
         inputs: ['实现', '证据'],
         expectedOutput: 'DeliveryReview',
         directoryIds: [directoryId],
+        requiresIndependentSession: true,
       },
     ];
     task = store.saveComposedPlan(task.id, {
@@ -136,9 +138,9 @@ describe('review enforcement', () => {
       INSERT INTO jobs(
         id, type, aggregate_id, payload_json, status, priority, available_at,
         attempt, max_attempts, dedupe_key, created_at, updated_at
-      ) VALUES (?, 'RUN_SKILL_STEP', ?, '{}', 'FAILED', 90, ?, 3, 3, ?, ?, ?)
+      ) VALUES (?, 'RUN_WORK_UNIT', ?, '{}', 'FAILED', 90, ?, 3, 3, ?, ?, ?)
     `).run(
-      'legacy-review-fix-job',
+      'historical-review-fix-job',
       task.id,
       timestamp,
       `task:${task.id}:review-fix:${implementation.id}:cycle:1`,
@@ -150,7 +152,7 @@ describe('review enforcement', () => {
       summary: '缺少异常路径处理。',
       issues: ['空输入会导致未处理异常'],
       artifacts: [{ type: 'delivery-review', content: '# Review\n\n必须补充空输入处理。' }],
-      completionChecks: [
+      verificationChecks: [
         { check: '结论引用实际证据', status: 'passed', evidence: '引用 feature.txt。' },
         { check: '偏差和限制未被隐藏', status: 'failed', evidence: '发现空输入缺口。' },
       ],
@@ -162,7 +164,7 @@ describe('review enforcement', () => {
       expect.objectContaining({ artifactType: 'implementation-report' }),
       expect.objectContaining({ artifactType: 'delivery-review' }),
     ]);
-    expect(store.listEvents(task.id).some((event) => event.type === 'skill_step.changes_required')).toBe(true);
+    expect(store.listEvents(task.id).some((event) => event.type === 'work_unit.changes_required')).toBe(true);
     const correctionJob = database.prepare(`
       SELECT status, dedupe_key FROM jobs
       WHERE aggregate_id = ? AND dedupe_key LIKE ?
@@ -227,7 +229,7 @@ describe('review enforcement', () => {
         {
           id: 'technical-design-step',
           position: 0,
-          skillId: 'technical-design',
+          unitKey: 'work-unit',
           agentId: designer.id,
           title: '技术方案设计',
           description: '输出技术方案。',
@@ -238,13 +240,14 @@ describe('review enforcement', () => {
         {
           id: 'document-review-step',
           position: 1,
-          skillId: 'delivery-review',
+          unitKey: 'work-unit',
           agentId: reviewer.id,
           title: '文档交付评审',
           description: '独立检查技术方案。',
           inputs: ['TechnicalPlan'],
           expectedOutput: 'DeliveryReview',
           directoryIds: [directoryId],
+          requiresIndependentSession: true,
         },
       ],
       qualityGates: [],

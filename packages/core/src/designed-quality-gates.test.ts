@@ -105,7 +105,7 @@ describe('test-designed quality gates', () => {
       steps: [{
         id: 'test-design-step',
         position: 0,
-        skillId: 'test-design',
+        unitKey: 'work-unit',
         agentId: tester.id,
         title: '测试设计',
         description: '生成更窄的专项门禁。',

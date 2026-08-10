@@ -25,7 +25,7 @@ afterEach(() => {
 });
 
 describe('automatic failure policy', () => {
-  it('allows two implementation fixes, one automatic replan, then blocks', () => {
+  it('allows two write-unit fixes, one automatic replan, then blocks', () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-retry-policy-'));
     roots.push(root);
     const repository = join(root, 'repository');
@@ -60,13 +60,14 @@ describe('automatic failure policy', () => {
       steps: [{
         id: 'retry-implementation',
         position: 0,
-        skillId: 'implementation',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '实施',
         description: '尝试修复。',
         inputs: ['需求'],
         expectedOutput: '实现摘要',
         directoryIds: [directoryId],
+        mode: 'write',
       }],
       qualityGates: [],
     });

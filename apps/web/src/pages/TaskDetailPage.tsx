@@ -68,8 +68,7 @@ function describePlanChanges(current: TaskPlan, previous?: TaskPlan): string[] {
     changes.push('范围或成功标准已调整');
   }
   const stepSignature = (plan: TaskPlan) => plan.steps.map((step) => ({
-    kind: step.kind,
-    skillId: step.skillId,
+    unitKey: step.unitKey,
     title: step.title,
     expectedOutput: step.expectedOutput,
     directoryIds: step.directoryIds,
@@ -301,8 +300,8 @@ export function TaskDetailPage() {
             className="settings-card"
             type="warning"
             showIcon
-            message="这个旧版计划还没有候选方案"
-            description="你可以填写自定义方案，或使用页面上方“请求修改”让协调器按新规则重新生成推荐与备选方案。"
+            message="计划问题缺少候选方案"
+            description="请请求协调器重新规划并生成推荐方案、备选方案和自定义入口。"
           />}
           <div className="settings-card">{data.plan.questions.map((question) => {
             const options = question.options ?? [];
@@ -350,9 +349,7 @@ export function TaskDetailPage() {
             const team = teams.data?.find((item) => item.id === data.teamId);
             const compatibleAgents = (agents.data ?? []).filter((agent) => {
               if (!team?.memberIds.includes(agent.id)) return false;
-              if (agent.status !== 'active') return false;
-              if (step.kind === 'work_unit') return true;
-              return builtins.data?.roles.find((role) => role.id === agent.roleId)?.skillIds.includes(step.skillId);
+              return agent.status === 'active';
             });
             return <List.Item>
               <List.Item.Meta
@@ -360,8 +357,8 @@ export function TaskDetailPage() {
                 description={<Space direction="vertical" size={2}>
                   <Typography.Text type="secondary">{step.description}</Typography.Text>
                   <Typography.Text type="secondary">输入：{step.inputs.join('、') || '当前任务与上游产物'}</Typography.Text>
-                  {step.kind === 'work_unit' && <Typography.Text type="secondary">能力：{step.requiredCapabilities?.join('、') || '通用项目能力'} · {step.mode === 'write' ? '可写' : '只读'}</Typography.Text>}
-                  {step.kind === 'work_unit' && <Typography.Text type="secondary">验证：{step.verification?.join('；') || '对照成功标准与质量门禁'}</Typography.Text>}
+                  <Typography.Text type="secondary">能力：{step.requiredCapabilities?.join('、') || '通用项目能力'} · {step.mode === 'write' ? '可写' : '只读'}</Typography.Text>
+                  <Typography.Text type="secondary">验证：{step.verification?.join('；') || '对照成功标准与质量门禁'}</Typography.Text>
                   <Typography.Text type="secondary">产出：{step.expectedOutput}</Typography.Text>
                 </Space>}
               />
@@ -373,7 +370,7 @@ export function TaskDetailPage() {
                     options={compatibleAgents.map((agent) => ({ label: `${agent.name} · ${agent.model}`, value: agent.id }))}
                   />
                 </Form.Item>
-                {step.kind === 'work_unit' && <Form.Item noStyle shouldUpdate>
+                <Form.Item noStyle shouldUpdate>
                   {({ getFieldValue }) => {
                     const selectedAgentId = getFieldValue(['stepAgents', step.id]) as string | null;
                     const selectedAgent = agents.data?.find((agent) => agent.id === selectedAgentId);
@@ -390,7 +387,7 @@ export function TaskDetailPage() {
                       <Select mode="multiple" allowClear placeholder="按需选择，可为空" options={capabilityOptions} />
                     </Form.Item>{unavailableDefaults.length > 0 && <Alert type="info" showIcon title="人员默认能力未在本项目启用" description={`不会自动装载：${unavailableDefaults.map((id) => capabilitiesName(id, projectCapabilities.data ?? [])).join('、')}。可在项目能力页安装/启用，或保持当前降级方案。`} />}</>;
                   }}
-                </Form.Item>}
+                </Form.Item>
               </Space>
             </List.Item>;
           }} />
@@ -460,7 +457,7 @@ export function TaskDetailPage() {
     },
     {
       key: 'execution', label: '执行', children: <Space direction="vertical" size="middle" className="full-width">
-        <Card title={data.flowVersion === 2 ? 'WorkUnit 执行链' : 'Skill 执行链'}><Timeline items={data.steps.map((step) => ({
+        <Card title="WorkUnit 执行链"><Timeline items={data.steps.map((step) => ({
           key: step.id,
           color: step.status === 'succeeded' ? 'green' : step.status === 'running' ? 'blue' : step.status === 'failed' ? 'red' : 'gray',
           children: <div><Typography.Text strong>{step.title}</Typography.Text><Typography.Paragraph type="secondary">{step.summary ?? step.description}</Typography.Paragraph><Space wrap><Tag>{step.status}</Tag>{step.attempt > 0 && <Tag color="orange">第 {step.attempt} 次尝试</Tag>}{(taskCapabilities.data ?? []).filter((item) => item.stepId === step.id).map((item) => <Tag
@@ -643,7 +640,6 @@ export function TaskDiagnosticsPanel({
     business_result: '业务结果',
     transient: '瞬时故障',
     invalid_output: '输出不合法',
-    skill_contract: 'Skill 契约',
     permission: '权限问题',
     scope_change: '范围变化',
     model_capability: '模型能力',
@@ -874,7 +870,7 @@ function ExecutionEvidence({ taskId, evidence }: { taskId: string; evidence: Tas
           <List.Item.Meta
             title={<Space><Typography.Text>{item.title}</Typography.Text><Tag>v{item.version}</Tag><Tag color={item.status === 'superseded' ? 'default' : 'blue'}>{item.status}</Tag></Space>}
             description={<Space direction="vertical" className="full-width" size={4}>
-              <Typography.Text className="mono-text" type="secondary">{item.contentHash.slice(0, 12)} · {item.skillId}</Typography.Text>
+              <Typography.Text className="mono-text" type="secondary">{item.contentHash.slice(0, 12)} · {item.unitKey}</Typography.Text>
               <MarkdownContent
                 className="artifact-content"
                 content={evidence.artifactPreviews.find((preview) => preview.artifactId === item.id)?.content || '产物正文不可用'}

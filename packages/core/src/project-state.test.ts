@@ -75,7 +75,7 @@ describe('ProjectSpace state reconstruction', () => {
       steps: [{
         id: 'restore-implementation',
         position: 0,
-        skillId: 'implementation',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '形成恢复证据',
         description: '保留计划与快照。',

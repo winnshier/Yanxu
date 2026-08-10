@@ -17,8 +17,8 @@ describe('execution failure classification', () => {
       .toMatchObject({ category: 'model_capability', retryable: false, suggestedAction: 'await_user' });
   });
 
-  it('allows one guarded correction for a deterministic skill contract failure', () => {
-    expect(classifyExecutionFailure(new DomainError('SKILL_COMPLETION_CHECK_FAILED', 'review failed', 422)))
-      .toMatchObject({ category: 'skill_contract', retryable: true, suggestedAction: 'retry' });
+  it('does not give removed fixed-contract failures a special retry path', () => {
+    expect(classifyExecutionFailure(new DomainError('WORK_UNIT_RESULT_INVALID', 'review failed', 422)))
+      .toMatchObject({ category: 'system', retryable: false, suggestedAction: 'await_user' });
   });
 });

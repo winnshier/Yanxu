@@ -115,7 +115,7 @@ describe('capability registry', () => {
       goal: '完成评审', scope: ['项目目录'], nonScope: ['远程发布'], successCriteria: ['形成结论'],
       assumptions: [], risks: [], questions: [], permissions: [], qualityGates: [],
       steps: [{
-        id: 'review', position: 0, skillId: 'work-unit', kind: 'work_unit', agentId: agent.id,
+        id: 'review', position: 0, unitKey: 'work-unit', agentId: agent.id,
         title: '评审 React 改动', description: '按项目 Skill 检查。', inputs: [], expectedOutput: '评审结论',
         directoryIds: [project.directories[0]!.id], requiredCapabilities: ['React 评审'], capabilityIds: [capability.id],
         verification: ['核对检查项'], mode: 'read_only', requiresIndependentSession: false,
@@ -148,7 +148,7 @@ describe('capability registry', () => {
       goal: '完成 API 评审', scope: ['项目目录'], nonScope: [], successCriteria: ['形成结论'],
       assumptions: [], risks: [], questions: [], permissions: [], qualityGates: [],
       steps: [{
-        id: 'api-review', position: 0, skillId: 'work-unit', kind: 'work_unit', agentId: agent.id,
+        id: 'api-review', position: 0, unitKey: 'work-unit', agentId: agent.id,
         title: '评审 API 改动', description: '按项目 Skill 检查。', inputs: [], expectedOutput: 'API 评审结论',
         directoryIds: [project.directories[0]!.id], requiredCapabilities: ['API 评审'], capabilityIds: [secondCapability.id],
         verification: ['核对检查项'], mode: 'read_only', requiresIndependentSession: false,

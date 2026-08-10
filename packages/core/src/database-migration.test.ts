@@ -23,7 +23,14 @@ describe('database migration recovery', () => {
     legacy.exec(`
       CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
       CREATE TABLE legacy_marker (value TEXT NOT NULL);
-      CREATE TABLE tasks (id TEXT PRIMARY KEY);
+      CREATE TABLE tasks (id TEXT PRIMARY KEY, flow_version INTEGER NOT NULL DEFAULT 1);
+      CREATE TABLE task_steps (
+        id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        unit_kind TEXT NOT NULL DEFAULT 'legacy_skill'
+      );
+      CREATE TABLE artifact_versions (id TEXT PRIMARY KEY, skill_id TEXT NOT NULL);
+      CREATE TABLE jobs (id TEXT PRIMARY KEY, type TEXT NOT NULL);
       CREATE TABLE execution_runs (id TEXT PRIMARY KEY);
       CREATE TABLE agent_sessions (id TEXT PRIMARY KEY, executor TEXT, model TEXT);
       CREATE TABLE task_capability_snapshots (id TEXT PRIMARY KEY, task_id TEXT NOT NULL);
@@ -37,6 +44,10 @@ describe('database migration recovery', () => {
         restored_at TEXT
       );
       INSERT INTO legacy_marker(value) VALUES ('before-upgrade');
+      INSERT INTO tasks(id, flow_version) VALUES ('task_old', 1);
+      INSERT INTO task_steps(id, skill_id, unit_kind) VALUES ('step_old', 'implementation', 'legacy_skill');
+      INSERT INTO artifact_versions(id, skill_id) VALUES ('artifact_old', 'implementation');
+      INSERT INTO jobs(id, type) VALUES ('job_old', 'RUN_SKILL_STEP');
     `);
     const insert = legacy.prepare('INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)');
     for (let version = 1; version < DATABASE_SCHEMA_VERSION; version += 1) {
@@ -56,6 +67,15 @@ describe('database migration recovery', () => {
       status: 'created',
     });
     expect(existsSync(recovery.backup_path)).toBe(true);
+    expect((upgraded.prepare('SELECT unit_key FROM task_steps WHERE id = ?').get('step_old') as { unit_key: string }).unit_key)
+      .toBe('implementation');
+    expect((upgraded.prepare('SELECT unit_key FROM artifact_versions WHERE id = ?').get('artifact_old') as { unit_key: string }).unit_key)
+      .toBe('implementation');
+    expect(upgraded.prepare("SELECT id FROM jobs WHERE type = 'RUN_SKILL_STEP'").get()).toBeUndefined();
+    expect((upgraded.pragma('table_info(tasks)') as Array<{ name: string }>).map((column) => column.name))
+      .not.toContain('flow_version');
+    expect((upgraded.pragma('table_info(task_steps)') as Array<{ name: string }>).map((column) => column.name))
+      .not.toContain('unit_kind');
     upgraded.close();
 
     const rollback = new Database(recovery.backup_path, { readonly: true });
@@ -87,5 +107,21 @@ describe('database migration recovery', () => {
       .run(DATABASE_SCHEMA_VERSION + 1, new Date().toISOString());
     future.close();
     expect(() => openDatabase(databasePath)).toThrow('newer than this application supports');
+  });
+
+  it('creates a fresh schema without legacy task-flow columns', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-fresh-schema-'));
+    roots.push(root);
+    const databasePath = join(root, 'system', 'app.db');
+    const database = openDatabase(databasePath);
+    const columns = (table: string) => (database.pragma(`table_info(${table})`) as Array<{ name: string }>)
+      .map((column) => column.name);
+    expect(columns('tasks')).not.toContain('flow_version');
+    expect(columns('task_steps')).toContain('unit_key');
+    expect(columns('task_steps')).not.toEqual(expect.arrayContaining(['skill_id', 'unit_kind']));
+    expect(columns('artifact_versions')).toContain('unit_key');
+    expect(columns('artifact_versions')).not.toContain('skill_id');
+    expect(database.pragma('quick_check')).toEqual([{ quick_check: 'ok' }]);
+    database.close();
   });
 });

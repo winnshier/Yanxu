@@ -12,7 +12,7 @@ import type {
   StructuredExecutionResult,
 } from '@yanxu/executors';
 import { ExecutorRegistry } from './executor-registry.js';
-import { Scheduler, type SkillResult } from './scheduler.js';
+import { Scheduler, type WorkUnitResult } from './scheduler.js';
 
 const temporaryDirectories: string[] = [];
 
@@ -89,18 +89,23 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
     if (!input.runtime.sessionIds.includes(sessionId)) input.runtime.sessionIds.push(sessionId);
     await input.onSessionStarted?.(sessionId);
 
-    if (input.title.startsWith('确认前技能选择')) {
+    if (input.title.startsWith('需求规格判断')) {
       return this.result<T>(sessionId, {
-        skillIds: this.configuration.fullFlow ? ['requirement-specification'] : [],
+        required: this.configuration.fullFlow,
         rationale: this.configuration.fullFlow ? '完整研发需要先形成可确认的需求规格。' : '恢复测试使用已明确的实施范围。',
       });
     }
     if (input.title.startsWith('需求规格')) {
-      return this.result<T>(sessionId, skillResult(
-        'requirement-spec',
-        '# RequirementSpec\n\n## 成功标准\n\n- 功能可执行并通过自动化验证。',
-        ['目标与成功标准可验证', '歧义已显式列出'],
-      ));
+      return this.result<T>(sessionId, {
+        status: 'succeeded',
+        summary: '需求规格已生成',
+        artifact: {
+          type: 'requirement-spec',
+          content: '# RequirementSpec\n\n## 成功标准\n\n- 功能可执行并通过自动化验证。',
+        },
+        issues: [],
+        assumptions: [],
+      });
     }
     if (input.title.startsWith('研序计划')) {
       this.planningAttempts += 1;
@@ -123,7 +128,7 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
       return this.result<T>(sessionId, this.plan());
     }
     if (input.title.includes('技术方案')) {
-      return this.result<T>(sessionId, skillResult(
+      return this.result<T>(sessionId, workUnitResult(
         'technical-plan',
         '# Technical Plan\n\n在隔离分支新增 feature.txt。',
         ['列出影响范围', '列出验证路径'],
@@ -148,7 +153,7 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
           `implementation attempt ${this.implementationAttempts}\n`,
         );
       }
-      const output = skillResult(
+      const output = workUnitResult(
         'implementation-report',
         '# Implementation\n\n已新增 feature.txt。',
         ['变更位于批准范围', '实际文件清单可由 Git 重建'],
@@ -158,21 +163,22 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
         output.status = 'blocked';
         output.summary = '依赖安装被运行环境拒绝。';
         output.issues = ['计划批准的安装命令未进入运行时白名单。'];
-        output.completionChecks[1] = {
+        output.reportedChecks = ['现场文件已写入，但尚未形成 checkpoint。'];
+        output.verificationChecks = [{
           check: '实际文件清单可由 Git 重建',
           status: 'failed',
           evidence: '现场文件已写入，但尚未形成 checkpoint。',
-        };
+        }];
       }
       return this.result<T>(sessionId, output);
     }
     if (input.title.includes('测试设计')) {
-      const output = skillResult(
+      const output = workUnitResult(
         'test-plan',
         '# Test Plan\n\n执行已批准基础门禁和关键场景。',
         ['覆盖成功标准', '标明豁免与风险'],
       );
-      output.artifacts[0] = {
+      output.artifacts![0] = {
         type: 'test-plan',
         content: '# Test Plan\n\n执行已批准基础门禁和关键场景。',
         metadata: {
@@ -189,14 +195,14 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
       return this.result<T>(sessionId, output);
     }
     if (input.title.includes('测试执行')) {
-      return this.result<T>(sessionId, skillResult(
+      return this.result<T>(sessionId, workUnitResult(
         'test-report',
         '# Test Report\n\n独立门禁由研序执行。',
         ['所有非豁免门禁有结果', '失败有可复现证据'],
       ));
     }
     if (input.title.includes('交付评审')) {
-      return this.result<T>(sessionId, skillResult(
+      return this.result<T>(sessionId, workUnitResult(
         'delivery-review',
         '# Delivery Review\n\n需求、变更和门禁证据一致。',
         ['结论引用实际证据', '偏差和限制未被隐藏'],
@@ -223,13 +229,13 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
   private plan() {
     const steps = this.configuration.fullFlow
       ? [
-        this.step('technical-design', this.configuration.developerId, '技术方案', 'TechnicalPlan', 0),
-        this.step('implementation', this.configuration.developerId, '内容实施', '实现摘要', 1),
-        this.step('test-design', this.configuration.testerId ?? '', '测试设计', 'TestPlan', 2),
-        this.step('test-execution', this.configuration.testerId ?? '', '测试执行', '测试报告', 3),
-        this.step('delivery-review', this.configuration.reviewerId ?? '', '交付评审', 'DeliveryReview', 4),
+        this.step(this.configuration.developerId, '技术方案', 'TechnicalPlan', 0, 'read_only'),
+        this.step(this.configuration.developerId, '内容实施', '实现摘要', 1, 'write'),
+        this.step(this.configuration.testerId ?? '', '测试设计', 'TestPlan', 2, 'read_only'),
+        this.step(this.configuration.testerId ?? '', '测试执行', '测试报告', 3, 'read_only'),
+        this.step(this.configuration.reviewerId ?? '', '交付评审', 'DeliveryReview', 4, 'read_only', true),
       ]
-      : [this.step('implementation', this.configuration.developerId, '内容实施', '实现摘要', 0)];
+      : [this.step(this.configuration.developerId, '内容实施', '实现摘要', 0, 'write')];
     return {
       goal: '自动完成任务并形成证据',
       scope: ['关联目录'],
@@ -251,10 +257,15 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
     };
   }
 
-  private step(skillId: string, agentId: string, title: string, expectedOutput: string, position: number) {
-    const mode = skillId === 'implementation' ? 'write' as const : 'read_only' as const;
+  private step(
+    agentId: string,
+    title: string,
+    expectedOutput: string,
+    position: number,
+    mode: 'read_only' | 'write',
+    requiresIndependentSession = false,
+  ) {
     return {
-      skillId,
       agentId,
       title,
       description: `${title}自动化步骤。`,
@@ -264,12 +275,12 @@ class FakeOpenCodeAdapter implements ExecutorAdapter {
       requiredCapabilities: [`${title}能力`],
       verification: [`核对${title}结果`],
       mode,
-      requiresIndependentSession: skillId === 'delivery-review',
+      requiresIndependentSession,
     };
   }
 }
 
-function skillResult(artifactType: string, content: string, checks: string[]): SkillResult {
+function workUnitResult(artifactType: string, content: string, checks: string[]): WorkUnitResult {
   return {
     status: 'succeeded',
     summary: `${artifactType} completed`,
@@ -277,8 +288,8 @@ function skillResult(artifactType: string, content: string, checks: string[]): S
     issues: [],
     assumptions: [],
     requestedScopeChanges: [],
-    reportedChecks: [],
-    completionChecks: checks.map((check) => ({ check, status: 'passed', evidence: `${check} 已验证。` })),
+    reportedChecks: checks,
+    verificationChecks: checks.map((check) => ({ check, status: 'passed', evidence: `${check} 已验证。` })),
   };
 }
 
@@ -311,12 +322,9 @@ describe('scheduler end-to-end', () => {
       expect(fixture.store.getTaskEvidence(task.id).preApprovalArtifacts).toEqual([
         expect.objectContaining({ artifactType: 'requirement-spec', status: 'generated' }),
       ]);
-      expect(task.plan).toMatchObject({
-        preApprovalSkillIds: ['requirement-specification'],
-        taskVersion: 2,
-      });
+      expect(task.plan).toMatchObject({ taskVersion: 2 });
       const coordinatorExecutions = fixture.adapter.executions.filter((execution) =>
-        execution.title.startsWith('确认前技能选择')
+        execution.title.startsWith('需求规格判断')
         || execution.title.startsWith('需求规格')
         || execution.title.startsWith('研序计划'));
       expect(coordinatorExecutions).toHaveLength(3);
@@ -361,8 +369,12 @@ describe('scheduler end-to-end', () => {
       const deliveredEvidence = fixture.store.getTaskEvidence(task.id);
       expect(deliveredEvidence).toMatchObject({
         preApprovalArtifacts: [expect.objectContaining({ status: 'approved' })],
-        designedQualityGates: [],
-        gateAttempts: [expect.objectContaining({ status: 'passed' })],
+        designedQualityGates: expect.arrayContaining([
+          expect.objectContaining({ name: 'critical acceptance', required: true }),
+        ]),
+        gateAttempts: expect.arrayContaining([
+          expect.objectContaining({ status: 'passed' }),
+        ]),
       });
       const technicalExecution = fixture.adapter.executions.find((execution) => execution.title.includes('技术方案'));
       const implementationExecution = fixture.adapter.executions.find((execution) => execution.title.includes('内容实施'));
@@ -476,7 +488,6 @@ describe('scheduler end-to-end', () => {
         () => fixture.store.getTask(fixture.taskId),
         (current) => current.status === 'WAITING_PLAN_APPROVAL',
       );
-      expect(task.plan?.preApprovalSkillIds).toEqual([]);
       expect(fixture.store.getTaskEvidence(task.id).preApprovalArtifacts).toEqual([]);
       fixture.store.commandTask(task.id, 'confirm', task.stateVersion);
       task = await waitFor(
@@ -705,7 +716,6 @@ describe('scheduler end-to-end', () => {
         () => fixture.store.getTask(fixture.taskId),
         (current) => current.status === 'WAITING_PLAN_APPROVAL',
       );
-      expect(task.plan?.preApprovalSkillIds).toEqual(['requirement-specification']);
       expect(fixture.store.getTaskEvidence(task.id).preApprovalArtifacts.at(-1))
         .toMatchObject({ artifactType: 'requirement-spec', version: 1, status: 'generated' });
 
@@ -719,7 +729,6 @@ describe('scheduler end-to-end', () => {
         () => fixture.store.getTask(fixture.taskId),
         (current) => current.status === 'WAITING_REAPPROVAL',
       );
-      expect(task.plan?.preApprovalSkillIds).toEqual(['requirement-specification']);
       expect(task.plan?.preApprovalArtifacts).toEqual([
         expect.objectContaining({ artifactType: 'requirement-spec', version: 2, status: 'generated' }),
       ]);

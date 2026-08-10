@@ -34,20 +34,12 @@ describe('plan question decisions', () => {
     })).toEqual({ q_format: '同时交付 CSV 和 JSON。' });
   });
 
-  it('restores a previously selected option and supports legacy custom-only questions', () => {
+  it('restores a previously selected coordinator option', () => {
     expect(buildPlanQuestionFormAnswers([{
       ...questions[0]!,
       answer: '使用 JSON 格式交付。',
     }])).toEqual({
       q_format: { optionId: 'option_json', custom: '' },
-    });
-    expect(buildPlanQuestionFormAnswers([{
-      id: 'legacy',
-      question: '旧问题',
-      options: [],
-      answer: null,
-    }])).toEqual({
-      legacy: { optionId: 'custom', custom: '' },
     });
   });
 });

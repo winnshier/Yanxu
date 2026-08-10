@@ -44,6 +44,7 @@ const migrations = [
   { version: 24, file: '024_execution_runs.sql' },
   { version: 25, file: '025_schedules.sql' },
   { version: 26, file: '026_runtime_evidence.sql' },
+  { version: 27, file: '027_remove_legacy_task_flow.sql' },
 ] as const;
 
 export const DATABASE_SCHEMA_VERSION = migrations.at(-1)!.version;

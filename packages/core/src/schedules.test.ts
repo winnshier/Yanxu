@@ -38,7 +38,7 @@ describe('project schedules', () => {
       goal: '生成项目巡检报告', scope: ['project'], nonScope: ['修改文件'], successCriteria: ['报告可追溯'],
       assumptions: [], risks: [], questions: [], permissions: ['只读项目目录'],
       steps: [{
-        id: 'scheduled-report', position: 0, kind: 'work_unit', skillId: 'work-unit', agentId: agent.id,
+        id: 'scheduled-report', position: 0, unitKey: 'work-unit', agentId: agent.id,
         title: '生成报告', description: '只读检查。', inputs: [], expectedOutput: '报告', directoryIds: [directoryId],
         requiredCapabilities: [], capabilityIds: [], verification: ['报告存在'], mode: 'read_only', requiresIndependentSession: false,
       }],

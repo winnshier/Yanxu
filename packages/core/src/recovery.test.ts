@@ -102,7 +102,7 @@ describe('scheduler recovery', () => {
       steps: [{
         id: 'orphan-implementation',
         position: 0,
-        skillId: 'implementation',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '内容实施',
         description: '产生实际文件变更。',
@@ -130,7 +130,7 @@ describe('scheduler recovery', () => {
       SELECT id, type, status, dedupe_key FROM jobs WHERE aggregate_id = ?
     `).get(task.id) as { id: string; type: string; status: string; dedupe_key: string };
     expect(recoveredJob).toMatchObject({
-      type: 'RUN_SKILL_STEP',
+      type: 'RUN_WORK_UNIT',
       status: 'READY',
     });
     expect(recoveredJob.dedupe_key).toContain('orphan-recovery');
@@ -138,7 +138,7 @@ describe('scheduler recovery', () => {
       expect.objectContaining({
         jobId: recoveredJob.id,
         reason: 'active_task_without_job',
-        action: 'run_skill_step_enqueued',
+        action: 'run_work_unit_enqueued',
       }),
     ]);
     expect(store.listEvents(task.id)).toEqual(expect.arrayContaining([
@@ -185,7 +185,7 @@ describe('scheduler recovery', () => {
       steps: [{
         id: 'current-implementation',
         position: 0,
-        skillId: 'implementation',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '当前计划实施',
         description: '只执行当前计划。',
@@ -211,7 +211,7 @@ describe('scheduler recovery', () => {
     const historicalStepId = 'historical-technical-design';
     database.prepare(`
       INSERT INTO task_steps(
-        id, task_id, position, skill_id, agent_id, title, description,
+        id, task_id, position, unit_key, agent_id, title, description,
         inputs_json, expected_output, directory_ids_json, status
       ) VALUES (?, ?, 1001, 'technical-design', ?, '旧计划技术设计', '不得再次执行',
         '[]', '旧计划产物', ?, 'skipped')

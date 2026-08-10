@@ -325,7 +325,7 @@ function taskFixture(projectId: string, directoryId: string): Task {
     triggerSource: 'manual', scheduleOccurrenceId: null,
     plan: {
       id: 'plan_test', taskId: 'task_test1234567890', version: 1,
-      taskVersionId: 'taskv_test', taskVersion: 1, preApprovalSkillIds: [],
+      taskVersionId: 'taskv_test', taskVersion: 1,
       goal: 'Test', scope: ['repository'], nonScope: [],
       successCriteria: [], assumptions: [], risks: [], questions: [], permissions: [], qualityGates: [],
       preApprovalArtifacts: [],

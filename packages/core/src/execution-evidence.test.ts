@@ -89,7 +89,7 @@ describe('execution evidence chain', () => {
       {
         id: 'draft_requirement',
         position: 0,
-        skillId: 'requirement-specification',
+        unitKey: 'work-unit',
         agentId: product.id,
         title: '需求规格',
         description: '固化验收标准。',
@@ -100,7 +100,7 @@ describe('execution evidence chain', () => {
       {
         id: 'draft_design',
         position: 1,
-        skillId: 'technical-design',
+        unitKey: 'work-unit',
         agentId: developer.id,
         title: '技术设计',
         description: '消费需求规格。',

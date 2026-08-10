@@ -146,9 +146,6 @@ export function TeamPage() {
         </QueryState>
       </>,
     },
-    {
-      key: 'skills', label: '旧版 Skill 库', children: <><Typography.Paragraph type="secondary">仅用于兼容历史任务；新任务使用 WorkUnit，不按固定 Skill 契约编排。</Typography.Paragraph><div className="dense-library"><List dataSource={builtins.data?.skills ?? []} rowKey={(skill) => skill.id} renderItem={(skill) => <List.Item extra={<Tag>{roleName(skill.roleId)}</Tag>}><List.Item.Meta title={skill.name} description={skill.description} /></List.Item>} /></div></>,
-    },
   ];
 
   return (
