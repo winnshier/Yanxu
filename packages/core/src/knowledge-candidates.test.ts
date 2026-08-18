@@ -36,7 +36,7 @@ function createFixture(name: string) {
   const store = new YanxuStore(database, workbench);
   const agent = store.createAgent({
     name: '项目研发',
-    roleId: 'development',
+    roleId: 'implementation-worker',
     executor: 'opencode',
     model: 'test-model',
   }, availableOpenCode);

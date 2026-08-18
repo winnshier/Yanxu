@@ -26,7 +26,7 @@ describe('WorkUnit flow', () => {
     const database = openDatabase(join(root, 'workbench', 'system', 'app.db'));
     const store = new YanxuStore(database, join(root, 'workbench'));
     const productAgent = store.createAgent({
-      name: '通用执行人员', roleId: 'product', executor: 'opencode', model: 'test/model', permissionMode: 'managed',
+      name: '通用执行人员', roleId: 'product-analyst', executor: 'opencode', model: 'test/model', permissionMode: 'managed',
     }, openCode);
     const team = store.createTeam({ name: '轻量团队', memberIds: [productAgent.id] });
     const project = store.createProject({ name: '空项目', directoryPath: projectDirectory });
@@ -104,10 +104,10 @@ describe('WorkUnit flow', () => {
       lastCheckedAt: new Date().toISOString(), error: null,
     };
     const developer = store.createAgent({
-      name: 'OpenCode 研发', roleId: 'development', executor: 'opencode', model: 'test/model',
+      name: 'OpenCode 研发', roleId: 'implementation-worker', executor: 'opencode', model: 'test/model',
     }, openCode);
     const reviewer = store.createAgent({
-      name: 'Claude 评审', roleId: 'review', executor: 'claude', model: 'sonnet',
+      name: 'Claude 评审', roleId: 'code-reviewer', executor: 'claude', model: 'sonnet',
     }, claude);
     const team = store.createTeam({ name: '双 CLI 团队', memberIds: [developer.id, reviewer.id] });
     const project = store.createProject({ name: '双 CLI 项目', directoryPath: projectDirectory });

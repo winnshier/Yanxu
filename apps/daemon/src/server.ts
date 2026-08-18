@@ -169,6 +169,8 @@ export async function createServer(
     store.discoverCapabilities(request.body?.projectId));
   server.post<{ Params: { capabilityId: string } }>('/api/capabilities/:capabilityId/install', (request) =>
     store.installCapability(request.params.capabilityId));
+  server.delete<{ Params: { capabilityId: string } }>('/api/capabilities/:capabilityId/install', (request) =>
+    store.uninstallCapability(request.params.capabilityId));
   server.post<{ Body: FolderSelectionRequest }>(
     '/api/capabilities/import/local',
     { schema: { body: folderSelectionRequestSchema } },

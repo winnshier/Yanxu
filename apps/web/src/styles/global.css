@@ -339,6 +339,8 @@ button.capability-metric:hover { transform: translateY(-1px); box-shadow: 0 4px 
 .capability-name-line .ant-tag { margin-inline-end: 0; border-radius: 999px; font-size: 10px; line-height: 20px; }
 .capability-identity > .ant-typography-secondary { max-width: 100%; font-size: 12px; }
 .capability-source.ant-typography { color: #a0a6b2; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
+.capability-source-select { width: min(100%, 520px); }
+.capability-source-select .ant-select-selection-item { color: #7c8493; font-family: "SFMono-Regular", Consolas, monospace; font-size: 10px; }
 .capability-compatibility { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
 .executor-pill {
   min-width: 68px;

@@ -367,15 +367,10 @@ describe('scheduler end-to-end', () => {
 
       expect(task.steps.every((step) => step.status === 'succeeded')).toBe(true);
       const deliveredEvidence = fixture.store.getTaskEvidence(task.id);
-      expect(deliveredEvidence).toMatchObject({
-        preApprovalArtifacts: [expect.objectContaining({ status: 'approved' })],
-        designedQualityGates: expect.arrayContaining([
-          expect.objectContaining({ name: 'critical acceptance', required: true }),
-        ]),
-        gateAttempts: expect.arrayContaining([
-          expect.objectContaining({ status: 'passed' }),
-        ]),
-      });
+      expect(deliveredEvidence.preApprovalArtifacts.some((artifact) => artifact.status === 'approved')).toBe(true);
+      expect(deliveredEvidence.designedQualityGates.some((gate) =>
+        gate.name === 'critical acceptance' && gate.required)).toBe(true);
+      expect(deliveredEvidence.gateAttempts.some((attempt) => attempt.status === 'passed')).toBe(true);
       const technicalExecution = fixture.adapter.executions.find((execution) => execution.title.includes('技术方案'));
       const implementationExecution = fixture.adapter.executions.find((execution) => execution.title.includes('内容实施'));
       const resumedSessionId = implementationExecution?.resumeSessionId;
@@ -854,28 +849,28 @@ function createFixture(
   store.updateSettings({ coordinatorModel: 'test/fake', maxParallelTasks: 2, retryLimit: 2 });
   const product = store.createAgent({
     name: '产品',
-    roleId: 'product',
+    roleId: 'product-analyst',
     executor: 'opencode',
     model: 'test/fake',
     permissionMode: 'standard',
   }, availableOpenCode);
   const developer = store.createAgent({
     name: '研发',
-    roleId: 'development',
+    roleId: 'implementation-worker',
     executor: 'opencode',
     model: 'test/fake',
     permissionMode: 'managed',
   }, availableOpenCode);
   const tester = store.createAgent({
     name: '测试',
-    roleId: 'testing',
+    roleId: 'test-engineer',
     executor: 'opencode',
     model: 'test/fake',
     permissionMode: 'managed',
   }, availableOpenCode);
   const reviewer = store.createAgent({
     name: '评审',
-    roleId: 'review',
+    roleId: 'code-reviewer',
     executor: 'opencode',
     model: 'test/fake',
     permissionMode: 'managed',

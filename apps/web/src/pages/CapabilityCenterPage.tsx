@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Alert, Button, Card, Descriptions, Dropdown, Empty, Input, Modal, Segmented, Space, Tag, Typography, message } from 'antd';
+import { Alert, Button, Card, Descriptions, Dropdown, Empty, Input, Modal, Popconfirm, Segmented, Select, Space, Tag, Typography, message } from 'antd';
 import {
   ApiOutlined,
   CheckCircleFilled,
@@ -16,6 +16,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import type { Capability } from '@yanxu/contracts';
 import { api } from '../lib/api.js';
+import { groupCapabilities, installedCapabilityForGroup, selectedCapabilityForGroup } from '../lib/capability-groups.js';
 import { PageHeader } from '../components/PageHeader.js';
 import { QueryState } from '../components/QueryState.js';
 
@@ -41,6 +42,10 @@ function capabilityStatus(capability: Capability) {
   return { className: 'is-pending', icon: <InfoCircleFilled />, label: '待安装' };
 }
 
+function sourceLabel(capability: Capability): string {
+  return `${sourceTypeLabel[capability.source.type]}${capability.lifecycleStatus === 'installed' ? ' · 已安装' : ''} · ${capability.source.ref}`;
+}
+
 function displayManifestValue(value: unknown, fallback = '未声明'): string {
   if (value === null || value === undefined || value === '') return fallback;
   if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
@@ -50,7 +55,9 @@ function displayManifestValue(value: unknown, fallback = '未声明'): string {
 export function CapabilityCenterPage() {
   const queryClient = useQueryClient();
   const [kind, setKind] = useState<'all' | 'skill' | 'mcp'>('all');
+  const [lifecycle, setLifecycle] = useState<'all' | 'installed' | 'not_installed'>('all');
   const [query, setQuery] = useState('');
+  const [sourceSelections, setSourceSelections] = useState<Record<string, string>>({});
   const [githubOpen, setGithubOpen] = useState(false);
   const [githubAddress, setGithubAddress] = useState('');
   const [selectedCapability, setSelectedCapability] = useState<Capability | null>(null);
@@ -78,7 +85,23 @@ export function CapabilityCenterPage() {
     mutationFn: api.installCapability,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['capabilities'] });
+      void queryClient.invalidateQueries({ queryKey: ['role-templates'] });
+      void queryClient.invalidateQueries({ queryKey: ['builtins'] });
+      void queryClient.invalidateQueries({ queryKey: ['agents'] });
+      void queryClient.invalidateQueries({ predicate: (item) => item.queryKey[0] === 'project-capabilities' });
       message.success('能力已安装到研序托管目录');
+    },
+    onError: (error: Error) => message.error(error.message),
+  });
+  const uninstall = useMutation({
+    mutationFn: api.uninstallCapability,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['capabilities'] });
+      void queryClient.invalidateQueries({ queryKey: ['role-templates'] });
+      void queryClient.invalidateQueries({ queryKey: ['builtins'] });
+      void queryClient.invalidateQueries({ queryKey: ['agents'] });
+      void queryClient.invalidateQueries({ predicate: (item) => item.queryKey[0] === 'project-capabilities' });
+      message.success('能力已卸载；保留托管副本用于审计和重新安装，后续调用不会再装载');
     },
     onError: (error: Error) => message.error(error.message),
   });
@@ -103,22 +126,30 @@ export function CapabilityCenterPage() {
     },
     onError: (error: Error) => { if (!error.message.includes('取消')) message.error(error.message); },
   });
-  const filtered = useMemo(() => (capabilities.data ?? []).filter((item) => {
-    if (kind !== 'all' && item.kind !== kind) return false;
-    const needle = query.trim().toLowerCase();
-    return !needle || `${item.name}\n${item.description}\n${item.source.ref}`.toLowerCase().includes(needle);
-  }), [capabilities.data, kind, query]);
+  const groups = useMemo(() => groupCapabilities(capabilities.data ?? []), [capabilities.data]);
+  const filtered = useMemo(() => groups.map((group) => ({
+    group,
+    capability: selectedCapabilityForGroup(group, sourceSelections[group.key]),
+    installedCapability: installedCapabilityForGroup(group),
+  })).filter(({ group, installedCapability }) => {
+    if (kind !== 'all' && group.kind !== kind) return false;
+    if (lifecycle === 'installed' && !installedCapability) return false;
+    if (lifecycle === 'not_installed' && installedCapability) return false;
+    const needle = query.trim().toLocaleLowerCase();
+    return !needle || group.variants.some((item) =>
+      `${item.name}\n${item.description}\n${item.source.ref}`.toLocaleLowerCase().includes(needle));
+  }), [groups, kind, lifecycle, query, sourceSelections]);
   const summary = useMemo(() => {
-    const items = capabilities.data ?? [];
     return {
-      total: items.length,
-      skills: items.filter((item) => item.kind === 'skill').length,
-      mcps: items.filter((item) => item.kind === 'mcp').length,
-      installed: items.filter((item) => item.lifecycleStatus === 'installed').length,
-      opencode: items.filter((item) => item.compatibility.includes('opencode')).length,
-      claude: items.filter((item) => item.compatibility.includes('claude')).length,
+      total: groups.length,
+      sources: capabilities.data?.length ?? 0,
+      skills: groups.filter((item) => item.kind === 'skill').length,
+      mcps: groups.filter((item) => item.kind === 'mcp').length,
+      installed: groups.filter((item) => installedCapabilityForGroup(item)).length,
+      opencode: groups.filter((item) => item.variants.some((variant) => variant.compatibility.includes('opencode'))).length,
+      claude: groups.filter((item) => item.variants.some((variant) => variant.compatibility.includes('claude'))).length,
     };
-  }, [capabilities.data]);
+  }, [capabilities.data?.length, groups]);
 
   return <div className="page-container capability-center-page">
     <PageHeader
@@ -144,12 +175,12 @@ export function CapabilityCenterPage() {
       </Space>}
     />
     <section className="module-overview-bar capability-summary" aria-label="能力概况">
-      <div className="capability-summary-total"><strong>{summary.total}</strong><span>项能力已纳管</span></div>
+      <div className="capability-summary-total"><strong>{summary.total}</strong><span>项逻辑能力 · {summary.sources} 个来源</span></div>
       <div className="capability-summary-metrics">
         <button type="button" className={`capability-metric is-all ${kind === 'all' ? 'is-active' : ''}`} onClick={() => setKind('all')}>全部 <strong>{summary.total}</strong></button>
         <button type="button" className={`capability-metric is-skill ${kind === 'skill' ? 'is-active' : ''}`} onClick={() => setKind('skill')}>Skill <strong>{summary.skills}</strong></button>
         <button type="button" className={`capability-metric is-mcp ${kind === 'mcp' ? 'is-active' : ''}`} onClick={() => setKind('mcp')}>MCP <strong>{summary.mcps}</strong></button>
-        <span className="capability-metric is-installed">已安装 <strong>{summary.installed}</strong></span>
+        <button type="button" className={`capability-metric is-installed ${lifecycle === 'installed' ? 'is-active' : ''}`} onClick={() => setLifecycle(lifecycle === 'installed' ? 'all' : 'installed')}>已安装 <strong>{summary.installed}</strong></button>
         <span className="capability-metric is-opencode">OpenCode <strong>{summary.opencode}</strong></span>
         <span className="capability-metric is-claude">Claude <strong>{summary.claude}</strong></span>
       </div>
@@ -164,6 +195,9 @@ export function CapabilityCenterPage() {
             <Segmented value={kind} onChange={(value) => setKind(value as typeof kind)} options={[
               { label: '全部', value: 'all' }, { label: 'Skill', value: 'skill' }, { label: 'MCP', value: 'mcp' },
             ]} />
+            <Segmented value={lifecycle} onChange={(value) => setLifecycle(value as typeof lifecycle)} options={[
+              { label: '全部状态', value: 'all' }, { label: '已安装', value: 'installed' }, { label: '未安装', value: 'not_installed' },
+            ]} />
           </Space>
         </div>
         {filtered.length === 0 ? <Empty description="尚未发现能力，先扫描本机配置或导入本地 Skill" /> : <div className="capability-list">
@@ -174,9 +208,11 @@ export function CapabilityCenterPage() {
             <span>状态</span>
             <span>操作</span>
           </div>
-          {filtered.map((capability) => {
-            const status = capabilityStatus(capability);
-            return <article className="capability-row" key={capability.id}>
+          {filtered.map(({ group, capability, installedCapability }) => {
+            const status = installedCapability && installedCapability.id !== capability.id
+              ? { className: 'is-warning', icon: <ExclamationCircleFilled />, label: '已安装其他来源' }
+              : capabilityStatus(capability);
+            return <article className="capability-row" key={group.key}>
               <div className={`capability-kind-icon is-${capability.kind}`} aria-hidden="true">
                 {capability.kind === 'skill' ? <ToolOutlined /> : <ApiOutlined />}
               </div>
@@ -184,10 +220,18 @@ export function CapabilityCenterPage() {
                 <div className="capability-name-line">
                   <Typography.Text strong>{capability.name}</Typography.Text>
                   <Tag variant="filled">{capability.kind.toUpperCase()}</Tag>
+                  {group.variants.length > 1 && <Tag variant="filled" color="blue">{group.variants.length} 个来源</Tag>}
                   {capability.security.localCredentialBindings > 0 && <Tag variant="filled" color="green" icon={<SafetyCertificateOutlined />}>本机凭据 {capability.security.localCredentialBindings}</Tag>}
                 </div>
                 <Typography.Text type="secondary" ellipsis title={capability.description || '暂无说明'}>{capability.description || '暂无说明'}</Typography.Text>
-                <Typography.Text className="capability-source" type="secondary" ellipsis title={capability.source.ref}>{sourceTypeLabel[capability.source.type]} · {capability.source.ref}</Typography.Text>
+                {group.variants.length > 1 ? <Select
+                  className="capability-source-select"
+                  size="small"
+                  value={capability.id}
+                  title={capability.source.ref}
+                  onChange={(capabilityId) => setSourceSelections((current) => ({ ...current, [group.key]: capabilityId }))}
+                  options={group.variants.map((variant) => ({ label: sourceLabel(variant), value: variant.id }))}
+                /> : <Typography.Text className="capability-source" type="secondary" ellipsis title={capability.source.ref}>{sourceLabel(capability)}</Typography.Text>}
               </div>
               <div className="capability-compatibility" aria-label="兼容 CLI">
                 {capability.compatibility.map((executor) => <span className={`executor-pill is-${executor}`} key={executor}>{executor === 'opencode' ? 'OpenCode' : 'Claude'}</span>)}
@@ -196,8 +240,13 @@ export function CapabilityCenterPage() {
               <div className="capability-row-actions">
                 <Button type="text" onClick={() => setSelectedCapability(capability)}>详情</Button>
                 {capability.lifecycleStatus !== 'installed' && capability.parseStatus === 'valid' && !capability.security.containsLiteralSecrets
-                  ? <Button type="primary" size="small" loading={install.isPending && install.variables === capability.id} onClick={() => install.mutate(capability.id)}>安装</Button>
+                  ? <Button type="primary" size="small" loading={install.isPending && install.variables === capability.id} onClick={() => install.mutate(capability.id)}>{installedCapability ? '切换来源' : '安装'}</Button>
                   : null}
+                {capability.lifecycleStatus === 'installed' ? <Popconfirm
+                  title={`卸载 ${capability.name}？`}
+                  description="项目中的该能力会同步停用，后续任务调用不会再挂载；托管副本保留用于审计和重装。"
+                  onConfirm={() => uninstall.mutate(capability.id)}
+                ><Button danger type="text" size="small" loading={uninstall.isPending && uninstall.variables === capability.id}>卸载</Button></Popconfirm> : null}
               </div>
             </article>;
           })}
@@ -226,7 +275,13 @@ export function CapabilityCenterPage() {
       onCancel={() => setSelectedCapability(null)}
       footer={selectedCapability && selectedCapability.lifecycleStatus !== 'installed' && selectedCapability.parseStatus === 'valid' && !selectedCapability.security.containsLiteralSecrets
         ? <Space><Button onClick={() => setSelectedCapability(null)}>关闭</Button><Button type="primary" loading={install.isPending} onClick={() => install.mutate(selectedCapability.id, { onSuccess: () => setSelectedCapability(null) })}>确认安装此版本</Button></Space>
-        : <Button onClick={() => setSelectedCapability(null)}>关闭</Button>}
+        : selectedCapability?.lifecycleStatus === 'installed'
+          ? <Space><Button onClick={() => setSelectedCapability(null)}>关闭</Button><Popconfirm
+            title={`卸载 ${selectedCapability.name}？`}
+            description="卸载后 Role 不再推荐该能力，真实调用也不会挂载。"
+            onConfirm={() => uninstall.mutate(selectedCapability.id, { onSuccess: () => setSelectedCapability(null) })}
+          ><Button danger loading={uninstall.isPending}>卸载</Button></Popconfirm></Space>
+          : <Button onClick={() => setSelectedCapability(null)}>关闭</Button>}
     >
       {selectedCapability && <Space direction="vertical" size={12} className="full-width">
         <Descriptions bordered size="small" column={1} items={[

@@ -36,13 +36,13 @@ describe('dynamic execution plans', () => {
     const store = new YanxuStore(database, workbench);
     const product = store.createAgent({
       name: '产品一号',
-      roleId: 'product',
+      roleId: 'product-analyst',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
     const tester = store.createAgent({
       name: '测试一号',
-      roleId: 'testing',
+      roleId: 'test-engineer',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
@@ -215,7 +215,7 @@ describe('dynamic execution plans', () => {
     const store = new YanxuStore(database, workbench);
     const product = store.createAgent({
       name: '产品一号',
-      roleId: 'product',
+      roleId: 'product-analyst',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
@@ -329,13 +329,13 @@ describe('dynamic execution plans', () => {
     const store = new YanxuStore(database, workbench);
     const developer = store.createAgent({
       name: '研发一号',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
     const reviewer = store.createAgent({
       name: '评审一号',
-      roleId: 'review',
+      roleId: 'code-reviewer',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
@@ -441,7 +441,7 @@ describe('dynamic execution plans', () => {
     const store = new YanxuStore(database, workbench);
     const developer = store.createAgent({
       name: '研发一号',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);

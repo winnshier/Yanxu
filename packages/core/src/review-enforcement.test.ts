@@ -50,13 +50,13 @@ describe('review enforcement', () => {
     const store = new YanxuStore(database, workbench);
     const developer = store.createAgent({
       name: '研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
     const reviewer = store.createAgent({
       name: '评审',
-      roleId: 'review',
+      roleId: 'code-reviewer',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
@@ -195,13 +195,13 @@ describe('review enforcement', () => {
     const store = new YanxuStore(database, workbench);
     const designer = store.createAgent({
       name: '架构师',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
     const reviewer = store.createAgent({
       name: '评审',
-      roleId: 'review',
+      roleId: 'code-reviewer',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);

@@ -34,7 +34,7 @@ describe('automatic failure policy', () => {
     const store = new YanxuStore(database, join(root, 'workbench'));
     const developer = store.createAgent({
       name: '研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/model',
     }, installation);

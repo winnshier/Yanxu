@@ -108,6 +108,7 @@ export const api = {
     '/api/capabilities/discover', json('POST', projectId ? { projectId } : {}),
   ),
   installCapability: (id: string) => request<Capability>(`/api/capabilities/${id}/install`, json('POST')),
+  uninstallCapability: (id: string) => request<Capability>(`/api/capabilities/${id}/install`, json('DELETE')),
   importLocalSkill: (selectionToken: string) => request<Capability>(
     '/api/capabilities/import/local', json('POST', { selectionToken }),
   ),

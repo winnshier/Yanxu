@@ -21,4 +21,12 @@ describe('execution failure classification', () => {
     expect(classifyExecutionFailure(new DomainError('WORK_UNIT_RESULT_INVALID', 'review failed', 422)))
       .toMatchObject({ category: 'system', retryable: false, suggestedAction: 'await_user' });
   });
+
+  it('treats an uninstalled runtime capability as a non-retryable configuration change', () => {
+    expect(classifyExecutionFailure(new DomainError(
+      'TASK_CAPABILITY_UNINSTALLED',
+      '任务能力 source-verification 已被卸载。',
+      409,
+    ))).toMatchObject({ category: 'configuration', retryable: false, suggestedAction: 'await_user' });
+  });
 });

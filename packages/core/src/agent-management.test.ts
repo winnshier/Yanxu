@@ -32,20 +32,20 @@ describe('AI agent lifecycle', () => {
     const store = new YanxuStore(database, root);
     const referenced = store.createAgent({
       name: '研发一号',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/model',
     }, installation);
     const disposable = store.createAgent({
       name: '临时人员',
-      roleId: 'review',
+      roleId: 'code-reviewer',
       executor: 'opencode',
       model: 'test/model',
     }, installation);
 
     expect(store.updateAgent(referenced.id, {
       name: '研发主力',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/updated',
       permissionMode: 'managed',

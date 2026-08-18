@@ -39,7 +39,7 @@ describe('ProjectSpace state reconstruction', () => {
     const firstStore = new YanxuStore(firstDatabase, firstWorkbench);
     const developer = firstStore.createAgent({
       name: '恢复测试研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
       permissionMode: 'managed',

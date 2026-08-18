@@ -199,7 +199,7 @@ describe('local daemon HTTP boundary', () => {
         headers,
         payload: {
           name: 'HTTP 研发',
-          roleId: 'development',
+          roleId: 'implementation-worker',
           executor: 'opencode',
           model: 'test/fake',
         },
@@ -273,7 +273,7 @@ describe('local daemon HTTP boundary', () => {
     const store = new YanxuStore(database, root);
     const agent = store.createAgent({
       name: '研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/fake',
     }, availableOpenCode);

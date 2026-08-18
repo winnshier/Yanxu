@@ -74,8 +74,10 @@ export function CreateAgentModal({ open, roles, executors, capabilities, agent, 
         <Form.Item name="roleId" label="Role" rules={[{ required: true }]}>
           <Select onChange={(roleId) => {
             const role = roles.find((item) => item.id === roleId);
-            const compatibleDefaults = (role?.capabilityIds ?? []).filter((capabilityId) =>
-              capabilities.find((item) => item.id === capabilityId)?.compatibility.includes(executor));
+            const compatibleDefaults = (role?.capabilityIds ?? []).filter((capabilityId) => {
+              const capability = capabilities.find((item) => item.id === capabilityId);
+              return capability?.lifecycleStatus === 'installed' && capability.compatibility.includes(executor);
+            });
             form.setFieldValue('defaultCapabilityIds', compatibleDefaults);
           }} options={roles.map((role) => ({
             label: `${role.name}${role.origin === 'external' ? ' · 外部' : ''}`,

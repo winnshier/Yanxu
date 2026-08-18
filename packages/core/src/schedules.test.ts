@@ -25,7 +25,7 @@ describe('project schedules', () => {
     mkdirSync(directory);
     const database = openDatabase(join(root, 'workbench', 'system', 'app.db'));
     const store = new YanxuStore(database, join(root, 'workbench'));
-    const agent = store.createAgent({ name: '巡检', roleId: 'testing', executor: 'opencode', model: 'test/model' }, executor);
+    const agent = store.createAgent({ name: '巡检', roleId: 'test-engineer', executor: 'opencode', model: 'test/model' }, executor);
     const team = store.createTeam({ name: '巡检团队', memberIds: [agent.id] });
     const project = store.createProject({ name: '定时项目', directoryPath: directory });
     const directoryId = project.directories[0]?.id;

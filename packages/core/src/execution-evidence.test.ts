@@ -51,13 +51,13 @@ describe('execution evidence chain', () => {
     const store = new YanxuStore(database, workbench);
     const product = store.createAgent({
       name: '产品',
-      roleId: 'product',
+      roleId: 'product-analyst',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);
     const developer = store.createAgent({
       name: '研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);

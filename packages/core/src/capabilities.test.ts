@@ -77,6 +77,55 @@ describe('capability registry', () => {
     database.close();
   });
 
+  it('switches one logical Skill between sources and preserves its uninstall state across restart', () => {
+    const root = mkdtempSync(join(tmpdir(), 'yanxu-capability-source-switch-'));
+    roots.push(root);
+    const skillRoot = join(root, 'source-verification');
+    const workbench = join(root, 'workbench');
+    const databasePath = join(workbench, 'system', 'app.db');
+    mkdirSync(skillRoot);
+    writeFileSync(join(skillRoot, 'SKILL.md'), [
+      '---',
+      'name: source-verification',
+      'description: Verify sources from a local installation.',
+      '---',
+      '# Local source verification',
+      '',
+    ].join('\n'));
+
+    const database = openDatabase(databasePath);
+    const store = new YanxuStore(database, workbench);
+    const builtinId = 'builtin-skill-source-verification';
+    const agent = store.createAgent({
+      name: '来源研究员', roleId: 'research-specialist', executor: 'opencode', model: 'test/model',
+      defaultCapabilityIds: [builtinId],
+    }, openCode);
+    const local = store.installCapability(store.importLocalSkill(skillRoot).id);
+
+    expect(store.getCapability(builtinId).lifecycleStatus).toBe('imported');
+    expect(local.lifecycleStatus).toBe('installed');
+    expect(store.getRoleTemplate('research-specialist').capabilityIds).toContain(local.id);
+    expect(store.getRoleTemplate('research-specialist').capabilityIds).not.toContain(builtinId);
+    expect(store.getAgent(agent.id).defaultCapabilityIds).toContain(local.id);
+    expect(store.getAgent(agent.id).defaultCapabilityIds).not.toContain(builtinId);
+
+    store.uninstallCapability(local.id);
+    expect(store.getCapability(local.id).lifecycleStatus).toBe('imported');
+    expect(store.getRoleTemplate('research-specialist').capabilityIds).not.toContain(local.id);
+    expect(store.getRoleTemplate('research-specialist').capabilityIds).not.toContain(builtinId);
+    expect(store.getAgent(agent.id).defaultCapabilityIds).not.toContain(local.id);
+    database.close();
+
+    const reopenedDatabase = openDatabase(databasePath);
+    const reopenedStore = new YanxuStore(reopenedDatabase, workbench);
+    expect(reopenedStore.getCapability(builtinId).lifecycleStatus).toBe('imported');
+    expect(reopenedStore.getCapability(local.id).lifecycleStatus).toBe('imported');
+    expect(reopenedStore.getRoleTemplate('research-specialist').capabilityIds).not.toContain(builtinId);
+    reopenedStore.installCapability(builtinId);
+    expect(reopenedStore.getRoleTemplate('research-specialist').capabilityIds).toContain(builtinId);
+    reopenedDatabase.close();
+  });
+
   it('imports, installs, locks, freezes and projects a skill into an isolated task runtime', () => {
     const root = mkdtempSync(join(tmpdir(), 'yanxu-capability-flow-'));
     roots.push(root);
@@ -97,7 +146,7 @@ describe('capability registry', () => {
     expect(capability.lifecycleStatus).toBe('installed');
 
     const agent = store.createAgent({
-      name: '研发', roleId: 'development', executor: 'opencode', model: 'test/model', permissionMode: 'managed',
+      name: '研发', roleId: 'implementation-worker', executor: 'opencode', model: 'test/model', permissionMode: 'managed',
       defaultCapabilityIds: [capability.id],
     }, openCode);
     expect(agent.defaultCapabilityIds).toEqual([capability.id]);
@@ -159,6 +208,9 @@ describe('capability registry', () => {
     expect(existsSync(join(secondProjection.configDirectory, 'skills', 'api-review', 'SKILL.md'))).toBe(true);
     expect(existsSync(join(secondProjection.configDirectory, 'skills', 'react-review'))).toBe(false);
     expect(existsSync(join(projection.configDirectory, 'skills', 'api-review'))).toBe(false);
+    store.uninstallCapability(secondCapability.id);
+    expect(() => store.prepareTaskCapabilityProjection(secondTask.id, 'opencode', join(root, 'runtime-after-uninstall')))
+      .toThrow('已被卸载');
     store.refreshProjectSpaceState(project.id);
     database.close();
 
@@ -168,7 +220,7 @@ describe('capability registry', () => {
     restoredStore.restoreProjectSpace(project.projectSpacePath);
     expect(restoredStore.listProjectCapabilities(project.id)).toEqual(expect.arrayContaining([
       expect.objectContaining({ capabilityId: capability.id, enabled: true, lockedHash: capability.contentHash }),
-      expect.objectContaining({ capabilityId: secondCapability.id, enabled: true, lockedHash: secondCapability.contentHash }),
+      expect.objectContaining({ capabilityId: secondCapability.id, enabled: false, lockedHash: secondCapability.contentHash }),
     ]));
     expect(restoredStore.listTaskCapabilitySnapshots(task.id)).toEqual([
       expect.objectContaining({ capabilityId: capability.id, status: 'frozen', projectionPath: null }),

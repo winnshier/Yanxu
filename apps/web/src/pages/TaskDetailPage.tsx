@@ -110,7 +110,6 @@ export function TaskDetailPage() {
   const taskCapabilities = useQuery({ queryKey: ['task-capabilities', taskId], queryFn: () => api.taskCapabilities(taskId), enabled: Boolean(taskId), refetchInterval: 5_000 });
   const agents = useQuery({ queryKey: ['agents'], queryFn: api.agents });
   const teams = useQuery({ queryKey: ['teams'], queryFn: api.teams });
-  const builtins = useQuery({ queryKey: ['builtins'], queryFn: api.builtins });
 
   useEffect(() => {
     if (data?.plan) {

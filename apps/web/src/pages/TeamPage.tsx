@@ -23,6 +23,7 @@ export function TeamPage() {
   const roles = useQuery({ queryKey: ['role-templates'], queryFn: api.roleTemplates });
   const executors = useQuery({ queryKey: ['executors'], queryFn: api.executors });
   const capabilities = useQuery({ queryKey: ['capabilities'], queryFn: api.capabilities });
+  const capabilitiesById = new Map((capabilities.data ?? []).map((capability) => [capability.id, capability]));
   const roleName = (roleId: string) => builtins.data?.roles.find((role) => role.id === roleId)?.name ?? roleId;
   const teamsForAgent = (agentId: string) => (teams.data ?? []).filter((team) => team.memberIds.includes(agentId));
   const executorForAgent = (executorId: string) => executors.data?.find((executor) => executor.id === executorId);
@@ -137,7 +138,11 @@ export function TeamPage() {
                   <Typography.Text type="secondary">{role.description || '暂无描述'}</Typography.Text>
                   {role.parseError && <Typography.Text type={role.parseStatus === 'incompatible' ? 'danger' : 'secondary'}>{role.parseError}</Typography.Text>}
                   <Typography.Text>责任：{role.responsibilities.join('；') || '以基础指令为准'}</Typography.Text>
-                  <Space size={[4, 4]} wrap>{role.compatibility.map((item) => <Tag color="blue" key={item}>{item}</Tag>)}{role.dependencyNames.map((item) => <Tag color="purple" key={item}>依赖 {item}</Tag>)}<Tag>{role.format}</Tag></Space>
+                  <Space size={[4, 4]} wrap>{role.compatibility.map((item) => <Tag color="blue" key={item}>{item}</Tag>)}{role.dependencyNames.map((item) => {
+                    const available = role.capabilityIds.some((capabilityId) =>
+                      capabilitiesById.get(capabilityId)?.name.toLocaleLowerCase() === item.toLocaleLowerCase());
+                    return <Tag color={available ? 'purple' : 'red'} key={item}>{available ? '能力' : '不可用'} {item}</Tag>;
+                  })}<Tag>{role.format}</Tag></Space>
                   <Typography.Text className="mono-text description-path" type="secondary" ellipsis={{ tooltip: role.source.ref }}>{role.source.ref}</Typography.Text>
                 </Space>}
               />

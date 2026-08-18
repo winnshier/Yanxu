@@ -38,7 +38,7 @@ describe('task cancellation', () => {
     const store = new YanxuStore(database, workbench);
     const agent = store.createAgent({
       name: '产品',
-      roleId: 'product',
+      roleId: 'product-analyst',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);

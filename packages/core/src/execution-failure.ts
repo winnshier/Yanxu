@@ -54,6 +54,10 @@ export function classifyExecutionFailure(error: unknown): ClassifiedExecutionFai
   if (code && staleCodes.has(code)) {
     category = 'stale_execution';
     suggestedAction = 'discard';
+  } else if (code === 'TASK_CAPABILITY_UNINSTALLED' || code === 'TASK_CAPABILITY_INCOMPATIBLE') {
+    category = 'configuration';
+    retryable = false;
+    suggestedAction = 'await_user';
   } else if (code?.includes('RUNTIME_DRIFT') || code?.includes('CREDENTIAL') || code?.includes('CONFIG')) {
     category = 'configuration';
     retryable = false;

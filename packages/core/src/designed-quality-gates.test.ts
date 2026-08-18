@@ -43,7 +43,7 @@ describe('test-designed quality gates', () => {
     const database = openDatabase(join(root, 'workbench', 'system', 'app.db'));
     const store = new YanxuStore(database, join(root, 'workbench'));
     const developer = store.createAgent({
-      name: '研发', roleId: 'development', executor: 'opencode', model: 'test-model',
+      name: '研发', roleId: 'implementation-worker', executor: 'opencode', model: 'test-model',
     }, availableOpenCode);
     const team = store.createTeam({ name: '无门禁团队', memberIds: [developer.id] });
     const project = store.createProject({ name: '无门禁项目', directoryPath: repository });
@@ -76,7 +76,7 @@ describe('test-designed quality gates', () => {
     const store = new YanxuStore(database, workbench);
     const tester = store.createAgent({
       name: '测试',
-      roleId: 'testing',
+      roleId: 'test-engineer',
       executor: 'opencode',
       model: 'test-model',
     }, availableOpenCode);

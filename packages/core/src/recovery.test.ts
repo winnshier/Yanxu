@@ -74,7 +74,7 @@ describe('scheduler recovery', () => {
     const store = new YanxuStore(database, workbench);
     const developer = store.createAgent({
       name: '恢复研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/model',
     }, availableOpenCode);
@@ -157,7 +157,7 @@ describe('scheduler recovery', () => {
     const store = new YanxuStore(database, workbench);
     const developer = store.createAgent({
       name: '历史步骤恢复研发',
-      roleId: 'development',
+      roleId: 'implementation-worker',
       executor: 'opencode',
       model: 'test/model',
     }, availableOpenCode);

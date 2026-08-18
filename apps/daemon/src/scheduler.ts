@@ -959,7 +959,7 @@ ${JSON.stringify(workspaces, null, 2)}
       const team = this.store.getTeam(task.teamId);
       const teamCoordinatorAgents = this.store.listAgents().filter((agent) =>
         team.memberIds.includes(agent.id) && agent.executor === settings.coordinatorExecutor);
-      const productAgent = teamCoordinatorAgents.find((agent) => agent.roleId === 'product') ?? teamCoordinatorAgents[0];
+      const productAgent = teamCoordinatorAgents.find((agent) => agent.roleId === 'product-analyst') ?? teamCoordinatorAgents[0];
       const decision = await adapter.executeStructured<RequirementDecision>({
         runtime,
         title: `需求规格判断 · ${task.title}`,
@@ -1243,7 +1243,7 @@ ${JSON.stringify({
       };
     });
     const projectCapabilities = this.store.listProjectCapabilities(project.id)
-      .filter((item) => item.enabled)
+      .filter((item) => item.enabled && item.capability.lifecycleStatus === 'installed')
       .map((item) => {
         const localCredentialRefs = new Set<string>();
         const localCredentialBindings = item.capability.manifest.localCredentialBindings;

@@ -3,7 +3,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { builtinRoles } from '@yanxu/builtins';
+import { builtinRoles, builtinSkills } from '@yanxu/builtins';
 import { YANXU_VERSION } from '@yanxu/contracts';
 import type {
   AgentProfile,
@@ -473,6 +473,8 @@ export class YanxuStore {
 
   private seedDefaults(): void {
     const timestamp = now();
+    this.seedBuiltinSkills(timestamp);
+    this.migrateLegacyBuiltinRoles(timestamp);
     const defaults: Record<string, unknown> = {
       maxParallelTasks: 2,
       retryLimit: 2,
@@ -493,6 +495,117 @@ export class YanxuStore {
         INSERT INTO teams(id, name, description, is_default, created_at, updated_at)
         VALUES (?, ?, ?, 1, ?, ?)
       `).run(id('team'), '默认团队', '新任务默认选择的团队，可在 AI 团队中添加人员。', timestamp, timestamp);
+    }
+  }
+
+  private seedBuiltinSkills(timestamp: string): void {
+    const upsert = this.database.prepare(`
+      INSERT INTO capabilities(
+        id, origin_key, kind, name, description, source_type, source_scope, source_executor, source_ref, source_version,
+        version, content_hash, compatibility_json, lifecycle_status, parse_status, parse_error, command_status,
+        runtime_health, credential_refs_json, manifest_json, managed_path, security_json,
+        last_discovered_at, created_at, updated_at
+      ) VALUES (?, ?, 'skill', ?, ?, 'builtin', 'managed', NULL, ?, ?, ?, ?, ?, 'installed', 'valid', NULL,
+        'not_applicable', 'not_applicable', '[]', ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        origin_key = excluded.origin_key,
+        kind = excluded.kind,
+        name = excluded.name,
+        description = excluded.description,
+        source_type = excluded.source_type,
+        source_scope = excluded.source_scope,
+        source_executor = excluded.source_executor,
+        source_ref = excluded.source_ref,
+        source_version = excluded.source_version,
+        version = excluded.version,
+        content_hash = excluded.content_hash,
+        compatibility_json = excluded.compatibility_json,
+        lifecycle_status = capabilities.lifecycle_status,
+        parse_status = 'valid',
+        parse_error = NULL,
+        command_status = 'not_applicable',
+        runtime_health = 'not_applicable',
+        credential_refs_json = '[]',
+        manifest_json = excluded.manifest_json,
+        managed_path = excluded.managed_path,
+        security_json = excluded.security_json,
+        last_discovered_at = excluded.last_discovered_at,
+        updated_at = excluded.updated_at
+    `);
+    for (const skill of builtinSkills) {
+      const contentHash = sha256(`SKILL.md\0${skill.content}\0`);
+      const managedPath = join(this.workbenchHome, 'capabilities', skill.id, contentHash);
+      mkdirSync(managedPath, { recursive: true });
+      writeFileSync(join(managedPath, 'SKILL.md'), skill.content, { mode: 0o600 });
+      const manifest = {
+        format: 'agent-skill',
+        entryFile: 'SKILL.md',
+        name: skill.name,
+        description: skill.description,
+        license: 'MIT',
+        compatibility: skill.compatibility.join(', '),
+        allowedTools: null,
+        metadata: { builtin: true, pack: skill.pack, title: skill.title },
+        files: ['SKILL.md'],
+        totalBytes: Buffer.byteLength(skill.content),
+        contentPreview: skill.content.replace(/^---\s*\n[\s\S]*?\n---\s*\n?/, '').slice(0, 2_000),
+      };
+      const security = {
+        files: ['SKILL.md'],
+        scripts: [],
+        executableFiles: [],
+        networkHosts: [],
+        environmentKeys: [],
+        headerKeys: [],
+        localCredentialBindings: 0,
+        containsLiteralSecrets: false,
+      };
+      upsert.run(
+        skill.id,
+        `yanxu:builtin-skill:${skill.name}`,
+        skill.name,
+        skill.description,
+        `yanxu://builtin-skills/${skill.name}`,
+        '2.0.0',
+        '2.0.0',
+        contentHash,
+        JSON.stringify(skill.compatibility),
+        JSON.stringify(manifest),
+        managedPath,
+        JSON.stringify(security),
+        timestamp,
+        timestamp,
+        timestamp,
+      );
+    }
+  }
+
+  private migrateLegacyBuiltinRoles(timestamp: string): void {
+    const replacements = new Map([
+      ['product', 'product-analyst'],
+      ['development', 'implementation-worker'],
+      ['testing', 'test-engineer'],
+      ['review', 'code-reviewer'],
+    ]);
+    const rows = this.database.prepare(`
+      SELECT id, role_id, default_capability_ids_json FROM agent_profiles
+      WHERE role_id IN ('product', 'development', 'testing', 'review')
+    `).all() as Array<{ id: string; role_id: string; default_capability_ids_json: string }>;
+    const update = this.database.prepare(`
+      UPDATE agent_profiles SET role_id = ?, default_capability_ids_json = ?, updated_at = ? WHERE id = ?
+    `);
+    for (const row of rows) {
+      const roleId = replacements.get(row.role_id);
+      if (!roleId) continue;
+      const existingCapabilityIds = parseJson<string[]>(row.default_capability_ids_json, []);
+      const role = builtinRoles.find((item) => item.id === roleId);
+      const availableRole = role ? this.resolveRoleCapabilities(role) : null;
+      update.run(
+        roleId,
+        JSON.stringify(existingCapabilityIds.length > 0 ? existingCapabilityIds : availableRole?.capabilityIds ?? []),
+        timestamp,
+        row.id,
+      );
     }
   }
 
@@ -908,6 +1021,7 @@ export class YanxuStore {
 
   installCapability(capabilityId: string): Capability {
     const capability = this.getCapability(capabilityId);
+    if (capability.lifecycleStatus === 'installed') return capability;
     if (capability.parseStatus !== 'valid') {
       throw new DomainError('CAPABILITY_INSTALL_INVALID', '无效能力不能安装，请先处理解析错误。', 422, {
         capabilityId,
@@ -926,9 +1040,7 @@ export class YanxuStore {
     mkdirSync(temporary, { recursive: true });
     try {
       if (capability.kind === 'skill') {
-        const sourceRoot = capability.lifecycleStatus === 'imported' && capability.managedPath
-          ? capability.managedPath
-          : dirname(capability.source.ref);
+        const sourceRoot = capability.managedPath ?? dirname(capability.source.ref);
         for (const file of capability.security.files) {
           const sourcePath = resolve(sourceRoot, file);
           const relativePath = relative(sourceRoot, sourcePath);
@@ -958,14 +1070,63 @@ export class YanxuStore {
       throw error;
     }
     const timestamp = now();
-    this.database.prepare(`
-      UPDATE capabilities SET lifecycle_status = 'installed', managed_path = ?, updated_at = ? WHERE id = ?
-    `).run(target, timestamp, capabilityId);
+    const replaced = this.listCapabilities().filter((item) =>
+      item.id !== capability.id
+      && item.kind === capability.kind
+      && item.name.toLocaleLowerCase() === capability.name.toLocaleLowerCase()
+      && item.lifecycleStatus === 'installed');
+    this.disableCapabilitiesInProjects(replaced.map((item) => item.id));
+    this.database.transaction(() => {
+      const deactivate = this.database.prepare(`
+        UPDATE capabilities SET lifecycle_status = 'imported', updated_at = ? WHERE id = ?
+      `);
+      for (const sibling of replaced) deactivate.run(timestamp, sibling.id);
+      this.database.prepare(`
+        UPDATE capabilities SET lifecycle_status = 'installed', managed_path = ?, updated_at = ? WHERE id = ?
+      `).run(target, timestamp, capabilityId);
+      this.replaceAgentCapabilityReferences(replaced.map((item) => item.id), capabilityId, timestamp);
+    })();
+    for (const sibling of replaced) {
+      this.appendEvent('capability', sibling.id, 'capability.source_replaced', 'user',
+        `同名能力 ${sibling.name} 已切换到其他来源，不再可用。`, {
+          replacementCapabilityId: capabilityId,
+          replacementSource: capability.source.ref,
+        });
+    }
     this.appendEvent('capability', capabilityId, 'capability.installed', 'user', `能力 ${capability.name} 已安装到研序托管目录。`, {
       kind: capability.kind,
       version: capability.version,
       contentHash: capability.contentHash,
+      replacedCapabilityIds: replaced.map((item) => item.id),
     });
+    return this.getCapability(capabilityId);
+  }
+
+  uninstallCapability(capabilityId: string): Capability {
+    const capability = this.getCapability(capabilityId);
+    const installed = this.listCapabilities().filter((item) =>
+      item.kind === capability.kind
+      && item.name.toLocaleLowerCase() === capability.name.toLocaleLowerCase()
+      && item.lifecycleStatus === 'installed');
+    if (installed.length === 0) return capability;
+    const installedIds = installed.map((item) => item.id);
+    this.disableCapabilitiesInProjects(installedIds);
+    const timestamp = now();
+    this.database.transaction(() => {
+      const deactivate = this.database.prepare(`
+        UPDATE capabilities SET lifecycle_status = 'imported', updated_at = ? WHERE id = ?
+      `);
+      for (const item of installed) deactivate.run(timestamp, item.id);
+      this.replaceAgentCapabilityReferences(installedIds, null, timestamp);
+    })();
+    for (const item of installed) {
+      this.appendEvent('capability', item.id, 'capability.uninstalled', 'user',
+        `能力 ${item.name} 已卸载，后续调用不会再装载该来源。`, {
+          kind: item.kind,
+          source: item.source.ref,
+          retainedForAudit: true,
+        });
+    }
     return this.getCapability(capabilityId);
   }
 
@@ -975,15 +1136,16 @@ export class YanxuStore {
       ${includeDrafts ? '' : "WHERE lifecycle_status = 'installed'"}
       ORDER BY name COLLATE NOCASE, updated_at DESC
     `).all() as RoleTemplateRow[]).map((row) => this.roleTemplateFromRow(row));
-    return [...builtinRoles, ...external];
+    const capabilities = this.listCapabilities();
+    return [...builtinRoles, ...external].map((role) => this.resolveRoleCapabilities(role, capabilities));
   }
 
   getRoleTemplate(roleId: string): RoleTemplate {
     const builtin = builtinRoles.find((role) => role.id === roleId);
-    if (builtin) return builtin;
+    if (builtin) return this.resolveRoleCapabilities(builtin);
     const row = this.database.prepare('SELECT * FROM role_templates WHERE id = ?').get(roleId) as RoleTemplateRow | undefined;
     if (!row) throw new DomainError('ROLE_NOT_FOUND', 'RoleTemplate 不存在或已经移除。', 404);
-    return this.roleTemplateFromRow(row);
+    return this.resolveRoleCapabilities(this.roleTemplateFromRow(row));
   }
 
   importGitHubRoleTemplates(address: string): RoleTemplate[] {
@@ -1312,6 +1474,18 @@ export class YanxuStore {
     try {
       for (const snapshot of snapshots) {
         const capability = this.getCapability(snapshot.capabilityId);
+        if (capability.lifecycleStatus !== 'installed') {
+          throw new DomainError('TASK_CAPABILITY_UNINSTALLED', `任务能力 ${capability.name} 已被卸载，当前调用不会装载该能力。`, 409, {
+            capabilityId: capability.id,
+            source: capability.source.ref,
+          });
+        }
+        if (!capability.compatibility.includes(executor)) {
+          throw new DomainError('TASK_CAPABILITY_INCOMPATIBLE', `任务能力 ${capability.name} 与 ${executor} 不兼容。`, 409, {
+            capabilityId: capability.id,
+            executor,
+          });
+        }
         const managedVersionPath = join(this.workbenchHome, 'capabilities', capability.id, snapshot.contentHash);
         if (!existsSync(managedVersionPath)) {
           throw new DomainError('TASK_CAPABILITY_VERSION_MISSING', `任务锁定的能力 ${capability.name} 版本已不可用。`, 409, {
@@ -1487,6 +1661,64 @@ export class YanxuStore {
     };
   }
 
+  private resolveRoleCapabilities(role: RoleTemplate, capabilities = this.listCapabilities()): RoleTemplate {
+    const installed = capabilities.filter((capability) =>
+      capability.lifecycleStatus === 'installed' && capability.parseStatus === 'valid');
+    const capabilitiesById = new Map(capabilities.map((capability) => [capability.id, capability]));
+    const requested: Array<{ name: string; kind: Capability['kind'] | null }> = role.capabilityIds
+      .map((capabilityId) => capabilitiesById.get(capabilityId))
+      .filter((capability): capability is Capability => Boolean(capability))
+      .map((capability) => ({ name: capability.name, kind: capability.kind }));
+    for (const dependencyName of role.dependencyNames) {
+      if (!requested.some((item) =>
+        item.name.toLocaleLowerCase() === dependencyName.toLocaleLowerCase())) {
+        requested.push({ name: dependencyName, kind: null });
+      }
+    }
+    const capabilityIds = [...new Set(requested
+      .map(({ name, kind }) => installed.find((capability) =>
+        capability.name.toLocaleLowerCase() === name.toLocaleLowerCase()
+        && (kind === null || capability.kind === kind))?.id)
+      .filter((id): id is string => Boolean(id)))];
+    return { ...role, capabilityIds };
+  }
+
+  private disableCapabilitiesInProjects(capabilityIds: string[]): void {
+    if (capabilityIds.length === 0) return;
+    const references = this.database.prepare(`
+      SELECT project_id, capability_id FROM project_capabilities
+      WHERE enabled = 1 AND capability_id IN (${capabilityIds.map(() => '?').join(', ')})
+    `).all(...capabilityIds) as Array<{ project_id: string; capability_id: string }>;
+    for (const reference of references) {
+      this.updateProjectCapability(reference.project_id, reference.capability_id, { enabled: false });
+    }
+  }
+
+  private replaceAgentCapabilityReferences(
+    removedCapabilityIds: string[],
+    replacementCapabilityId: string | null,
+    timestamp: string,
+  ): void {
+    if (removedCapabilityIds.length === 0) return;
+    const removed = new Set(removedCapabilityIds);
+    const replacement = replacementCapabilityId ? this.getCapability(replacementCapabilityId) : null;
+    const rows = this.database.prepare(`
+      SELECT id, executor, default_capability_ids_json FROM agent_profiles
+    `).all() as Array<{ id: string; executor: AgentProfile['executor']; default_capability_ids_json: string }>;
+    const update = this.database.prepare(`
+      UPDATE agent_profiles SET default_capability_ids_json = ?, updated_at = ? WHERE id = ?
+    `);
+    for (const row of rows) {
+      const current = parseJson<string[]>(row.default_capability_ids_json, []);
+      if (!current.some((id) => removed.has(id))) continue;
+      const next = current.flatMap((id) => {
+        if (!removed.has(id)) return [id];
+        return replacement && replacement.compatibility.includes(row.executor) ? [replacement.id] : [];
+      });
+      update.run(JSON.stringify([...new Set(next)]), timestamp, row.id);
+    }
+  }
+
   private roleTemplateFromRow(row: RoleTemplateRow): RoleTemplate {
     return {
       id: row.id,
@@ -1607,6 +1839,12 @@ export class YanxuStore {
           });
         }
         const capability = projectCapability.capability;
+        if (capability.lifecycleStatus !== 'installed') {
+          throw new DomainError('TASK_CAPABILITY_UNINSTALLED', `执行单元“${step.title}”使用的能力 ${capability.name} 已被卸载。`, 422, {
+            stepId: step.id,
+            capabilityId,
+          });
+        }
         if (!capability.compatibility.includes(agent.executor)) {
           throw new DomainError('TASK_CAPABILITY_INCOMPATIBLE', `能力 ${capability.name} 与 ${agent.executor} 不兼容。`, 422, {
             stepId: step.id,
